@@ -1,0 +1,162 @@
+// Copyright (c) 2015-present Mattermost, Inc. All Rights Reserved.
+// See LICENSE.txt for license information.
+
+package model
+
+import (
+	"encoding/json"
+	"maps"
+)
+
+type PostMetadata struct {
+	// Embeds holds information required to render content embedded in the post. This includes the OpenGraph metadata
+	// for links in the post.
+	Embeds []*PostEmbed `json:"embeds,omitempty"`
+
+	// Emojis holds all custom emojis used in the post, reactions, message attachments, and
+	// interactive payloads (mm_blocks, Block Kit blocks, Adaptive Cards) where applicable.
+	Emojis []*Emoji `json:"emojis,omitempty"`
+
+	// Files holds information about the file attachments on the post.
+	Files []*FileInfo `json:"files,omitempty"`
+
+	// RedactedFileCount is set when file attachments are stripped by an ABAC permission policy.
+	// Clients use this to render a placeholder instead of the file.
+	RedactedFileCount int `json:"redacted_file_count,omitempty"`
+
+	// Images holds the dimensions of all external images in the post as a map of the image URL to its dimensions.
+	// This includes image embeds (when the message contains a plaintext link to an image), Markdown images, images
+	// contained in the OpenGraph metadata, and images contained in message attachments. It does not contain
+	// the dimensions of any file attachments as those are stored in FileInfos.
+	Images map[string]*PostImage `json:"images,omitempty"`
+
+	// Reactions holds reactions made to the post.
+	Reactions []*Reaction `json:"reactions,omitempty"`
+
+	// Priority holds info about priority settings for the post.
+	Priority *PostPriority `json:"priority,omitempty"`
+
+	// Acknowledgements holds acknowledgements made by users to the post
+	Acknowledgements []*PostAcknowledgement `json:"acknowledgements,omitempty"`
+
+	// Translations holds translation data for configured target languages, keyed by language code
+	Translations map[string]*PostTranslation `json:"translations,omitempty"`
+
+	ExpireAt   int64    `json:"expire_at,omitempty"`
+	Recipients []string `json:"recipients,omitempty"`
+
+	// PropertyValues holds the post's property values for the group requested via
+	// propertyGroup. Transient: populated on read, never persisted on the post.
+	PropertyValues []*PropertyValue `json:"property_values,omitempty"`
+
+	// PropertyValuesUnavailable is nil when hydration was not requested for this post, false
+	// when it was requested and the values loaded, and true when the lookup failed. True
+	// distinguishes "this post has no values" from "the values could not be loaded", so a
+	// client never renders a post as unmarked when the marking is merely missing. A response
+	// without the flag says nothing about the values, so a client should only change what it
+	// stored for this flag on a response that carries it.
+	PropertyValuesUnavailable *bool `json:"property_values_unavailable,omitempty"`
+}
+
+// PostTranslation represents a translation of a post in a specific language
+type PostTranslation struct {
+	Text       string          `json:"text,omitempty"`   // Used when Type is "string"
+	Object     json.RawMessage `json:"object,omitempty"` // Used when Type is "object"
+	Type       string          `json:"type"`
+	State      string          `json:"state"`
+	SourceLang string          `json:"source_lang,omitempty"` // Original language of the post
+}
+
+func (p *PostMetadata) Auditable() map[string]any {
+	embeds := make([]map[string]any, 0, len(p.Embeds))
+	for _, pe := range p.Embeds {
+		embeds = append(embeds, pe.Auditable())
+	}
+	if len(embeds) == 0 {
+		embeds = nil
+	}
+
+	return map[string]any{
+		"embeds":              embeds,
+		"emojis":              p.Emojis,
+		"files":               p.Files,
+		"images":              p.Images,
+		"reactions":           p.Reactions,
+		"priority":            p.Priority,
+		"acknowledgements":    p.Acknowledgements,
+		"translations":        p.Translations,
+		"redacted_file_count": p.RedactedFileCount,
+		"property_values":     p.PropertyValues,
+	}
+}
+
+type PostImage struct {
+	Width  int `json:"width"`
+	Height int `json:"height"`
+
+	// Format is the name of the image format as used by image/go such as "png", "gif", or "jpeg".
+	Format string `json:"format"`
+
+	// FrameCount stores the number of frames in this image, if it is an animated gif. It will be 0 for other formats.
+	FrameCount int `json:"frame_count"`
+}
+
+// Copy does a deep copy
+func (p *PostMetadata) Copy() *PostMetadata {
+	embedsCopy := make([]*PostEmbed, len(p.Embeds))
+	copy(embedsCopy, p.Embeds)
+
+	emojisCopy := make([]*Emoji, len(p.Emojis))
+	copy(emojisCopy, p.Emojis)
+
+	filesCopy := make([]*FileInfo, len(p.Files))
+	copy(filesCopy, p.Files)
+
+	imagesCopy := map[string]*PostImage{}
+	maps.Copy(imagesCopy, p.Images)
+
+	reactionsCopy := make([]*Reaction, len(p.Reactions))
+	copy(reactionsCopy, p.Reactions)
+
+	acknowledgementsCopy := make([]*PostAcknowledgement, len(p.Acknowledgements))
+	copy(acknowledgementsCopy, p.Acknowledgements)
+
+	var propertyValuesCopy []*PropertyValue
+	if p.PropertyValues != nil {
+		propertyValuesCopy = make([]*PropertyValue, len(p.PropertyValues))
+		copy(propertyValuesCopy, p.PropertyValues)
+	}
+
+	var propertyValuesUnavailableCopy *bool
+	if p.PropertyValuesUnavailable != nil {
+		propertyValuesUnavailableCopy = NewPointer(*p.PropertyValuesUnavailable)
+	}
+
+	translationsCopy := map[string]*PostTranslation{}
+	maps.Copy(translationsCopy, p.Translations)
+
+	var postPriorityCopy *PostPriority
+	if p.Priority != nil {
+		postPriorityCopy = &PostPriority{
+			Priority:                p.Priority.Priority,
+			RequestedAck:            p.Priority.RequestedAck,
+			PersistentNotifications: p.Priority.PersistentNotifications,
+			PostId:                  p.Priority.PostId,
+			ChannelId:               p.Priority.ChannelId,
+		}
+	}
+
+	return &PostMetadata{
+		Embeds:                    embedsCopy,
+		Emojis:                    emojisCopy,
+		Files:                     filesCopy,
+		Images:                    imagesCopy,
+		Reactions:                 reactionsCopy,
+		Priority:                  postPriorityCopy,
+		Acknowledgements:          acknowledgementsCopy,
+		Translations:              translationsCopy,
+		RedactedFileCount:         p.RedactedFileCount,
+		PropertyValues:            propertyValuesCopy,
+		PropertyValuesUnavailable: propertyValuesUnavailableCopy,
+	}
+}

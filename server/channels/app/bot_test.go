@@ -1,0 +1,1920 @@
+// Copyright (c) 2015-present Mattermost, Inc. All Rights Reserved.
+// See LICENSE.txt for license information.
+
+package app
+
+import (
+	"errors"
+	"fmt"
+	"net/http"
+	"strings"
+	"testing"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/mock"
+	"github.com/stretchr/testify/require"
+
+	"github.com/mattermost/mattermost/server/public/model"
+	"github.com/mattermost/mattermost/server/v8/channels/app/users"
+	"github.com/mattermost/mattermost/server/v8/channels/store"
+	storemocks "github.com/mattermost/mattermost/server/v8/channels/store/storetest/mocks"
+)
+
+func TestCreateBot(t *testing.T) {
+	mainHelper.Parallel(t)
+	t.Run("invalid bot", func(t *testing.T) {
+		t.Run("relative to user", func(t *testing.T) {
+			th := Setup(t).InitBasic(t)
+
+			_, err := th.App.CreateBot(th.Context, &model.Bot{
+				Username:    "invalid username",
+				Description: "a bot",
+				OwnerId:     th.BasicUser.Id,
+			})
+			require.NotNil(t, err)
+			require.Equal(t, "model.bot.is_valid.username.app_error", err.Id)
+		})
+
+		t.Run("relative to bot", func(t *testing.T) {
+			th := Setup(t).InitBasic(t)
+
+			_, err := th.App.CreateBot(th.Context, &model.Bot{
+				Username:    "username",
+				Description: strings.Repeat("x", 1025),
+				OwnerId:     th.BasicUser.Id,
+			})
+			require.NotNil(t, err)
+			require.Equal(t, "model.bot.is_valid.description.app_error", err.Id)
+		})
+
+		t.Run("username contains . character", func(t *testing.T) {
+			th := Setup(t).InitBasic(t)
+
+			bot, err := th.App.CreateBot(th.Context, &model.Bot{
+				Username:    "username.",
+				Description: "a bot",
+				OwnerId:     th.BasicUser.Id,
+			})
+			require.NotNil(t, err)
+			require.Nil(t, bot)
+			require.Equal(t, "model.user.is_valid.email.app_error", err.Id)
+		})
+
+		t.Run("username missing", func(t *testing.T) {
+			th := Setup(t).InitBasic(t)
+
+			bot, err := th.App.CreateBot(th.Context, &model.Bot{
+				Description: "a bot",
+				OwnerId:     th.BasicUser.Id,
+			})
+			require.NotNil(t, err)
+			require.Nil(t, bot)
+			require.Equal(t, "model.bot.is_valid.username.app_error", err.Id)
+		})
+
+		t.Run("username reserved for a system-owned bot", func(t *testing.T) {
+			th := Setup(t).InitBasic(t)
+
+			bot, err := th.App.CreateBot(th.Context, &model.Bot{
+				Username:    model.BotSystemBotUsername,
+				Description: "a bot",
+				OwnerId:     th.BasicUser.Id,
+			})
+			require.NotNil(t, err)
+			require.Nil(t, bot)
+			require.Equal(t, "app.bot.createbot.reserved_username.app_error", err.Id)
+		})
+	})
+
+	t.Run("create bot", func(t *testing.T) {
+		th := Setup(t).InitBasic(t)
+
+		bot, err := th.App.CreateBot(th.Context, &model.Bot{
+			Username:    "username",
+			Description: "a bot",
+			OwnerId:     th.BasicUser.Id,
+		})
+		require.Nil(t, err)
+		defer func() {
+			err = th.App.PermanentDeleteBot(th.Context, bot.UserId)
+			require.Nil(t, err)
+		}()
+		assert.Equal(t, "username", bot.Username)
+		assert.Equal(t, "a bot", bot.Description)
+		assert.Equal(t, th.BasicUser.Id, bot.OwnerId)
+
+		user, err := th.App.GetUser(th.Context, bot.UserId)
+		require.Nil(t, err)
+
+		// Check that a post was created to add bot to team and channels
+		channel, err := th.App.getOrCreateDirectChannelWithUser(th.Context, user, th.BasicUser)
+		require.Nil(t, err)
+		posts, err := th.App.GetPosts(th.Context, channel.Id, 0, 1)
+		require.Nil(t, err)
+
+		postArray := posts.ToSlice()
+		assert.Len(t, postArray, 1)
+		assert.Equal(t, postArray[0].Type, model.PostTypeAddBotTeamsChannels)
+	})
+
+	t.Run("create bot, username already used by a non-bot user", func(t *testing.T) {
+		th := Setup(t).InitBasic(t)
+
+		_, err := th.App.CreateBot(th.Context, &model.Bot{
+			Username:    th.BasicUser.Username,
+			Description: "a bot",
+			OwnerId:     th.BasicUser.Id,
+		})
+		require.NotNil(t, err)
+		require.Equal(t, "app.user.save.username_exists.app_error", err.Id)
+	})
+}
+
+func TestEnsureBot(t *testing.T) {
+	mainHelper.Parallel(t)
+	t.Run("ensure bot should pass if already exist bot user", func(t *testing.T) {
+		th := Setup(t).InitBasic(t)
+
+		pluginId := "pluginId"
+
+		appErr := th.App.SetPluginKey(pluginId, "key", []byte("test"))
+		require.Nil(t, appErr)
+
+		botID1, err := th.App.EnsureBot(th.Context, pluginId, &model.Bot{
+			Username:    "username",
+			Description: "a bot",
+			OwnerId:     th.BasicUser.Id,
+		})
+		require.NoError(t, err)
+
+		bot, appErr := th.App.GetBot(th.Context, botID1, true)
+		require.Nil(t, appErr)
+		assert.Equal(t, "username", bot.Username)
+		assert.Equal(t, "a bot", bot.Description)
+
+		botID2, err := th.App.EnsureBot(th.Context, pluginId, &model.Bot{
+			Username:    "another_username",
+			Description: "another bot",
+			OwnerId:     th.BasicUser.Id,
+		})
+		require.NoError(t, err)
+		assert.Equal(t, botID1, botID2)
+
+		bot, appErr = th.App.GetBot(th.Context, botID2, true)
+		require.Nil(t, appErr)
+		assert.Equal(t, "another_username", bot.Username)
+		assert.Equal(t, "another bot", bot.Description)
+	})
+
+	t.Run("ensure bot should fail if username belongs to a non-bot user", func(t *testing.T) {
+		th := Setup(t).InitBasic(t)
+
+		pluginId := "pluginId"
+
+		// th.BasicUser is a regular (non-bot) user created by InitBasic.
+		// EnsureBot must return an error — not the human user's ID.
+		botID, err := th.App.EnsureBot(th.Context, pluginId, &model.Bot{
+			Username:    th.BasicUser.Username,
+			Description: "a bot",
+			OwnerId:     th.BasicUser.Id,
+		})
+		require.Error(t, err)
+		assert.Empty(t, botID)
+	})
+
+	t.Run("ensure bot should pass even after delete bot user", func(t *testing.T) {
+		th := Setup(t).InitBasic(t)
+
+		pluginId := "pluginId"
+
+		appErr := th.App.SetPluginKey(pluginId, "key", []byte("test"))
+		require.Nil(t, appErr)
+
+		initialBot := model.Bot{
+			Username:    "username",
+			Description: "a bot",
+			OwnerId:     th.BasicUser.Id,
+		}
+
+		botID1, err := th.App.EnsureBot(th.Context, pluginId, &initialBot)
+		require.NoError(t, err)
+
+		bot, appErr := th.App.GetBot(th.Context, botID1, true)
+		require.Nil(t, appErr)
+		assert.Equal(t, "username", bot.Username)
+		assert.Equal(t, "a bot", bot.Description)
+
+		err = th.App.Srv().Store().User().PermanentDelete(th.Context, initialBot.UserId)
+		require.NoError(t, err)
+		botID2, err := th.App.EnsureBot(th.Context, pluginId, &model.Bot{
+			Username:    "another_username",
+			Description: "another bot",
+			OwnerId:     th.BasicUser.Id,
+		})
+		require.NoError(t, err)
+		assert.NotEqual(t, botID1, botID2)
+
+		bot, appErr = th.App.GetBot(th.Context, botID2, true)
+		require.Nil(t, appErr)
+		assert.Equal(t, "another_username", bot.Username)
+		assert.Equal(t, "another bot", bot.Description)
+	})
+}
+
+func TestPatchBot(t *testing.T) {
+	mainHelper.Parallel(t)
+	t.Run("invalid patch for user", func(t *testing.T) {
+		th := Setup(t).InitBasic(t)
+
+		bot, err := th.App.CreateBot(th.Context, &model.Bot{
+			Username:    "username",
+			Description: "a bot",
+			OwnerId:     th.BasicUser.Id,
+		})
+		require.Nil(t, err)
+		defer func() {
+			err = th.App.PermanentDeleteBot(th.Context, bot.UserId)
+			require.Nil(t, err)
+		}()
+
+		botPatch := &model.BotPatch{
+			Username:    new("invalid username"),
+			DisplayName: new("an updated bot"),
+			Description: new("updated bot"),
+		}
+
+		_, err = th.App.PatchBot(th.Context, bot.UserId, botPatch)
+		require.NotNil(t, err)
+		require.Equal(t, "model.user.is_valid.username.app_error", err.Id)
+	})
+
+	t.Run("invalid patch for bot", func(t *testing.T) {
+		th := Setup(t).InitBasic(t)
+
+		bot, err := th.App.CreateBot(th.Context, &model.Bot{
+			Username:    "username",
+			Description: "a bot",
+			OwnerId:     th.BasicUser.Id,
+		})
+		require.Nil(t, err)
+		defer func() {
+			err = th.App.PermanentDeleteBot(th.Context, bot.UserId)
+			require.Nil(t, err)
+		}()
+
+		botPatch := &model.BotPatch{
+			Username:    new("username"),
+			DisplayName: new("display name"),
+			Description: new(strings.Repeat("x", 1025)),
+		}
+
+		_, err = th.App.PatchBot(th.Context, bot.UserId, botPatch)
+		require.NotNil(t, err)
+		require.Equal(t, "model.bot.is_valid.description.app_error", err.Id)
+	})
+
+	t.Run("patch bot to username reserved for a system-owned bot", func(t *testing.T) {
+		th := Setup(t).InitBasic(t)
+
+		bot, err := th.App.CreateBot(th.Context, &model.Bot{
+			Username:    "username",
+			Description: "a bot",
+			OwnerId:     th.BasicUser.Id,
+		})
+		require.Nil(t, err)
+		defer func() {
+			err = th.App.PermanentDeleteBot(th.Context, bot.UserId)
+			require.Nil(t, err)
+		}()
+
+		botPatch := &model.BotPatch{
+			Username: new(model.BotSystemBotUsername),
+		}
+
+		_, err = th.App.PatchBot(th.Context, bot.UserId, botPatch)
+		require.NotNil(t, err)
+		require.Equal(t, "app.bot.patchbot.reserved_username.app_error", err.Id)
+	})
+
+	t.Run("patch bot to reserved username with different casing is still blocked", func(t *testing.T) {
+		th := Setup(t).InitBasic(t)
+
+		bot, err := th.App.CreateBot(th.Context, &model.Bot{
+			Username:    "username",
+			Description: "a bot",
+			OwnerId:     th.BasicUser.Id,
+		})
+		require.Nil(t, err)
+		defer func() {
+			err = th.App.PermanentDeleteBot(th.Context, bot.UserId)
+			require.Nil(t, err)
+		}()
+
+		botPatch := &model.BotPatch{
+			Username: new("System-Bot"),
+		}
+
+		_, err = th.App.PatchBot(th.Context, bot.UserId, botPatch)
+		require.NotNil(t, err)
+		require.Equal(t, "app.bot.patchbot.reserved_username.app_error", err.Id)
+	})
+
+	t.Run("patch bot", func(t *testing.T) {
+		th := Setup(t).InitBasic(t)
+
+		bot := &model.Bot{
+			Username:    "username",
+			DisplayName: "bot",
+			Description: "a bot",
+			OwnerId:     th.BasicUser.Id,
+		}
+
+		createdBot, err := th.App.CreateBot(th.Context, bot)
+		require.Nil(t, err)
+		defer func() {
+			err = th.App.PermanentDeleteBot(th.Context, createdBot.UserId)
+			require.Nil(t, err)
+		}()
+
+		botPatch := &model.BotPatch{
+			Username:    new("username2"),
+			DisplayName: new("updated bot"),
+			Description: new("an updated bot"),
+		}
+
+		patchedBot, err := th.App.PatchBot(th.Context, createdBot.UserId, botPatch)
+		require.Nil(t, err)
+
+		// patchedBot should create a new .UpdateAt time
+		require.NotEqual(t, createdBot.UpdateAt, patchedBot.UpdateAt)
+
+		createdBot.Username = "username2"
+		createdBot.DisplayName = "updated bot"
+		createdBot.Description = "an updated bot"
+		createdBot.UpdateAt = patchedBot.UpdateAt
+		require.Equal(t, createdBot, patchedBot)
+	})
+
+	t.Run("patch bot, username already used by a non-bot user", func(t *testing.T) {
+		th := Setup(t).InitBasic(t)
+
+		bot, err := th.App.CreateBot(th.Context, &model.Bot{
+			Username:    "username",
+			DisplayName: "bot",
+			Description: "a bot",
+			OwnerId:     th.BasicUser.Id,
+		})
+		require.Nil(t, err)
+		defer func() {
+			err = th.App.PermanentDeleteBot(th.Context, bot.UserId)
+			require.Nil(t, err)
+		}()
+
+		botPatch := &model.BotPatch{
+			Username: new(th.BasicUser2.Username),
+		}
+
+		_, err = th.App.PatchBot(th.Context, bot.UserId, botPatch)
+		require.NotNil(t, err)
+		require.Equal(t, "app.user.save.username_exists.app_error", err.Id)
+	})
+}
+
+func TestGetBot(t *testing.T) {
+	mainHelper.Parallel(t)
+	th := Setup(t).InitBasic(t)
+
+	bot1, err := th.App.CreateBot(th.Context, &model.Bot{
+		Username:    "username",
+		Description: "a bot",
+		OwnerId:     th.BasicUser.Id,
+	})
+	require.Nil(t, err)
+	defer func() {
+		err = th.App.PermanentDeleteBot(th.Context, bot1.UserId)
+		require.Nil(t, err)
+	}()
+
+	bot2, err := th.App.CreateBot(th.Context, &model.Bot{
+		Username:    "username2",
+		Description: "a second bot",
+		OwnerId:     th.BasicUser.Id,
+	})
+	require.Nil(t, err)
+	defer func() {
+		err = th.App.PermanentDeleteBot(th.Context, bot2.UserId)
+		require.Nil(t, err)
+	}()
+
+	deletedBot, err := th.App.CreateBot(th.Context, &model.Bot{
+		Username:    "username3",
+		Description: "a deleted bot",
+		OwnerId:     th.BasicUser.Id,
+	})
+	require.Nil(t, err)
+	deletedBot, err = th.App.UpdateBotActive(th.Context, deletedBot.UserId, false)
+	require.Nil(t, err)
+	defer func() {
+		err := th.App.PermanentDeleteBot(th.Context, deletedBot.UserId)
+		require.Nil(t, err)
+	}()
+
+	t.Run("get unknown bot", func(t *testing.T) {
+		_, err := th.App.GetBot(th.Context, model.NewId(), false)
+		require.NotNil(t, err)
+		require.Equal(t, "store.sql_bot.get.missing.app_error", err.Id)
+	})
+
+	t.Run("get bot1", func(t *testing.T) {
+		bot, err := th.App.GetBot(th.Context, bot1.UserId, false)
+		require.Nil(t, err)
+		assert.Equal(t, bot1, bot)
+	})
+
+	t.Run("get bot2", func(t *testing.T) {
+		bot, err := th.App.GetBot(th.Context, bot2.UserId, false)
+		require.Nil(t, err)
+		assert.Equal(t, bot2, bot)
+	})
+
+	t.Run("get deleted bot", func(t *testing.T) {
+		_, err := th.App.GetBot(th.Context, deletedBot.UserId, false)
+		require.NotNil(t, err)
+		require.Equal(t, "store.sql_bot.get.missing.app_error", err.Id)
+	})
+
+	t.Run("get deleted bot, include deleted", func(t *testing.T) {
+		bot, err := th.App.GetBot(th.Context, deletedBot.UserId, true)
+		require.Nil(t, err)
+		assert.Equal(t, deletedBot, bot)
+	})
+}
+
+func TestGetBots(t *testing.T) {
+	mainHelper.Parallel(t)
+	th := Setup(t).DeleteBots(t)
+
+	OwnerId1 := model.NewId()
+	OwnerId2 := model.NewId()
+
+	bot1, err := th.App.CreateBot(th.Context, &model.Bot{
+		Username:    "username",
+		Description: "a bot",
+		OwnerId:     OwnerId1,
+	})
+	require.Nil(t, err)
+	defer func() {
+		err = th.App.PermanentDeleteBot(th.Context, bot1.UserId)
+		require.Nil(t, err)
+	}()
+
+	deletedBot1, err := th.App.CreateBot(th.Context, &model.Bot{
+		Username:    "username4",
+		Description: "a deleted bot",
+		OwnerId:     OwnerId1,
+	})
+	require.Nil(t, err)
+	deletedBot1, err = th.App.UpdateBotActive(th.Context, deletedBot1.UserId, false)
+	require.Nil(t, err)
+	defer func() {
+		err = th.App.PermanentDeleteBot(th.Context, deletedBot1.UserId)
+		require.Nil(t, err)
+	}()
+
+	bot2, err := th.App.CreateBot(th.Context, &model.Bot{
+		Username:    "username2",
+		Description: "a second bot",
+		OwnerId:     OwnerId1,
+	})
+	require.Nil(t, err)
+	defer func() {
+		err = th.App.PermanentDeleteBot(th.Context, bot2.UserId)
+		require.Nil(t, err)
+	}()
+
+	bot3, err := th.App.CreateBot(th.Context, &model.Bot{
+		Username:    "username3",
+		Description: "a third bot",
+		OwnerId:     OwnerId1,
+	})
+	require.Nil(t, err)
+	defer func() {
+		err = th.App.PermanentDeleteBot(th.Context, bot3.UserId)
+		require.Nil(t, err)
+	}()
+
+	bot4, err := th.App.CreateBot(th.Context, &model.Bot{
+		Username:    "username5",
+		Description: "a fourth bot",
+		OwnerId:     OwnerId2,
+	})
+	require.Nil(t, err)
+	defer func() {
+		err = th.App.PermanentDeleteBot(th.Context, bot4.UserId)
+		require.Nil(t, err)
+	}()
+
+	deletedBot2, err := th.App.CreateBot(th.Context, &model.Bot{
+		Username:    "username6",
+		Description: "a deleted bot",
+		OwnerId:     OwnerId2,
+	})
+	require.Nil(t, err)
+	deletedBot2, err = th.App.UpdateBotActive(th.Context, deletedBot2.UserId, false)
+	require.Nil(t, err)
+	defer func() {
+		err := th.App.PermanentDeleteBot(th.Context, deletedBot2.UserId)
+		require.Nil(t, err)
+	}()
+
+	t.Run("get bots, page=0, perPage=10", func(t *testing.T) {
+		bots, err := th.App.GetBots(th.Context, &model.BotGetOptions{
+			Page:           0,
+			PerPage:        10,
+			OwnerId:        "",
+			IncludeDeleted: false,
+		})
+		require.Nil(t, err)
+		assert.Equal(t, model.BotList{bot1, bot2, bot3, bot4}, bots)
+	})
+
+	t.Run("get bots, page=0, perPage=1", func(t *testing.T) {
+		bots, err := th.App.GetBots(th.Context, &model.BotGetOptions{
+			Page:           0,
+			PerPage:        1,
+			OwnerId:        "",
+			IncludeDeleted: false,
+		})
+		require.Nil(t, err)
+		assert.Equal(t, model.BotList{bot1}, bots)
+	})
+
+	t.Run("get bots, page=1, perPage=2", func(t *testing.T) {
+		bots, err := th.App.GetBots(th.Context, &model.BotGetOptions{
+			Page:           1,
+			PerPage:        2,
+			OwnerId:        "",
+			IncludeDeleted: false,
+		})
+		require.Nil(t, err)
+		assert.Equal(t, model.BotList{bot3, bot4}, bots)
+	})
+
+	t.Run("get bots, page=2, perPage=2", func(t *testing.T) {
+		bots, err := th.App.GetBots(th.Context, &model.BotGetOptions{
+			Page:           2,
+			PerPage:        2,
+			OwnerId:        "",
+			IncludeDeleted: false,
+		})
+		require.Nil(t, err)
+		assert.Equal(t, model.BotList{}, bots)
+	})
+
+	t.Run("get bots, page=0, perPage=10, include deleted", func(t *testing.T) {
+		bots, err := th.App.GetBots(th.Context, &model.BotGetOptions{
+			Page:           0,
+			PerPage:        10,
+			OwnerId:        "",
+			IncludeDeleted: true,
+		})
+		require.Nil(t, err)
+		assert.Equal(t, model.BotList{bot1, deletedBot1, bot2, bot3, bot4, deletedBot2}, bots)
+	})
+
+	t.Run("get bots, page=0, perPage=1, include deleted", func(t *testing.T) {
+		bots, err := th.App.GetBots(th.Context, &model.BotGetOptions{
+			Page:           0,
+			PerPage:        1,
+			OwnerId:        "",
+			IncludeDeleted: true,
+		})
+		require.Nil(t, err)
+		assert.Equal(t, model.BotList{bot1}, bots)
+	})
+
+	t.Run("get bots, page=1, perPage=2, include deleted", func(t *testing.T) {
+		bots, err := th.App.GetBots(th.Context, &model.BotGetOptions{
+			Page:           1,
+			PerPage:        2,
+			OwnerId:        "",
+			IncludeDeleted: true,
+		})
+		require.Nil(t, err)
+		assert.Equal(t, model.BotList{bot2, bot3}, bots)
+	})
+
+	t.Run("get bots, page=2, perPage=2, include deleted", func(t *testing.T) {
+		bots, err := th.App.GetBots(th.Context, &model.BotGetOptions{
+			Page:           2,
+			PerPage:        2,
+			OwnerId:        "",
+			IncludeDeleted: true,
+		})
+		require.Nil(t, err)
+		assert.Equal(t, model.BotList{bot4, deletedBot2}, bots)
+	})
+
+	t.Run("get offset=0, limit=10, creator id 1", func(t *testing.T) {
+		bots, err := th.App.GetBots(th.Context, &model.BotGetOptions{
+			Page:           0,
+			PerPage:        10,
+			OwnerId:        OwnerId1,
+			IncludeDeleted: false,
+		})
+		require.Nil(t, err)
+		require.Equal(t, model.BotList{bot1, bot2, bot3}, bots)
+	})
+
+	t.Run("get offset=0, limit=10, creator id 2", func(t *testing.T) {
+		bots, err := th.App.GetBots(th.Context, &model.BotGetOptions{
+			Page:           0,
+			PerPage:        10,
+			OwnerId:        OwnerId2,
+			IncludeDeleted: false,
+		})
+		require.Nil(t, err)
+		require.Equal(t, model.BotList{bot4}, bots)
+	})
+
+	t.Run("get offset=0, limit=10, include deleted, creator id 1", func(t *testing.T) {
+		bots, err := th.App.GetBots(th.Context, &model.BotGetOptions{
+			Page:           0,
+			PerPage:        10,
+			OwnerId:        OwnerId1,
+			IncludeDeleted: true,
+		})
+		require.Nil(t, err)
+		require.Equal(t, model.BotList{bot1, deletedBot1, bot2, bot3}, bots)
+	})
+
+	t.Run("get offset=0, limit=10, include deleted, creator id 2", func(t *testing.T) {
+		bots, err := th.App.GetBots(th.Context, &model.BotGetOptions{
+			Page:           0,
+			PerPage:        10,
+			OwnerId:        OwnerId2,
+			IncludeDeleted: true,
+		})
+		require.Nil(t, err)
+		require.Equal(t, model.BotList{bot4, deletedBot2}, bots)
+	})
+}
+
+func TestUpdateBotActive(t *testing.T) {
+	mainHelper.Parallel(t)
+	t.Run("unknown bot", func(t *testing.T) {
+		th := Setup(t).InitBasic(t)
+
+		_, err := th.App.UpdateBotActive(th.Context, model.NewId(), false)
+		require.NotNil(t, err)
+		require.Equal(t, "store.sql_bot.get.missing.app_error", err.Id)
+	})
+
+	t.Run("disable/enable bot", func(t *testing.T) {
+		th := Setup(t).InitBasic(t)
+
+		bot, err := th.App.CreateBot(th.Context, &model.Bot{
+			Username:    "username",
+			Description: "a bot",
+			OwnerId:     th.BasicUser.Id,
+		})
+		require.Nil(t, err)
+		defer func() {
+			err = th.App.PermanentDeleteBot(th.Context, bot.UserId)
+			require.Nil(t, err)
+		}()
+
+		disabledBot, err := th.App.UpdateBotActive(th.Context, bot.UserId, false)
+		require.Nil(t, err)
+		require.NotEqual(t, 0, disabledBot.DeleteAt)
+
+		// Disabling should be idempotent
+		disabledBotAgain, err := th.App.UpdateBotActive(th.Context, bot.UserId, false)
+		require.Nil(t, err)
+		require.Equal(t, disabledBot.DeleteAt, disabledBotAgain.DeleteAt)
+
+		reenabledBot, err := th.App.UpdateBotActive(th.Context, bot.UserId, true)
+		require.Nil(t, err)
+		require.EqualValues(t, 0, reenabledBot.DeleteAt)
+
+		// Re-enabling should be idempotent
+		reenabledBotAgain, err := th.App.UpdateBotActive(th.Context, bot.UserId, true)
+		require.Nil(t, err)
+		require.Equal(t, reenabledBot.DeleteAt, reenabledBotAgain.DeleteAt)
+	})
+
+	for username := range model.ProtectedBotUsernames {
+		t.Run("cannot disable protected bot "+username, func(t *testing.T) {
+			th := Setup(t).InitBasic(t)
+
+			protectedBot, err := th.App.GetOrCreateSystemOwnedBot(th.Context, username, "Protected Bot")
+			require.Nil(t, err)
+			require.Equal(t, username, protectedBot.Username)
+
+			_, err = th.App.UpdateBotActive(th.Context, protectedBot.UserId, false)
+			require.NotNil(t, err)
+			require.Equal(t, "app.bot.update_bot_active.protected_bot.app_error", err.Id)
+			require.Equal(t, http.StatusForbidden, err.StatusCode)
+
+			// The bot and its user must remain active.
+			refetched, err := th.App.GetBot(th.Context, protectedBot.UserId, true)
+			require.Nil(t, err)
+			require.Zero(t, refetched.DeleteAt)
+
+			botUser, err := th.App.GetUser(th.Context, protectedBot.UserId)
+			require.Nil(t, err)
+			require.Zero(t, botUser.DeleteAt)
+		})
+	}
+}
+
+func TestPermanentDeleteBot(t *testing.T) {
+	mainHelper.Parallel(t)
+	th := Setup(t).InitBasic(t)
+
+	bot, err := th.App.CreateBot(th.Context, &model.Bot{
+		Username:    "username",
+		Description: "a bot",
+		OwnerId:     th.BasicUser.Id,
+	})
+	require.Nil(t, err)
+
+	require.Nil(t, th.App.PermanentDeleteBot(th.Context, bot.UserId))
+
+	_, err = th.App.GetBot(th.Context, bot.UserId, false)
+	require.NotNil(t, err)
+	require.Equal(t, "store.sql_bot.get.missing.app_error", err.Id)
+}
+
+func TestPermanentDeleteBotDeletesAccessTokens(t *testing.T) {
+	mainHelper.Parallel(t)
+	th := Setup(t).InitBasic(t)
+
+	bot, err := th.App.CreateBot(th.Context, &model.Bot{
+		Username:    "token_bot",
+		Description: "a bot with tokens",
+		OwnerId:     th.BasicUser.Id,
+	})
+	require.Nil(t, err)
+
+	token1, err := th.App.CreateUserAccessToken(th.Context, &model.UserAccessToken{
+		UserId:      bot.UserId,
+		Description: "token 1",
+	})
+	require.Nil(t, err)
+
+	token2, err := th.App.CreateUserAccessToken(th.Context, &model.UserAccessToken{
+		UserId:      bot.UserId,
+		Description: "token 2",
+	})
+	require.Nil(t, err)
+
+	// Each token gets a backing session so we can verify the sessions are
+	// deleted alongside the tokens.
+	session1, err := th.App.GetSession(token1.Token)
+	require.Nil(t, err)
+	require.NotEmpty(t, session1.Id)
+
+	session2, err := th.App.GetSession(token2.Token)
+	require.Nil(t, err)
+	require.NotEmpty(t, session2.Id)
+
+	// A second bot whose tokens/sessions must survive, proving the deletion is
+	// scoped to the deleted bot's user ID.
+	otherBot, err := th.App.CreateBot(th.Context, &model.Bot{
+		Username:    "other_token_bot",
+		Description: "an unrelated bot",
+		OwnerId:     th.BasicUser.Id,
+	})
+	require.Nil(t, err)
+
+	otherToken, err := th.App.CreateUserAccessToken(th.Context, &model.UserAccessToken{
+		UserId:      otherBot.UserId,
+		Description: "keep me",
+	})
+	require.Nil(t, err)
+
+	otherSession, err := th.App.GetSession(otherToken.Token)
+	require.Nil(t, err)
+	require.NotEmpty(t, otherSession.Id)
+
+	tokens, err := th.App.GetUserAccessTokensForUser(bot.UserId, 0, 100)
+	require.Nil(t, err)
+	require.Len(t, tokens, 2)
+
+	require.Nil(t, th.App.PermanentDeleteBot(th.Context, bot.UserId))
+
+	tokens, err = th.App.GetUserAccessTokensForUser(bot.UserId, 0, 100)
+	require.Nil(t, err)
+	require.Empty(t, tokens, "bot access tokens should be deleted with the bot")
+
+	_, err = th.App.GetUserAccessToken(token1.Id, false)
+	require.NotNil(t, err, "token 1 should be deleted with the bot")
+	require.Equal(t, http.StatusNotFound, err.StatusCode)
+	_, err = th.App.GetUserAccessToken(token2.Id, false)
+	require.NotNil(t, err, "token 2 should be deleted with the bot")
+	require.Equal(t, http.StatusNotFound, err.StatusCode)
+
+	var nfErr *store.ErrNotFound
+	_, nErr := th.App.Srv().Store().Session().Get(th.Context, session1.Id)
+	require.ErrorAs(t, nErr, &nfErr, "session backed by the bot's first token should be deleted")
+	_, nErr = th.App.Srv().Store().Session().Get(th.Context, session2.Id)
+	require.ErrorAs(t, nErr, &nfErr, "session backed by the bot's second token should be deleted")
+
+	// Sessions are cached in memory by token, so the tokens must no longer
+	// authenticate once the bot is deleted. This exercises the session cache
+	// clearing, which plain SQL token deletion alone does not cover.
+	_, err = th.App.GetSession(token1.Token)
+	require.NotNil(t, err, "the deleted bot's first token must no longer authenticate")
+	require.Equal(t, http.StatusUnauthorized, err.StatusCode)
+	_, err = th.App.GetSession(token2.Token)
+	require.NotNil(t, err, "the deleted bot's second token must no longer authenticate")
+	require.Equal(t, http.StatusUnauthorized, err.StatusCode)
+
+	// The unrelated bot's credentials must be untouched.
+	otherTokens, err := th.App.GetUserAccessTokensForUser(otherBot.UserId, 0, 100)
+	require.Nil(t, err)
+	require.Len(t, otherTokens, 1, "an unrelated bot's tokens must not be deleted")
+
+	_, nErr = th.App.Srv().Store().Session().Get(th.Context, otherSession.Id)
+	require.NoError(t, nErr, "an unrelated bot's session must survive")
+
+	otherSessionAfter, err := th.App.GetSession(otherToken.Token)
+	require.Nil(t, err, "an unrelated bot's token must still authenticate")
+	require.Equal(t, otherSession.Id, otherSessionAfter.Id)
+}
+
+func TestDisableUserBots(t *testing.T) {
+	mainHelper.Parallel(t)
+	th := Setup(t)
+
+	ownerId1 := model.NewId()
+	ownerId2 := model.NewId()
+
+	bots := []*model.Bot{}
+	defer func() {
+		for _, bot := range bots {
+			err := th.App.PermanentDeleteBot(th.Context, bot.UserId)
+			require.Nil(t, err)
+		}
+	}()
+
+	for i := range 46 {
+		bot, err := th.App.CreateBot(th.Context, &model.Bot{
+			Username:    fmt.Sprintf("username%v", i),
+			Description: "a bot",
+			OwnerId:     ownerId1,
+		})
+		require.Nil(t, err)
+		bots = append(bots, bot)
+	}
+	require.Len(t, bots, 46)
+
+	u2bot1, err := th.App.CreateBot(th.Context, &model.Bot{
+		Username:    "username_nodisable",
+		Description: "a bot",
+		OwnerId:     ownerId2,
+	})
+	require.Nil(t, err)
+	defer func() {
+		err = th.App.PermanentDeleteBot(th.Context, u2bot1.UserId)
+		require.Nil(t, err)
+	}()
+
+	err = th.App.disableUserBots(th.Context, ownerId1)
+	require.Nil(t, err)
+
+	// Check all bots and corresponding users are disabled for creator 1
+	for _, bot := range bots {
+		retbot, err2 := th.App.GetBot(th.Context, bot.UserId, true)
+		require.Nil(t, err2)
+		require.NotZero(t, retbot.DeleteAt, bot.Username)
+	}
+
+	// Check bots and corresponding user not disabled for creator 2
+	bot, err := th.App.GetBot(th.Context, u2bot1.UserId, true)
+	require.Nil(t, err)
+	require.Zero(t, bot.DeleteAt)
+
+	user, err := th.App.GetUser(th.Context, u2bot1.UserId)
+	require.Nil(t, err)
+	require.Zero(t, user.DeleteAt)
+
+	// Bad id doesn't do anything or break horribly
+	err = th.App.disableUserBots(th.Context, model.NewId())
+	require.Nil(t, err)
+}
+
+func TestNotifySysadminsBotOwnerDisabled(t *testing.T) {
+	mainHelper.Parallel(t)
+	th := Setup(t)
+
+	userBots := []*model.Bot{}
+	defer func() {
+		for _, bot := range userBots {
+			err := th.App.PermanentDeleteBot(th.Context, bot.UserId)
+			require.Nil(t, err)
+		}
+	}()
+
+	// // Create two sysadmins
+	sysadmin1 := model.User{
+		Email:    "sys1@example.com",
+		Nickname: "nn_sysadmin1",
+		Password: model.NewTestPassword(),
+		Username: "un_sysadmin1",
+		Roles:    model.SystemAdminRoleId + " " + model.SystemUserRoleId,
+	}
+	_, err := th.App.CreateUser(th.Context, &sysadmin1)
+	require.Nil(t, err, "failed to create user")
+	_, err = th.App.UpdateUserRoles(th.Context, sysadmin1.Id, model.SystemUserRoleId+" "+model.SystemAdminRoleId, false)
+	require.Nil(t, err)
+
+	sysadmin2 := model.User{
+		Email:    "sys2@example.com",
+		Nickname: "nn_sysadmin2",
+		Password: model.NewTestPassword(),
+		Username: "un_sysadmin2",
+		Roles:    model.SystemAdminRoleId + " " + model.SystemUserRoleId,
+	}
+	_, err = th.App.CreateUser(th.Context, &sysadmin2)
+	require.Nil(t, err, "failed to create user")
+	_, err = th.App.UpdateUserRoles(th.Context, sysadmin2.Id, model.SystemUserRoleId+" "+model.SystemAdminRoleId, false)
+	require.Nil(t, err)
+
+	// create user to be disabled
+	user1, err := th.App.CreateUser(th.Context, &model.User{
+		Email:    "user1@example.com",
+		Username: "user1_disabled",
+		Nickname: "user1",
+		Password: model.NewTestPassword(),
+	})
+	require.Nil(t, err, "failed to create user")
+
+	// create user that doesn't own any bots
+	user2, err := th.App.CreateUser(th.Context, &model.User{
+		Email:    "user2@example.com",
+		Username: "user2_disabled",
+		Nickname: "user2",
+		Password: model.NewTestPassword(),
+	})
+	require.Nil(t, err, "failed to create user")
+
+	const numBotsToPrint = 10
+
+	// create bots owned by user (equal to numBotsToPrint)
+	var bot *model.Bot
+	for i := range numBotsToPrint {
+		bot, err = th.App.CreateBot(th.Context, &model.Bot{
+			Username:    fmt.Sprintf("bot%v", i),
+			Description: "a bot",
+			OwnerId:     user1.Id,
+		})
+		require.Nil(t, err)
+		userBots = append(userBots, bot)
+	}
+	assert.Len(t, userBots, 10)
+
+	// get DM channels for sysadmin1 and sysadmin2
+	channelSys1, appErr := th.App.GetOrCreateDirectChannel(th.Context, sysadmin1.Id, sysadmin1.Id)
+	require.Nil(t, appErr)
+	channelSys2, appErr := th.App.GetOrCreateDirectChannel(th.Context, sysadmin2.Id, sysadmin2.Id)
+	require.Nil(t, appErr)
+
+	// send notification for user without bots
+	err = th.App.notifySysadminsBotOwnerDeactivated(th.Context, user2.Id)
+	require.Nil(t, err)
+
+	// get posts from sysadmin1 and sysadmin2 DM channels
+	posts1, err := th.App.GetPosts(th.Context, channelSys1.Id, 0, 5)
+	require.Nil(t, err)
+	assert.Empty(t, posts1.Order)
+
+	posts2, err := th.App.GetPosts(th.Context, channelSys2.Id, 0, 5)
+	require.Nil(t, err)
+	assert.Empty(t, posts2.Order)
+
+	// send notification for user with bots
+	err = th.App.notifySysadminsBotOwnerDeactivated(th.Context, user1.Id)
+	require.Nil(t, err)
+
+	// get posts from sysadmin1  and sysadmin2 DM channels
+	posts1, err = th.App.GetPosts(th.Context, channelSys1.Id, 0, 5)
+	require.Nil(t, err)
+	assert.Len(t, posts1.Order, 1)
+
+	posts2, err = th.App.GetPosts(th.Context, channelSys2.Id, 0, 5)
+	require.Nil(t, err)
+	assert.Len(t, posts2.Order, 1)
+
+	post := posts1.Posts[posts1.Order[0]].Message
+	assert.Equal(t, "user1_disabled was deactivated. They managed the following bot accounts which have now been disabled.\n\n* bot0\n* bot1\n* bot2\n* bot3\n* bot4\n* bot5\n* bot6\n* bot7\n* bot8\n* bot9\nYou can take ownership of each bot by enabling it at **Integrations > Bot Accounts** and creating new tokens for the bot.\n\nFor more information, see our [documentation](https://docs.mattermost.com/developer/bot-accounts.html#what-happens-when-a-user-who-owns-bot-accounts-is-disabled).", post)
+
+	// print all bots
+	th.App.UpdateConfig(func(cfg *model.Config) { *cfg.ServiceSettings.DisableBotsWhenOwnerIsDeactivated = true })
+	message := th.App.getDisableBotSysadminMessage(user1, userBots)
+	assert.Equal(t, "user1_disabled was deactivated. They managed the following bot accounts which have now been disabled.\n\n* bot0\n* bot1\n* bot2\n* bot3\n* bot4\n* bot5\n* bot6\n* bot7\n* bot8\n* bot9\nYou can take ownership of each bot by enabling it at **Integrations > Bot Accounts** and creating new tokens for the bot.\n\nFor more information, see our [documentation](https://docs.mattermost.com/developer/bot-accounts.html#what-happens-when-a-user-who-owns-bot-accounts-is-disabled).", message)
+
+	// print all bots
+	th.App.UpdateConfig(func(cfg *model.Config) { *cfg.ServiceSettings.DisableBotsWhenOwnerIsDeactivated = false })
+	message = th.App.getDisableBotSysadminMessage(user1, userBots)
+	assert.Equal(t, "user1_disabled was deactivated. They managed the following bot accounts which are still enabled.\n\n* bot0\n* bot1\n* bot2\n* bot3\n* bot4\n* bot5\n* bot6\n* bot7\n* bot8\n* bot9\n\nWe strongly recommend you to take ownership of each bot by re-enabling it at **Integrations > Bot Accounts** and creating new tokens for the bot.\n\nFor more information, see our [documentation](https://docs.mattermost.com/developer/bot-accounts.html#what-happens-when-a-user-who-owns-bot-accounts-is-disabled).\n\nIf you want bot accounts to disable automatically after owner deactivation, set “Disable bot accounts when owner is deactivated” in **System Console > Integrations > Bot Accounts** to true.", message)
+
+	// create additional bot to go over the printable limit
+	for i := numBotsToPrint; i < numBotsToPrint+1; i++ {
+		bot, err = th.App.CreateBot(th.Context, &model.Bot{
+			Username:    fmt.Sprintf("bot%v", i),
+			Description: "a bot",
+			OwnerId:     user1.Id,
+		})
+		require.Nil(t, err)
+		userBots = append(userBots, bot)
+	}
+	assert.Len(t, userBots, 11)
+
+	// truncate number bots printed
+	th.App.UpdateConfig(func(cfg *model.Config) { *cfg.ServiceSettings.DisableBotsWhenOwnerIsDeactivated = true })
+	message = th.App.getDisableBotSysadminMessage(user1, userBots)
+	assert.Equal(t, "user1_disabled was deactivated. They managed 11 bot accounts which have now been disabled, including the following:\n\n* bot0\n* bot1\n* bot2\n* bot3\n* bot4\n* bot5\n* bot6\n* bot7\n* bot8\n* bot9\nYou can take ownership of each bot by enabling it at **Integrations > Bot Accounts** and creating new tokens for the bot.\n\nFor more information, see our [documentation](https://docs.mattermost.com/developer/bot-accounts.html#what-happens-when-a-user-who-owns-bot-accounts-is-disabled).", message)
+
+	// truncate number bots printed
+	th.App.UpdateConfig(func(cfg *model.Config) { *cfg.ServiceSettings.DisableBotsWhenOwnerIsDeactivated = false })
+	message = th.App.getDisableBotSysadminMessage(user1, userBots)
+	assert.Equal(t, "user1_disabled was deactivated. They managed 11 bot accounts which are still enabled, including the following:\n\n* bot0\n* bot1\n* bot2\n* bot3\n* bot4\n* bot5\n* bot6\n* bot7\n* bot8\n* bot9\nWe strongly recommend you to take ownership of each bot by re-enabling it at **Integrations > Bot Accounts** and creating new tokens for the bot.\n\nFor more information, see our [documentation](https://docs.mattermost.com/developer/bot-accounts.html#what-happens-when-a-user-who-owns-bot-accounts-is-disabled).\n\nIf you want bot accounts to disable automatically after owner deactivation, set “Disable bot accounts when owner is deactivated” in **System Console > Integrations > Bot Accounts** to true.", message)
+}
+
+func TestConvertUserToBot(t *testing.T) {
+	mainHelper.Parallel(t)
+	t.Run("invalid user", func(t *testing.T) {
+		t.Run("invalid user id", func(t *testing.T) {
+			th := Setup(t).InitBasic(t)
+
+			_, err := th.App.ConvertUserToBot(th.Context, &model.User{
+				Username: "username",
+				Id:       "",
+			})
+			require.NotNil(t, err)
+			require.Equal(t, "model.bot.is_valid.user_id.app_error", err.Id)
+		})
+
+		t.Run("invalid username", func(t *testing.T) {
+			th := Setup(t).InitBasic(t)
+
+			_, err := th.App.ConvertUserToBot(th.Context, &model.User{
+				Username: "invalid username",
+				Id:       th.BasicUser.Id,
+			})
+			require.NotNil(t, err)
+			require.Equal(t, "model.bot.is_valid.username.app_error", err.Id)
+		})
+	})
+
+	t.Run("valid user and session revoked", func(t *testing.T) {
+		th := Setup(t).InitBasic(t)
+
+		session, err := th.App.CreateSession(th.Context, &model.Session{UserId: th.BasicUser.Id, Props: model.StringMap{}})
+		require.Nil(t, err)
+
+		// make sure session is valid
+		testSession, err := th.App.GetSession(session.Token)
+		require.Nil(t, err)
+		require.False(t, testSession.IsExpired())
+
+		bot, err := th.App.ConvertUserToBot(th.Context, &model.User{
+			Username: "username",
+			Id:       th.BasicUser.Id,
+		})
+		require.Nil(t, err)
+		defer func() {
+			err = th.App.PermanentDeleteBot(th.Context, bot.UserId)
+			require.Nil(t, err)
+		}()
+		assert.Equal(t, "username", bot.Username)
+		assert.Equal(t, th.BasicUser.Id, bot.OwnerId)
+
+		// make sure session is no longer valid
+		_, err = th.App.GetSession(session.Token)
+		require.NotNil(t, err)
+		require.Equal(t, "api.context.invalid_session.error", err.Id)
+	})
+
+	t.Run("user with oauth credentials", func(t *testing.T) {
+		th := Setup(t).InitBasic(t)
+
+		// Create a user first
+		oauthUser := &model.User{
+			Email:         "oauth_user@example.com",
+			Username:      "oauth_user",
+			Password:      model.NewTestPassword(),
+			EmailVerified: true,
+		}
+
+		oauthUser, err := th.App.CreateUser(th.Context, oauthUser)
+		require.Nil(t, err)
+
+		// Set OAuth credentials
+		authData := "google_auth_data"
+		userAuth := &model.UserAuth{
+			AuthData:    &authData,
+			AuthService: "google",
+		}
+		_, err = th.App.UpdateUserAuth(th.Context, oauthUser.Id, userAuth)
+		require.Nil(t, err)
+
+		// Verify OAuth credentials are set
+		oauthUser, appErr := th.App.GetUser(th.Context, oauthUser.Id)
+		require.Nil(t, appErr)
+		require.Equal(t, "google", oauthUser.AuthService)
+		require.NotNil(t, oauthUser.AuthData)
+
+		// Convert user to bot
+		bot, err := th.App.ConvertUserToBot(th.Context, oauthUser)
+		require.Nil(t, err)
+		defer func() {
+			err = th.App.PermanentDeleteBot(th.Context, bot.UserId)
+			require.Nil(t, err)
+		}()
+
+		// Get updated user and verify OAuth credentials are cleared
+		updatedUser, err := th.App.GetUser(th.Context, oauthUser.Id)
+		require.Nil(t, err)
+		assert.Empty(t, updatedUser.AuthService)
+		// AuthData may be empty string instead of nil in the database
+		if updatedUser.AuthData != nil {
+			assert.Empty(t, *updatedUser.AuthData)
+		}
+	})
+}
+
+func TestGetSystemBot(t *testing.T) {
+	mainHelper.Parallel(t)
+	t.Run("An error should be returned if there are no sysadmins in the instance", func(t *testing.T) {
+		th := Setup(t).InitBasic(t)
+
+		require.Nil(t, th.App.PermanentDeleteAllUsers(th.Context))
+
+		_, err := th.App.GetSystemBot(th.Context)
+		require.NotNil(t, err)
+		require.Equal(t, "app.bot.get_system_bot.empty_admin_list.app_error", err.Id)
+	})
+
+	th := Setup(t).InitBasic(t)
+
+	t.Run("The bot should be created the first time it's retrieved", func(t *testing.T) {
+		// assert no bot with username exists
+		_, err := th.App.GetUserByUsername(model.BotSystemBotUsername)
+		require.NotNil(t, err)
+
+		bot, err := th.App.GetSystemBot(th.Context)
+		require.Nil(t, err)
+		require.Equal(t, bot.Username, model.BotSystemBotUsername)
+	})
+
+	t.Run("The bot should be correctly retrieved if it exists already", func(t *testing.T) {
+		// assert that the bot is now present
+		botUser, err := th.App.GetUserByUsername(model.BotSystemBotUsername)
+		require.Nil(t, err)
+		require.True(t, botUser.IsBot)
+
+		bot, err := th.App.GetSystemBot(th.Context)
+		require.Nil(t, err)
+		require.Equal(t, bot.Username, model.BotSystemBotUsername)
+		require.Equal(t, bot.UserId, botUser.Id)
+	})
+
+	t.Run("A disabled system bot is automatically re-enabled when retrieved", func(t *testing.T) {
+		bot, err := th.App.GetSystemBot(th.Context)
+		require.Nil(t, err)
+
+		// Simulate a legacy installation where the system bot was disabled
+		// before the protection guard existed: deactivate the underlying user
+		// and mark the bot record deleted directly in the store (bypassing
+		// UpdateBotActive's guard).
+		botUser, err := th.App.GetUser(th.Context, bot.UserId)
+		require.Nil(t, err)
+		_, err = th.App.UpdateActive(th.Context, botUser, false)
+		require.Nil(t, err)
+
+		storedBot, nErr := th.App.Srv().Store().Bot().Get(bot.UserId, true)
+		require.NoError(t, nErr)
+		storedBot.DeleteAt = model.GetMillis()
+		_, nErr = th.App.Srv().Store().Bot().Update(storedBot)
+		require.NoError(t, nErr)
+
+		disabled, err := th.App.GetBot(th.Context, bot.UserId, true)
+		require.Nil(t, err)
+		require.NotZero(t, disabled.DeleteAt)
+
+		// Retrieving the system bot should auto-heal both the bot record and
+		// its underlying user back to active.
+		healed, err := th.App.GetSystemBot(th.Context)
+		require.Nil(t, err)
+		require.Zero(t, healed.DeleteAt)
+
+		healedUser, err := th.App.GetUser(th.Context, bot.UserId)
+		require.Nil(t, err)
+		require.Zero(t, healedUser.DeleteAt)
+	})
+}
+
+func TestSystemBotProtectedFromOwnerDeactivation(t *testing.T) {
+	mainHelper.Parallel(t)
+	th := Setup(t).InitBasic(t)
+
+	th.App.UpdateConfig(func(cfg *model.Config) {
+		*cfg.ServiceSettings.DisableBotsWhenOwnerIsDeactivated = true
+	})
+
+	// The system bot's owner is the first system admin.
+	systemBot, err := th.App.GetSystemBot(th.Context)
+	require.Nil(t, err)
+	require.Equal(t, model.BotSystemBotUsername, systemBot.Username)
+
+	owner, err := th.App.GetUser(th.Context, systemBot.OwnerId)
+	require.Nil(t, err)
+
+	// A regular bot owned by the same user, to confirm the guard is scoped to
+	// protected bots and that the deactivation batch still disables others.
+	regularBot, err := th.App.CreateBot(th.Context, &model.Bot{
+		Username:    "regular_owned_bot",
+		Description: "a bot",
+		OwnerId:     owner.Id,
+	})
+	require.Nil(t, err)
+
+	// Deactivate the owner through the real code path. With
+	// DisableBotsWhenOwnerIsDeactivated enabled this triggers disableUserBots.
+	_, err = th.App.UpdateActive(th.Context, owner, false)
+	require.Nil(t, err)
+
+	// The protected system bot must remain enabled.
+	refetchedSystemBot, err := th.App.GetBot(th.Context, systemBot.UserId, true)
+	require.Nil(t, err)
+	require.Zero(t, refetchedSystemBot.DeleteAt, "system bot should remain enabled after owner deactivation")
+
+	// The non-protected bot owned by the same user must be disabled, proving
+	// the batch continued past the protected bot rather than aborting.
+	refetchedRegularBot, err := th.App.GetBot(th.Context, regularBot.UserId, true)
+	require.Nil(t, err)
+	require.NotZero(t, refetchedRegularBot.DeleteAt, "regular bot should be disabled after owner deactivation")
+}
+
+func TestIsBotExemptFromDMRestrictions(t *testing.T) {
+	mainHelper.Parallel(t)
+	t.Run("bot owned by current user", func(t *testing.T) {
+		th := Setup(t).InitBasic(t)
+
+		bot, err := th.App.CreateBot(th.Context, &model.Bot{
+			Username:    "username",
+			Description: "a bot",
+			OwnerId:     th.BasicUser.Id,
+		})
+		require.Nil(t, err)
+		defer func() {
+			err = th.App.PermanentDeleteBot(th.Context, bot.UserId)
+			require.Nil(t, err)
+		}()
+
+		session, err := th.App.CreateSession(th.Context, &model.Session{
+			UserId: th.BasicUser.Id,
+			Roles:  th.BasicUser.GetRawRoles(),
+		})
+		require.Nil(t, err)
+
+		rctx := th.Context.WithSession(session)
+		owned, appErr := th.App.IsBotExemptFromDMRestrictions(rctx, bot.UserId)
+		require.Nil(t, appErr)
+		assert.True(t, owned)
+	})
+
+	t.Run("bot owned by different user", func(t *testing.T) {
+		th := Setup(t).InitBasic(t)
+
+		bot, err := th.App.CreateBot(th.Context, &model.Bot{
+			Username:    "username",
+			Description: "a bot",
+			OwnerId:     th.BasicUser2.Id,
+		})
+		require.Nil(t, err)
+		defer func() {
+			err = th.App.PermanentDeleteBot(th.Context, bot.UserId)
+			require.Nil(t, err)
+		}()
+
+		session, err := th.App.CreateSession(th.Context, &model.Session{
+			UserId: th.BasicUser.Id,
+			Roles:  th.BasicUser.GetRawRoles(),
+		})
+		require.Nil(t, err)
+
+		rctx := th.Context.WithSession(session)
+		owned, appErr := th.App.IsBotExemptFromDMRestrictions(rctx, bot.UserId)
+		require.Nil(t, appErr)
+		assert.False(t, owned)
+	})
+
+	t.Run("invalid bot ID", func(t *testing.T) {
+		th := Setup(t).InitBasic(t)
+
+		session, err := th.App.CreateSession(th.Context, &model.Session{
+			UserId: th.BasicUser.Id,
+			Roles:  th.BasicUser.GetRawRoles(),
+		})
+		require.Nil(t, err)
+
+		rctx := th.Context.WithSession(session)
+		owned, appErr := th.App.IsBotExemptFromDMRestrictions(rctx, model.NewId())
+		require.NotNil(t, appErr)
+		assert.False(t, owned)
+		require.Equal(t, "store.sql_bot.get.missing.app_error", appErr.Id)
+	})
+
+	t.Run("bot owned by plugin when no plugins environment", func(t *testing.T) {
+		th := Setup(t).InitBasic(t)
+
+		pluginID := "test-plugin-id"
+		bot, err := th.App.CreateBot(th.Context, &model.Bot{
+			Username:    "username",
+			Description: "a bot",
+			OwnerId:     pluginID,
+		})
+		require.Nil(t, err)
+		defer func() {
+			err = th.App.PermanentDeleteBot(th.Context, bot.UserId)
+			require.Nil(t, err)
+		}()
+
+		session, err := th.App.CreateSession(th.Context, &model.Session{
+			UserId: th.BasicUser.Id,
+			Roles:  th.BasicUser.GetRawRoles(),
+		})
+		require.Nil(t, err)
+
+		rctx := th.Context.WithSession(session)
+		owned, appErr := th.App.IsBotExemptFromDMRestrictions(rctx, bot.UserId)
+		require.Nil(t, appErr)
+		assert.False(t, owned)
+	})
+
+	t.Run("bot owned by plugin", func(t *testing.T) {
+		th := Setup(t).InitBasic(t)
+
+		pluginID := "com.mattermost.testplugin"
+		pluginCode := `
+		package main
+
+		import (
+			"github.com/mattermost/mattermost/server/public/plugin"
+		)
+
+		type MyPlugin struct {
+			plugin.MattermostPlugin
+		}
+
+		func main() {
+			plugin.ClientMain(&MyPlugin{})
+		}
+	`
+		pluginManifest := `{"id": "com.mattermost.testplugin", "server": {"executable": "backend.exe"}}`
+
+		setupPluginAPITest(t, pluginCode, pluginManifest, pluginID, th.App, th.Context)
+
+		bot, err := th.App.CreateBot(th.Context, &model.Bot{
+			Username:    "username",
+			Description: "a bot",
+			OwnerId:     pluginID,
+		})
+		require.Nil(t, err)
+		defer func() {
+			err = th.App.PermanentDeleteBot(th.Context, bot.UserId)
+			require.Nil(t, err)
+		}()
+
+		session, err := th.App.CreateSession(th.Context, &model.Session{
+			UserId: th.BasicUser.Id,
+			Roles:  th.BasicUser.GetRawRoles(),
+		})
+		require.Nil(t, err)
+
+		rctx := th.Context.WithSession(session)
+		owned, appErr := th.App.IsBotExemptFromDMRestrictions(rctx, bot.UserId)
+		require.Nil(t, appErr)
+		assert.True(t, owned)
+	})
+
+	t.Run("system bot is always exempt regardless of session", func(t *testing.T) {
+		th := Setup(t).InitBasic(t)
+
+		systemBot, appErr := th.App.GetSystemBot(th.Context)
+		require.Nil(t, appErr)
+
+		// Exempt even with an empty context (background job with no session)
+		exempt, appErr := th.App.IsBotExemptFromDMRestrictions(th.Context, systemBot.UserId)
+		require.Nil(t, appErr)
+		assert.True(t, exempt)
+
+		// Exempt even when the session belongs to an unrelated non-admin user
+		session, err := th.App.CreateSession(th.Context, &model.Session{
+			UserId: th.BasicUser.Id,
+			Roles:  th.BasicUser.GetRawRoles(),
+		})
+		require.Nil(t, err)
+		rctx := th.Context.WithSession(session)
+
+		exempt, appErr = th.App.IsBotExemptFromDMRestrictions(rctx, systemBot.UserId)
+		require.Nil(t, appErr)
+		assert.True(t, exempt)
+	})
+}
+
+// TestBotStoreErrorClassification covers the store-error branches rewritten to
+// errors.AsType. A typed error is recognized through wrapping, an earlier type
+// wins when an error matches more than one, a store *AppError is returned as-is,
+// and any other error falls through to the generic one.
+func TestBotStoreErrorClassification(t *testing.T) {
+	mainHelper.Parallel(t)
+	th := SetupWithStoreMock(t)
+	mockStore := th.App.Srv().Store().(*storemocks.Store)
+
+	requireMapped := func(t *testing.T, got *model.AppError, id string, status int, cause error) {
+		t.Helper()
+		require.NotNil(t, got)
+		assert.Equal(t, id, got.Id)
+		assert.Equal(t, status, got.StatusCode)
+		assert.ErrorIs(t, got, cause)
+	}
+
+	var userBinding, botBinding, channelBinding *mock.Call
+	bind := func(userStore *storemocks.UserStore, botStore *storemocks.BotStore, channelStore *storemocks.ChannelStore) {
+		t.Helper()
+		if userBinding != nil {
+			userBinding.Unset()
+			userBinding = nil
+		}
+		if botBinding != nil {
+			botBinding.Unset()
+			botBinding = nil
+		}
+		if channelBinding != nil {
+			channelBinding.Unset()
+			channelBinding = nil
+		}
+		if userStore != nil {
+			userBinding = mockStore.On("User").Return(userStore)
+		}
+		if botStore != nil {
+			botBinding = mockStore.On("Bot").Return(botStore)
+		}
+		if channelStore != nil {
+			channelBinding = mockStore.On("Channel").Return(channelStore)
+		}
+	}
+
+	useUserService := func(t *testing.T, userStore store.UserStore) {
+		t.Helper()
+		srv := th.App.Srv()
+		original := srv.userService
+		t.Cleanup(func() {
+			srv.userService = original
+		})
+		us, err := users.New(users.ServiceConfig{
+			UserStore:    userStore,
+			SessionStore: &storemocks.SessionStore{},
+			OAuthStore:   &storemocks.OAuthStore{},
+			ConfigFn:     srv.Platform().Config,
+			LicenseFn:    srv.License,
+		})
+		require.NoError(t, err)
+		srv.userService = us
+	}
+
+	expectUserCache := func(userStore *storemocks.UserStore, channelStore *storemocks.ChannelStore) {
+		userStore.On("InvalidateProfilesInChannelCacheByUser", mock.Anything).Return().Maybe()
+		userStore.On("InvalidateProfileCacheForUser", mock.Anything).Return().Maybe()
+		channelStore.On("InvalidateAllChannelMembersForUser", mock.Anything).Return().Maybe()
+	}
+
+	storeAppErr := func() *model.AppError {
+		return model.NewAppError("store", "custom.bot.app_error", nil, "", http.StatusTeapot)
+	}
+	plain := func() error {
+		return errors.New("db down")
+	}
+	notFound := func(id string) error {
+		return fmt.Errorf("query: %w", store.NewErrNotFound("Bot", id))
+	}
+	newBot := func() *model.Bot {
+		return &model.Bot{
+			Username:    "validbot",
+			Description: "a bot",
+			OwnerId:     model.NewId(),
+		}
+	}
+	savedUser := func(id string) *model.User {
+		return &model.User{Id: id, Username: "validbot"}
+	}
+
+	t.Run("CreateBot user save", func(t *testing.T) {
+		inv := store.NewErrInvalidInput("User", "username", "validbot")
+		sent := storeAppErr().Wrap(inv)
+		userStore := &storemocks.UserStore{}
+		userStore.On("Save", mock.Anything, mock.Anything).Return((*model.User)(nil), fmt.Errorf("save: %w", sent)).Once()
+		bind(userStore, nil, nil)
+		bot, got := th.App.CreateBot(th.Context, newBot())
+		require.Nil(t, bot)
+		require.Same(t, sent, got)
+
+		for _, tc := range []struct {
+			field string
+			id    string
+		}{
+			{field: "email", id: "app.user.save.email_exists.app_error"},
+			{field: "username", id: "app.user.save.username_exists.app_error"},
+			{field: "nickname", id: "app.user.save.existing.app_error"},
+		} {
+			cause := fmt.Errorf("save: %w", store.NewErrInvalidInput("User", tc.field, "x"))
+			userStore = &storemocks.UserStore{}
+			userStore.On("Save", mock.Anything, mock.Anything).Return((*model.User)(nil), cause).Once()
+			bind(userStore, nil, nil)
+			_, got = th.App.CreateBot(th.Context, newBot())
+			requireMapped(t, got, tc.id, http.StatusBadRequest, cause)
+		}
+
+		cause := plain()
+		userStore = &storemocks.UserStore{}
+		userStore.On("Save", mock.Anything, mock.Anything).Return((*model.User)(nil), cause).Once()
+		bind(userStore, nil, nil)
+		_, got = th.App.CreateBot(th.Context, newBot())
+		requireMapped(t, got, "app.user.save.app_error", http.StatusInternalServerError, cause)
+	})
+
+	t.Run("CreateBot bot save", func(t *testing.T) {
+		userID := model.NewId()
+		sent := storeAppErr()
+		userStore := &storemocks.UserStore{}
+		userStore.On("Save", mock.Anything, mock.Anything).Return(savedUser(userID), nil).Once()
+		userStore.On("PermanentDelete", mock.Anything, userID).Return(nil).Once()
+		botStore := &storemocks.BotStore{}
+		botStore.On("Save", mock.Anything).Return((*model.Bot)(nil), fmt.Errorf("save: %w", sent)).Once()
+		bind(userStore, botStore, nil)
+		bot, got := th.App.CreateBot(th.Context, newBot())
+		require.Nil(t, bot)
+		require.Same(t, sent, got)
+
+		cause := plain()
+		userStore = &storemocks.UserStore{}
+		userStore.On("Save", mock.Anything, mock.Anything).Return(savedUser(userID), nil).Once()
+		userStore.On("PermanentDelete", mock.Anything, userID).Return(nil).Once()
+		botStore = &storemocks.BotStore{}
+		botStore.On("Save", mock.Anything).Return((*model.Bot)(nil), cause).Once()
+		bind(userStore, botStore, nil)
+		_, got = th.App.CreateBot(th.Context, newBot())
+		requireMapped(t, got, "app.bot.createbot.internal_error", http.StatusInternalServerError, cause)
+	})
+
+	t.Run("CreateBot owner lookup", func(t *testing.T) {
+		userID := model.NewId()
+		saved := &model.Bot{UserId: userID, Username: "validbot"}
+		cause := notFound(model.NewId())
+		userStore := &storemocks.UserStore{}
+		userStore.On("Save", mock.Anything, mock.Anything).Return(savedUser(userID), nil).Once()
+		userStore.On("Get", mock.Anything, mock.Anything).Return((*model.User)(nil), cause).Once()
+		botStore := &storemocks.BotStore{}
+		botStore.On("Save", mock.Anything).Return(saved, nil).Once()
+		bind(userStore, botStore, nil)
+		bot, got := th.App.CreateBot(th.Context, newBot())
+		require.Nil(t, got)
+		require.Same(t, saved, bot)
+
+		cause = plain()
+		userStore = &storemocks.UserStore{}
+		userStore.On("Save", mock.Anything, mock.Anything).Return(savedUser(userID), nil).Once()
+		userStore.On("Get", mock.Anything, mock.Anything).Return((*model.User)(nil), cause).Once()
+		botStore = &storemocks.BotStore{}
+		botStore.On("Save", mock.Anything).Return(saved, nil).Once()
+		bind(userStore, botStore, nil)
+		bot, got = th.App.CreateBot(th.Context, newBot())
+		require.Nil(t, bot)
+		requireMapped(t, got, "app.user.get.app_error", http.StatusInternalServerError, cause)
+	})
+
+	t.Run("GetOrCreateSystemOwnedBot user save", func(t *testing.T) {
+		admin := &model.User{Id: model.NewId(), Username: "admin"}
+		prepare := func(userStore *storemocks.UserStore) {
+			t.Helper()
+			userStore.On("GetAllProfiles", mock.Anything).Return([]*model.User{admin}, nil).Once()
+			userStore.On("GetByUsername", "validbot").Return((*model.User)(nil), store.NewErrNotFound("User", "validbot")).Once()
+			bind(userStore, nil, nil)
+			useUserService(t, userStore)
+		}
+
+		sent := storeAppErr().Wrap(store.NewErrInvalidInput("User", "username", "validbot"))
+		userStore := &storemocks.UserStore{}
+		userStore.On("Save", mock.Anything, mock.Anything).Return((*model.User)(nil), fmt.Errorf("save: %w", sent)).Once()
+		prepare(userStore)
+		bot, got := th.App.GetOrCreateSystemOwnedBot(th.Context, "validbot", "Valid Bot")
+		require.Nil(t, bot)
+		require.Same(t, sent, got)
+
+		for _, tc := range []struct {
+			field string
+			id    string
+		}{
+			{field: "email", id: "app.user.save.email_exists.app_error"},
+			{field: "username", id: "app.user.save.username_exists.app_error"},
+			{field: "nickname", id: "app.user.save.existing.app_error"},
+		} {
+			cause := fmt.Errorf("save: %w", store.NewErrInvalidInput("User", tc.field, "x"))
+			userStore = &storemocks.UserStore{}
+			userStore.On("Save", mock.Anything, mock.Anything).Return((*model.User)(nil), cause).Once()
+			prepare(userStore)
+			_, got = th.App.GetOrCreateSystemOwnedBot(th.Context, "validbot", "Valid Bot")
+			requireMapped(t, got, tc.id, http.StatusBadRequest, cause)
+		}
+
+		cause := plain()
+		userStore = &storemocks.UserStore{}
+		userStore.On("Save", mock.Anything, mock.Anything).Return((*model.User)(nil), cause).Once()
+		prepare(userStore)
+		_, got = th.App.GetOrCreateSystemOwnedBot(th.Context, "validbot", "Valid Bot")
+		requireMapped(t, got, "app.user.save.app_error", http.StatusInternalServerError, cause)
+	})
+
+	t.Run("GetOrCreateSystemOwnedBot bot save", func(t *testing.T) {
+		admin := &model.User{Id: model.NewId(), Username: "admin"}
+		userID := model.NewId()
+		prepare := func(userStore *storemocks.UserStore, botStore *storemocks.BotStore) {
+			t.Helper()
+			userStore.On("GetAllProfiles", mock.Anything).Return([]*model.User{admin}, nil).Once()
+			userStore.On("GetByUsername", "validbot").Return((*model.User)(nil), store.NewErrNotFound("User", "validbot")).Once()
+			userStore.On("Save", mock.Anything, mock.Anything).Return(savedUser(userID), nil).Once()
+			userStore.On("PermanentDelete", mock.Anything, userID).Return(nil).Once()
+			bind(userStore, botStore, nil)
+			useUserService(t, userStore)
+		}
+
+		sent := storeAppErr()
+		userStore := &storemocks.UserStore{}
+		botStore := &storemocks.BotStore{}
+		botStore.On("Save", mock.Anything).Return(&model.Bot{UserId: userID}, fmt.Errorf("save: %w", sent)).Once()
+		prepare(userStore, botStore)
+		bot, got := th.App.GetOrCreateSystemOwnedBot(th.Context, "validbot", "Valid Bot")
+		require.Nil(t, bot)
+		require.Same(t, sent, got)
+
+		cause := plain()
+		userStore = &storemocks.UserStore{}
+		botStore = &storemocks.BotStore{}
+		botStore.On("Save", mock.Anything).Return(&model.Bot{UserId: userID}, cause).Once()
+		prepare(userStore, botStore)
+		_, got = th.App.GetOrCreateSystemOwnedBot(th.Context, "validbot", "Valid Bot")
+		requireMapped(t, got, "app.bot.createbot.internal_error", http.StatusInternalServerError, cause)
+	})
+
+	patchable := func(id string) *model.Bot {
+		return &model.Bot{UserId: id, Username: "validbot", Description: "a bot", OwnerId: model.NewId()}
+	}
+	patch := &model.BotPatch{Username: new("validbot2")}
+
+	t.Run("PatchBot user get", func(t *testing.T) {
+		botUserID := model.NewId()
+		cause := notFound(botUserID)
+		botStore := &storemocks.BotStore{}
+		botStore.On("Get", botUserID, true).Return(patchable(botUserID), nil).Once()
+		userStore := &storemocks.UserStore{}
+		userStore.On("Get", mock.Anything, botUserID).Return((*model.User)(nil), cause).Once()
+		bind(userStore, botStore, nil)
+		bot, got := th.App.PatchBot(th.Context, botUserID, patch)
+		require.Nil(t, bot)
+		requireMapped(t, got, MissingAccountError, http.StatusNotFound, cause)
+
+		cause = plain()
+		botStore = &storemocks.BotStore{}
+		botStore.On("Get", botUserID, true).Return(patchable(botUserID), nil).Once()
+		userStore = &storemocks.UserStore{}
+		userStore.On("Get", mock.Anything, botUserID).Return((*model.User)(nil), cause).Once()
+		bind(userStore, botStore, nil)
+		_, got = th.App.PatchBot(th.Context, botUserID, patch)
+		requireMapped(t, got, "app.user.get.app_error", http.StatusInternalServerError, cause)
+	})
+
+	t.Run("PatchBot user update", func(t *testing.T) {
+		botUserID := model.NewId()
+		prepare := func(updateErr error) {
+			t.Helper()
+			botStore := &storemocks.BotStore{}
+			botStore.On("Get", botUserID, true).Return(patchable(botUserID), nil).Once()
+			userStore := &storemocks.UserStore{}
+			userStore.On("Get", mock.Anything, botUserID).Return(savedUser(botUserID), nil).Once()
+			userStore.On("Update", mock.Anything, mock.Anything, true).Return((*model.UserUpdate)(nil), updateErr).Once()
+			bind(userStore, botStore, nil)
+		}
+
+		sent := storeAppErr().Wrap(store.NewErrConflict("Username", errors.New("dup"), "validbot2"))
+		prepare(fmt.Errorf("update: %w", sent))
+		bot, got := th.App.PatchBot(th.Context, botUserID, patch)
+		require.Nil(t, bot)
+		require.Same(t, sent, got)
+
+		cause := fmt.Errorf("update: %w", store.NewErrInvalidInput("User", "username", "validbot2"))
+		prepare(cause)
+		_, got = th.App.PatchBot(th.Context, botUserID, patch)
+		requireMapped(t, got, "app.user.update.find.app_error", http.StatusBadRequest, cause)
+
+		cause = fmt.Errorf("update: %w", store.NewErrConflict("Username", errors.New("dup"), "validbot2"))
+		prepare(cause)
+		_, got = th.App.PatchBot(th.Context, botUserID, patch)
+		requireMapped(t, got, "app.user.save.username_exists.app_error", http.StatusBadRequest, cause)
+
+		cause = fmt.Errorf("update: %w", store.NewErrConflict("Email", errors.New("dup"), "validbot2@localhost"))
+		prepare(cause)
+		_, got = th.App.PatchBot(th.Context, botUserID, patch)
+		requireMapped(t, got, "app.user.save.email_exists.app_error", http.StatusBadRequest, cause)
+
+		cause = plain()
+		prepare(cause)
+		_, got = th.App.PatchBot(th.Context, botUserID, patch)
+		requireMapped(t, got, "app.user.update.finding.app_error", http.StatusInternalServerError, cause)
+	})
+
+	t.Run("PatchBot bot update", func(t *testing.T) {
+		botUserID := model.NewId()
+		updated := savedUser(botUserID)
+		prepare := func(updateErr error) {
+			t.Helper()
+			botStore := &storemocks.BotStore{}
+			botStore.On("Get", botUserID, true).Return(patchable(botUserID), nil).Once()
+			botStore.On("Update", mock.Anything).Return((*model.Bot)(nil), updateErr).Once()
+			userStore := &storemocks.UserStore{}
+			userStore.On("Get", mock.Anything, botUserID).Return(savedUser(botUserID), nil).Once()
+			userStore.On("Update", mock.Anything, mock.Anything, true).Return(&model.UserUpdate{Old: updated, New: updated}, nil).Once()
+			channelStore := &storemocks.ChannelStore{}
+			expectUserCache(userStore, channelStore)
+			bind(userStore, botStore, channelStore)
+		}
+
+		nf := store.NewErrNotFound("Bot", botUserID)
+		sent := storeAppErr().Wrap(nf)
+		prepare(fmt.Errorf("update: %w", sent))
+		bot, got := th.App.PatchBot(th.Context, botUserID, patch)
+		require.Nil(t, bot)
+		requireMapped(t, got, "store.sql_bot.get.missing.app_error", http.StatusNotFound, nf)
+		assert.Equal(t, "SqlBotStore.Get", got.Where)
+		require.NotSame(t, sent, got)
+
+		sent = storeAppErr()
+		prepare(fmt.Errorf("update: %w", sent))
+		_, got = th.App.PatchBot(th.Context, botUserID, patch)
+		require.Same(t, sent, got)
+
+		cause := plain()
+		prepare(cause)
+		_, got = th.App.PatchBot(th.Context, botUserID, patch)
+		requireMapped(t, got, "app.bot.patchbot.internal_error", http.StatusInternalServerError, cause)
+	})
+
+	t.Run("GetBot", func(t *testing.T) {
+		botUserID := model.NewId()
+		cause := notFound(botUserID)
+		botStore := &storemocks.BotStore{}
+		botStore.On("Get", botUserID, false).Return((*model.Bot)(nil), cause).Once()
+		bind(nil, botStore, nil)
+		bot, got := th.App.GetBot(th.Context, botUserID, false)
+		require.Nil(t, bot)
+		requireMapped(t, got, "store.sql_bot.get.missing.app_error", http.StatusNotFound, cause)
+		assert.Equal(t, "SqlBotStore.Get", got.Where)
+
+		cause = plain()
+		botStore = &storemocks.BotStore{}
+		botStore.On("Get", botUserID, false).Return((*model.Bot)(nil), cause).Once()
+		bind(nil, botStore, nil)
+		_, got = th.App.GetBot(th.Context, botUserID, false)
+		requireMapped(t, got, "app.bot.getbot.internal_error", http.StatusInternalServerError, cause)
+	})
+
+	t.Run("UpdateBotActive bot get", func(t *testing.T) {
+		botUserID := model.NewId()
+		cause := notFound(botUserID)
+		botStore := &storemocks.BotStore{}
+		botStore.On("Get", botUserID, true).Return((*model.Bot)(nil), cause).Once()
+		bind(nil, botStore, nil)
+		bot, got := th.App.UpdateBotActive(th.Context, botUserID, true)
+		require.Nil(t, bot)
+		requireMapped(t, got, "store.sql_bot.get.missing.app_error", http.StatusNotFound, cause)
+		assert.Equal(t, "SqlBotStore.Get", got.Where)
+
+		cause = plain()
+		botStore = &storemocks.BotStore{}
+		botStore.On("Get", botUserID, true).Return((*model.Bot)(nil), cause).Once()
+		bind(nil, botStore, nil)
+		_, got = th.App.UpdateBotActive(th.Context, botUserID, true)
+		requireMapped(t, got, "app.bot.getbot.internal_error", http.StatusInternalServerError, cause)
+	})
+
+	t.Run("UpdateBotActive user get", func(t *testing.T) {
+		botUserID := model.NewId()
+		cause := notFound(botUserID)
+		botStore := &storemocks.BotStore{}
+		botStore.On("Get", botUserID, true).Return(patchable(botUserID), nil).Once()
+		userStore := &storemocks.UserStore{}
+		userStore.On("Get", mock.Anything, botUserID).Return((*model.User)(nil), cause).Once()
+		bind(userStore, botStore, nil)
+		bot, got := th.App.UpdateBotActive(th.Context, botUserID, true)
+		require.Nil(t, bot)
+		requireMapped(t, got, MissingAccountError, http.StatusNotFound, cause)
+
+		cause = plain()
+		botStore = &storemocks.BotStore{}
+		botStore.On("Get", botUserID, true).Return(patchable(botUserID), nil).Once()
+		userStore = &storemocks.UserStore{}
+		userStore.On("Get", mock.Anything, botUserID).Return((*model.User)(nil), cause).Once()
+		bind(userStore, botStore, nil)
+		_, got = th.App.UpdateBotActive(th.Context, botUserID, true)
+		requireMapped(t, got, "app.user.get.app_error", http.StatusInternalServerError, cause)
+	})
+
+	t.Run("PermanentDeleteBot", func(t *testing.T) {
+		botUserID := model.NewId()
+		cause := fmt.Errorf("delete: %w", store.NewErrInvalidInput("Bot", "UserId", botUserID))
+		botStore := &storemocks.BotStore{}
+		botStore.On("PermanentDelete", botUserID).Return(cause).Once()
+		bind(nil, botStore, nil)
+		got := th.App.PermanentDeleteBot(th.Context, botUserID)
+		requireMapped(t, got, "app.bot.permenent_delete.bad_id", http.StatusBadRequest, cause)
+		assert.Equal(t, "PermanentDeleteBot", got.Where)
+
+		cause = plain()
+		botStore = &storemocks.BotStore{}
+		botStore.On("PermanentDelete", botUserID).Return(cause).Once()
+		bind(nil, botStore, nil)
+		got = th.App.PermanentDeleteBot(th.Context, botUserID)
+		requireMapped(t, got, "app.bot.permanent_delete.internal_error", http.StatusInternalServerError, cause)
+	})
+
+	t.Run("UpdateBotOwner get", func(t *testing.T) {
+		botUserID := model.NewId()
+		cause := notFound(botUserID)
+		botStore := &storemocks.BotStore{}
+		botStore.On("Get", botUserID, true).Return((*model.Bot)(nil), cause).Once()
+		bind(nil, botStore, nil)
+		bot, got := th.App.UpdateBotOwner(th.Context, botUserID, model.NewId())
+		require.Nil(t, bot)
+		requireMapped(t, got, "store.sql_bot.get.missing.app_error", http.StatusNotFound, cause)
+		assert.Equal(t, "SqlBotStore.Get", got.Where)
+
+		cause = plain()
+		botStore = &storemocks.BotStore{}
+		botStore.On("Get", botUserID, true).Return((*model.Bot)(nil), cause).Once()
+		bind(nil, botStore, nil)
+		_, got = th.App.UpdateBotOwner(th.Context, botUserID, model.NewId())
+		requireMapped(t, got, "app.bot.getbot.internal_error", http.StatusInternalServerError, cause)
+	})
+
+	t.Run("UpdateBotOwner update", func(t *testing.T) {
+		botUserID := model.NewId()
+		prepare := func(updateErr error) {
+			t.Helper()
+			botStore := &storemocks.BotStore{}
+			botStore.On("Get", botUserID, true).Return(patchable(botUserID), nil).Once()
+			botStore.On("Update", mock.Anything).Return((*model.Bot)(nil), updateErr).Once()
+			bind(nil, botStore, nil)
+		}
+
+		nf := store.NewErrNotFound("Bot", botUserID)
+		sent := storeAppErr().Wrap(nf)
+		prepare(fmt.Errorf("update: %w", sent))
+		bot, got := th.App.UpdateBotOwner(th.Context, botUserID, model.NewId())
+		require.Nil(t, bot)
+		requireMapped(t, got, "store.sql_bot.get.missing.app_error", http.StatusNotFound, nf)
+		assert.Equal(t, "SqlBotStore.Get", got.Where)
+		require.NotSame(t, sent, got)
+
+		sent = storeAppErr()
+		prepare(fmt.Errorf("update: %w", sent))
+		_, got = th.App.UpdateBotOwner(th.Context, botUserID, model.NewId())
+		require.Same(t, sent, got)
+
+		cause := plain()
+		prepare(cause)
+		_, got = th.App.UpdateBotOwner(th.Context, botUserID, model.NewId())
+		requireMapped(t, got, "app.bot.patchbot.internal_error", http.StatusInternalServerError, cause)
+	})
+
+	t.Run("ConvertUserToBot", func(t *testing.T) {
+		user := &model.User{Id: model.NewId(), Username: "validbot"}
+		sent := storeAppErr()
+		botStore := &storemocks.BotStore{}
+		botStore.On("Save", mock.Anything).Return((*model.Bot)(nil), fmt.Errorf("save: %w", sent)).Once()
+		bind(nil, botStore, nil)
+		bot, got := th.App.ConvertUserToBot(th.Context, user)
+		require.Nil(t, bot)
+		require.Same(t, sent, got)
+
+		cause := plain()
+		botStore = &storemocks.BotStore{}
+		botStore.On("Save", mock.Anything).Return((*model.Bot)(nil), cause).Once()
+		bind(nil, botStore, nil)
+		_, got = th.App.ConvertUserToBot(th.Context, user)
+		requireMapped(t, got, "app.bot.createbot.internal_error", http.StatusInternalServerError, cause)
+	})
+}

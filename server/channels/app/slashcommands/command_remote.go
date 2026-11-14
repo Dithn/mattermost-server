@@ -1,0 +1,328 @@
+// Copyright (c) 2015-present Mattermost, Inc. All Rights Reserved.
+// See LICENSE.txt for license information.
+
+package slashcommands
+
+import (
+	"cmp"
+	"errors"
+	"fmt"
+	"slices"
+	"strings"
+
+	"github.com/mattermost/mattermost/server/public/model"
+	"github.com/mattermost/mattermost/server/public/shared/i18n"
+	"github.com/mattermost/mattermost/server/public/shared/mlog"
+	"github.com/mattermost/mattermost/server/public/shared/request"
+	"github.com/mattermost/mattermost/server/v8/channels/app"
+)
+
+const (
+	AvailableRemoteActions = "create, accept, remove, status"
+)
+
+type RemoteProvider struct {
+}
+
+// ensure RemoteProvider implements AutocompleteDynamicArgProvider
+var _ app.AutocompleteDynamicArgProvider = (*RemoteProvider)(nil)
+var _ app.AutocompleteQuotedArgProvider = (*RemoteProvider)(nil)
+
+const (
+	CommandTriggerRemote = "secure-connection"
+)
+
+func init() {
+	app.RegisterCommandProvider(&RemoteProvider{})
+}
+
+func (rp *RemoteProvider) GetTrigger() string {
+	return CommandTriggerRemote
+}
+
+func (rp *RemoteProvider) GetCommand(a *app.App, T i18n.TranslateFunc) *model.Command {
+	remote := model.NewAutocompleteData(rp.GetTrigger(), "[action]", T("api.command_remote.remote_add_remove.help", map[string]any{"Actions": AvailableRemoteActions}))
+
+	create := model.NewAutocompleteData("create", "", T("api.command_remote.invite.help"))
+	create.AddNamedTextArgument("name", T("api.command_remote.name.help"), T("api.command_remote.name.hint"), "", true)
+	create.AddNamedTextArgument("displayname", T("api.command_remote.displayname.help"), T("api.command_remote.displayname.hint"), "", false)
+	create.AddNamedTextArgument("password", T("api.command_remote.invite_password.help"), T("api.command_remote.invite_password.hint"), "", true)
+
+	accept := model.NewAutocompleteData("accept", "", T("api.command_remote.accept.help"))
+	accept.AddNamedTextArgument("name", T("api.command_remote.name.help"), T("api.command_remote.name.hint"), "", true)
+	accept.AddNamedTextArgument("displayname", T("api.command_remote.displayname.help"), T("api.command_remote.displayname.hint"), "", false)
+	accept.AddNamedTextArgument("password", T("api.command_remote.invite_password.help"), T("api.command_remote.invite_password.hint"), "", true)
+	accept.AddNamedTextArgument("invite", T("api.command_remote.invitation.help"), T("api.command_remote.invitation.hint"), "", true)
+
+	remove := model.NewAutocompleteData("remove", "", T("api.command_remote.remove.help"))
+	remove.AddNamedDynamicListArgument("connectionID", T("api.command_remote.remove_remote_id.help"), "builtin:"+CommandTriggerRemote, true)
+
+	status := model.NewAutocompleteData("status", "", T("api.command_remote.status.help"))
+
+	remote.AddCommand(create)
+	remote.AddCommand(accept)
+	remote.AddCommand(remove)
+	remote.AddCommand(status)
+
+	return &model.Command{
+		Trigger:          rp.GetTrigger(),
+		AutoComplete:     true,
+		AutoCompleteDesc: T("api.command_remote.desc"),
+		AutoCompleteHint: T("api.command_remote.hint"),
+		DisplayName:      T("api.command_remote.name"),
+		AutocompleteData: remote,
+	}
+}
+
+func (rp *RemoteProvider) DoCommand(a *app.App, rctx request.CTX, args *model.CommandArgs, message string) *model.CommandResponse {
+	if !a.HasPermissionTo(rctx, args.UserId, model.PermissionManageSecureConnections) {
+		return response(args.T("api.command_remote.permission_required", map[string]any{"Permission": "manage_secure_connections"}))
+	}
+
+	margs, err := parseNamedArgs(args.T, args.Command)
+	if err != nil {
+		return response(err.Error())
+	}
+	action, ok := margs[ActionKey]
+	if !ok {
+		return response(args.T("api.command_remote.missing_command", map[string]any{"Actions": AvailableRemoteActions}))
+	}
+
+	switch action {
+	case "create":
+		return rp.doCreate(a, args, margs)
+	case "accept":
+		return rp.doAccept(a, args, margs)
+	case "remove":
+		return rp.doRemove(a, args, margs)
+	case "status":
+		return rp.doStatus(a, args, margs)
+	}
+
+	return response(args.T("api.command_remote.unknown_action", map[string]any{"Action": action}))
+}
+
+func (rp *RemoteProvider) SplitQuotedArg(in string) (string, bool, bool) {
+	return splitQuotedArg(in)
+}
+
+func (rp *RemoteProvider) GetAutoCompleteListItems(rctx request.CTX, a *app.App, commandArgs *model.CommandArgs, arg *model.AutocompleteArg, parsed, toBeParsed string) ([]model.AutocompleteListItem, error) {
+	if !a.HasPermissionTo(rctx, commandArgs.UserId, model.PermissionManageSecureConnections) {
+		return nil, errors.New("You require `manage_secure_connections` permission to manage secure connections.")
+	}
+
+	if arg.Name == "connectionID" && strings.Contains(parsed, " remove ") {
+		return getRemoteClusterAutocompleteListItems(a, true)
+	}
+
+	return nil, fmt.Errorf("`%s` is not a dynamic argument", arg.Name)
+}
+
+// doCreate creates and displays an encrypted invite that can be used by a remote site to establish a simple trust.
+func (rp *RemoteProvider) doCreate(a *app.App, args *model.CommandArgs, margs map[string]string) *model.CommandResponse {
+	password := margs["password"]
+	if password == "" {
+		return response(args.T("api.command_remote.missing_empty", map[string]any{"Arg": "password"}))
+	}
+
+	name := margs["name"]
+	if name == "" {
+		return response(args.T("api.command_remote.missing_empty", map[string]any{"Arg": "name"}))
+	}
+
+	displayname := margs["displayname"]
+	if displayname == "" {
+		displayname = name
+	}
+
+	url := a.GetSiteURL()
+	if url == "" {
+		return response(args.T("api.command_remote.site_url_not_set"))
+	}
+
+	rc := &model.RemoteCluster{
+		Name:        name,
+		DisplayName: displayname,
+		SiteURL:     model.SiteURLPending + model.NewId(), // require a unique siteurl
+		CreatorId:   args.UserId,
+	}
+
+	_, inviteCode, appErr := a.CreateRemoteClusterWithInvite(rc, url, password)
+	if appErr != nil {
+		msg := translatedAppErrMessage(a, args, "Failed to add secure connection", appErr, mlog.String("name", name))
+		return response(args.T("api.command_remote.add_remote.error", map[string]any{"Error": msg}))
+	}
+
+	return response("##### " + args.T("api.command_remote.invitation_created") + "\n" +
+		args.T("api.command_remote.invite_summary", map[string]any{"Command": "/secure-connection accept", "Invitation": inviteCode, "SiteURL": url}))
+}
+
+// doAccept accepts an invitation generated by a remote site.
+func (rp *RemoteProvider) doAccept(a *app.App, args *model.CommandArgs, margs map[string]string) *model.CommandResponse {
+	password := margs["password"]
+	if password == "" {
+		return response(args.T("api.command_remote.missing_empty", map[string]any{"Arg": "password"}))
+	}
+
+	name := margs["name"]
+	if name == "" {
+		return response(args.T("api.command_remote.missing_empty", map[string]any{"Arg": "name"}))
+	}
+
+	displayname := margs["displayname"]
+	if displayname == "" {
+		displayname = name
+	}
+
+	blob := margs["invite"]
+	if blob == "" {
+		return response(args.T("api.command_remote.missing_empty", map[string]any{"Arg": "invite"}))
+	}
+
+	// invite is encoded as base64 and encrypted
+	invite, dErr := a.DecryptRemoteClusterInvite(blob, password)
+	if dErr != nil {
+		msg := translatedAppErrMessage(a, args, "Failed to decode secure connection invitation", dErr)
+		return response(args.T("api.command_remote.decode_invitation.error", map[string]any{"Error": msg}))
+	}
+
+	rcs, _ := a.GetRemoteClusterService()
+	if rcs == nil {
+		return response(args.T("api.command_remote.service_not_enabled"))
+	}
+
+	url := a.GetSiteURL()
+	if url == "" {
+		return response(args.T("api.command_remote.site_url_not_set"))
+	}
+
+	rc, appErr := rcs.AcceptInvitation(invite, name, displayname, args.UserId, url, "")
+	if appErr != nil {
+		msg := translatedAppErrMessage(a, args, "Failed to accept secure connection invitation", appErr, mlog.String("remote_id", invite.RemoteId))
+		return response(args.T("api.command_remote.accept_invitation.error", map[string]any{"Error": msg}))
+	}
+
+	return response("##### " + args.T("api.command_remote.accept_invitation", map[string]any{"SiteURL": rc.GetSiteURL()}))
+}
+
+// doRemove removes a remote cluster from the database, effectively revoking the trust relationship.
+func (rp *RemoteProvider) doRemove(a *app.App, args *model.CommandArgs, margs map[string]string) *model.CommandResponse {
+	id := margs["connectionID"]
+	if id == "" {
+		return response(args.T("api.command_remote.missing_empty", map[string]any{"Arg": "connectionID"}))
+	}
+	if !model.IsValidId(id) {
+		return response(args.T("api.command_remote.invalid_id", map[string]any{"Arg": "connectionID", "Value": id}))
+	}
+
+	deleted, err := a.DeleteRemoteCluster(id)
+	if err != nil {
+		msg := translatedAppErrMessage(a, args, "Failed to remove secure connection", err, mlog.String("remote_id", id))
+		return response(args.T("api.command_remote.remove_remote.error", map[string]any{"Error": msg}))
+	}
+
+	result := args.T("api.command_remote.cluster_removed.result_removed")
+	if !deleted {
+		result = args.T("api.command_remote.cluster_removed.result_not_found")
+	}
+	return response("##### " + args.T("api.command_remote.cluster_removed", map[string]any{"RemoteId": id, "Result": result}))
+}
+
+// doStatus displays connection status for all remote clusters.
+func (rp *RemoteProvider) doStatus(a *app.App, args *model.CommandArgs, _ map[string]string) *model.CommandResponse {
+	list, err := a.GetAllRemoteClusters(0, 999999, model.RemoteClusterQueryFilter{IncludeDeleted: true})
+	if err != nil {
+		msg := translatedAppErrMessage(a, args, "Failed to fetch secure connections", err)
+		return response(args.T("api.command_remote.fetch_status.error", map[string]any{"Error": msg}))
+	}
+
+	if len(list) == 0 {
+		return response("** " + args.T("api.command_remote.remotes_not_found") + " **")
+	}
+
+	// Show active connections first, then deleted ones, ordered by creation time within each group.
+	slices.SortStableFunc(list, func(a, b *model.RemoteCluster) int {
+		aDeleted := a.DeleteAt != 0
+		bDeleted := b.DeleteAt != 0
+		if aDeleted != bDeleted {
+			if aDeleted {
+				return 1
+			}
+			return -1
+		}
+		return cmp.Compare(a.CreateAt, b.CreateAt)
+	})
+
+	var sb strings.Builder
+	fmt.Fprintf(&sb, "%s \n", args.T("api.command_remote.remote_table_header"))
+	// | Secure Connection | Display name | ConnectionID | Site URL | Default Team | Invite accepted | Online | Last ping | Deleted |
+	fmt.Fprintf(&sb, "| :---- | :---- | :---- | :---- | :---- | :---- | :---- | :---- | :---- |\n")
+
+	for _, rc := range list {
+		accepted := formatBool(args.T, rc.IsConfirmed())
+		online := formatBool(args.T, isOnline(rc.LastPingAt))
+		lastPing := formatTimestamp(rc.LastPingAt)
+		deleted := formatBool(args.T, rc.DeleteAt != 0)
+
+		fmt.Fprintf(&sb, "| %s | %s | %s | %s | %s | %s | %s | %s | %s |\n", rc.Name, rc.DisplayName, rc.RemoteId, rc.GetSiteURL(), rc.DefaultTeamId, accepted, online, lastPing, deleted)
+	}
+	return response(sb.String())
+}
+
+// translatedAppErrMessage logs appErr in full and returns only its message, translated for the caller.
+// It does not build the reply itself because i18n extract only finds ids passed to T as string literals.
+func translatedAppErrMessage(a *app.App, args *model.CommandArgs, logMsg string, appErr *model.AppError, fields ...mlog.Field) string {
+	level := mlog.LvlWarn
+	if appErr.StatusCode >= 400 && appErr.StatusCode < 500 {
+		level = mlog.LvlDebug
+	}
+	a.Log().Log(level, logMsg, append(fields, mlog.Err(appErr))...)
+
+	appErr.Translate(args.T)
+	return appErr.Message
+}
+
+func isOnline(lastPing int64) bool {
+	return lastPing > model.GetMillis()-model.RemoteOfflineAfterMillis
+}
+
+func getRemoteClusterAutocompleteListItems(a *app.App, includeOffline bool) ([]model.AutocompleteListItem, error) {
+	filter := model.RemoteClusterQueryFilter{
+		ExcludeOffline: !includeOffline,
+	}
+	clusters, err := a.GetAllRemoteClusters(0, 999999, filter)
+	if err != nil || len(clusters) == 0 {
+		return []model.AutocompleteListItem{}, nil
+	}
+
+	list := make([]model.AutocompleteListItem, 0, len(clusters))
+
+	for _, rc := range clusters {
+		item := model.AutocompleteListItem{
+			Item:     rc.RemoteId,
+			HelpText: fmt.Sprintf("%s  (%s)", rc.DisplayName, rc.GetSiteURL())}
+		list = append(list, item)
+	}
+	return list, nil
+}
+
+func getRemoteClusterAutocompleteListItemsNotInChannel(a *app.App, channelID string, includeOffline bool) ([]model.AutocompleteListItem, error) {
+	filter := model.RemoteClusterQueryFilter{
+		ExcludeOffline: !includeOffline,
+		NotInChannel:   channelID,
+	}
+	all, err := a.GetAllRemoteClusters(0, 999999, filter)
+	if err != nil || len(all) == 0 {
+		return []model.AutocompleteListItem{}, nil
+	}
+
+	list := make([]model.AutocompleteListItem, 0, len(all))
+
+	for _, rc := range all {
+		item := model.AutocompleteListItem{
+			Item:     rc.RemoteId,
+			HelpText: fmt.Sprintf("%s  (%s)", rc.DisplayName, rc.GetSiteURL())}
+		list = append(list, item)
+	}
+	return list, nil
+}

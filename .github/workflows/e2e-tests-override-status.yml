@@ -1,0 +1,145 @@
+---
+name: E2E Tests - Override Status
+
+on:
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: "PR number to update status for"
+        required: true
+        type: string
+
+permissions: {}
+
+jobs:
+  resolve-pr:
+    permissions:
+      contents: read
+      pull-requests: read
+    runs-on: ubuntu-24.04
+    outputs:
+      head_sha: ${{ steps.pr-info.outputs.head_sha }}
+    steps:
+      - name: Validate inputs
+        env:
+          PR_NUMBER: ${{ inputs.pr_number }}
+        run: |
+          if ! [[ "$PR_NUMBER" =~ ^[0-9]+$ ]]; then
+            echo "::error::Invalid PR number format. Must be numeric."
+            exit 1
+          fi
+      - name: Get PR head SHA
+        id: pr-info
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          PR_NUMBER: ${{ inputs.pr_number }}
+        run: |
+          PR_DATA=$(gh api "repos/${GITHUB_REPOSITORY}/pulls/${PR_NUMBER}")
+          HEAD_SHA=$(echo "$PR_DATA" | jq -r '.head.sha')
+          echo "head_sha=$HEAD_SHA" >> $GITHUB_OUTPUT
+
+  override-status:
+    needs: resolve-pr
+    concurrency:
+      group: e2e-status-publish-${{ needs.resolve-pr.outputs.head_sha }}
+      cancel-in-progress: false
+      queue: max
+    permissions:
+      contents: read
+      pull-requests: read
+      statuses: write
+    runs-on: ubuntu-24.04
+    steps:
+      # The lane list is read from this workflow's own ref (github.sha), the tree the YAML runs from.
+      # It is never read from head_sha: the PR head must not choose which contexts this job writes.
+      - name: ci/checkout-trusted-lanes
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+          ref: ${{ github.sha }}
+          sparse-checkout: .github
+          path: .e2e-trusted
+          fetch-depth: 1
+      - name: ci/status-lanes
+        id: lanes
+        uses: ./.e2e-trusted/.github/actions/e2e-status-lanes
+      - name: Override failed full test statuses
+        env:
+          GH_TOKEN: ${{ github.token }}
+          COMMIT_SHA: ${{ needs.resolve-pr.outputs.head_sha }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          LANES: ${{ steps.lanes.outputs.lanes }}
+        run: |
+          # Every PR lane from the lane reader (the one list, subpath included), then the rolling-upgrade
+          # from-version contexts (smoke must still pass). Rolling contexts are dynamic
+          # (e.g. .../upgrade-from-release-11.9), so discover by pattern.
+          [ -n "$LANES" ] || { echo "::error::the lane reader produced no lanes"; exit 1; }
+          IFS=',' read -r -a FULL_TEST_CONTEXTS <<< "$LANES"
+          while IFS= read -r ROLLING_CTX; do
+            [ -n "$ROLLING_CTX" ] && FULL_TEST_CONTEXTS+=("$ROLLING_CTX")
+          done < <(gh api "repos/${GITHUB_REPOSITORY}/commits/${COMMIT_SHA}/statuses" --paginate \
+            --jq '[.[] | select(.context | test("^e2e-test/playwright-full/[^/]+/upgrade-from-"))] | group_by(.context) | map(.[0].context) | .[]')
+
+          for CONTEXT_NAME in "${FULL_TEST_CONTEXTS[@]}"; do
+            echo "Checking: $CONTEXT_NAME"
+
+            # Get current status
+            STATUS_JSON=$(gh api "repos/${GITHUB_REPOSITORY}/commits/${COMMIT_SHA}/statuses" --paginate --slurp | \
+              jq "[.[][] | select(.context == \"$CONTEXT_NAME\")] | first // empty")
+
+            if [ -z "$STATUS_JSON" ]; then
+              echo "  No status found, skipping"
+              continue
+            fi
+
+            CURRENT_DESC=$(echo "$STATUS_JSON" | jq -r '.description // ""')
+            CURRENT_URL=$(echo "$STATUS_JSON" | jq -r '.target_url // ""')
+            CURRENT_STATE=$(echo "$STATUS_JSON" | jq -r '.state // ""')
+
+            echo "  Current: $CURRENT_DESC ($CURRENT_STATE)"
+
+            # Only override if status is failure
+            if [ "$CURRENT_STATE" != "failure" ]; then
+              echo "  Not failed, skipping"
+              continue
+            fi
+
+            # Parse and construct new message
+            if [[ "$CURRENT_DESC" =~ ^([0-9]+)\ failed,\ ([0-9]+)\ passed$ ]]; then
+              FAILED="${BASH_REMATCH[1]}"
+              PASSED="${BASH_REMATCH[2]}"
+              NEW_MSG="${FAILED} failed (verified), ${PASSED} passed"
+            elif [[ "$CURRENT_DESC" =~ ^([0-9]+)\ failed\ \([^)]+\),\ ([0-9]+)\ passed$ ]]; then
+              FAILED="${BASH_REMATCH[1]}"
+              PASSED="${BASH_REMATCH[2]}"
+              NEW_MSG="${FAILED} failed (verified), ${PASSED} passed"
+            else
+              # Test System IO / rolling-upgrade style (image_tag:, from:, pass %)
+              NEW_MSG="${CURRENT_DESC} (verified)"
+            fi
+
+            echo "  New: $NEW_MSG"
+
+            # Update status via GitHub API
+            gh api "repos/${GITHUB_REPOSITORY}/statuses/${COMMIT_SHA}" \
+              -f state=success \
+              -f context="$CONTEXT_NAME" \
+              -f description="$NEW_MSG" \
+              -f target_url="$CURRENT_URL"
+
+            echo "  Updated to success"
+          done
+
+      # Verification keeps the original run's URL/owner and never overrides
+      # pending. Refresh its factual projection while still holding the SHA lock.
+      - name: ci/refresh-verified-summary
+        uses: mattermost/mattermost-test-automation-toolkit/actions/e2e-test-status@main  # actions/e2e-test-status
+        with:
+          composite-identity: >-
+            {"repository":"${{ github.repository }}","commit_sha":"${{ needs.resolve-pr.outputs.head_sha }}","gh_run_id":"${{ github.run_id }}","gh_run_attempt":"${{ github.run_attempt }}"}
+          status-context: ${{ steps.lanes.outputs.aggregate }}
+          github-token: ${{ github.token }}
+          operation: summarize
+          triage-status-context: ${{ steps.lanes.outputs.aggregate }}
+          triage-lanes: ${{ steps.lanes.outputs.lanes }}

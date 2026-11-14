@@ -1,0 +1,57 @@
+.sidebarHeaderContainer {
+    display: flex;
+    height: 55px;
+    flex-direction: row;
+    flex-wrap: nowrap;
+    align-items: center;
+    justify-content: space-between;
+    padding: 0 16px;
+    color: var(--sidebar-header-text-color);
+
+    button#sidebarTeamMenuButton {
+        overflow: hidden;
+        padding: 2px 6px;
+        color: inherit;
+        font-family: Metropolis, sans-serif;
+        font-size: 16px;
+        gap: 1px;
+
+        &:hover {
+            background: rgba(var(--sidebar-header-text-color-rgb), 0.08);
+        }
+
+        &:active,
+        &[aria-expanded=true][aria-haspopup=true] {
+            background: rgba(var(--sidebar-header-text-color-rgb), 0.12);
+        }
+
+        & > span {
+            overflow: hidden;
+            text-overflow: ellipsis;
+            white-space: nowrap;
+        }
+
+        & > .icon {
+            display: flex;
+            justify-content: center;
+        }
+    }
+
+    // Rest fill matches Compass inverted hover (0.08). Hover override must beat
+    // Compass inverted :hover (hashed single classes); leave active/open to Compass.
+    .browseOrAddChannelMenuTrigger {
+        background-color: rgba(var(--sidebar-text-rgb), 0.08);
+    }
+
+    button.browseOrAddChannelMenuTrigger:hover {
+        background-color: rgba(var(--sidebar-text-rgb), 0.12);
+    }
+}
+
+#sidebarTeamMenu {
+    .learnAboutTeamsMenuItem {
+        .leading-element,.label-elements>span {
+            color: var(--link-color);
+        }
+    }
+}

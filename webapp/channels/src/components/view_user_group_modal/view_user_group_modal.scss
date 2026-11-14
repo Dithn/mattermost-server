@@ -1,0 +1,141 @@
+.view-user-groups-modal {
+    .modal-content .modal-header {
+        overflow: visible;
+        align-items: flex-start;
+        padding-right: 18px;
+        gap: 16px;
+
+        .user-groups-modal__header-title-block {
+            min-width: 0;
+            flex: 1;
+        }
+
+        .modal-title {
+            display: flex;
+            align-items: center;
+            gap: 4px;
+            overflow-wrap: anywhere;
+
+            i,
+            svg {
+                flex-shrink: 0;
+                margin-left: 5px;
+                color: rgba(var(--center-channel-color-rgb), 0.64);
+            }
+        }
+
+        .user-groups-modal__header-subtitle {
+            display: flex;
+            flex-wrap: wrap;
+            align-items: center;
+            margin-top: 2px;
+            color: rgba(var(--center-channel-color-rgb), 0.75);
+            font-size: 12px;
+            gap: 8px;
+            line-height: 16px;
+
+            .group-source span {
+                padding: 0 4px;
+                border-radius: 4px;
+                background: rgba(var(--center-channel-color-rgb), 0.08);
+                font-size: 10px;
+                line-height: 16px;
+            }
+        }
+
+        .user-groups-modal__header-actions {
+            align-items: flex-start;
+            margin-right: 0;
+        }
+
+        .user-groups-modal__header-close {
+            position: static;
+            top: auto;
+            right: auto;
+        }
+
+        .details-action {
+            .MenuWrapper {
+                margin-left: auto;
+            }
+        }
+    }
+
+    .modal-body {
+        overflow: visible;
+
+        .no-results__wrapper {
+            padding-bottom: 60px;
+        }
+
+        .user-groups-search {
+            margin-bottom: 24px;
+        }
+
+        .user-groups-modal__content {
+            &.group-member-list {
+                max-height: 450px;
+                padding-bottom: 16px;
+                border-top: 1px solid rgba(var(--center-channel-color-rgb), 0.08);
+                overflow-y: scroll; // for Firefox and browsers that doesn't support overflow-y:overlay property
+                overflow-y: overlay;
+
+                &::-webkit-scrollbar {
+                    width: 20px;
+                }
+
+                &::-webkit-scrollbar-track {
+                    background: rgba(0, 0, 0, 0);
+                }
+
+                &::-webkit-scrollbar-thumb {
+                    border: 8px rgba(0, 0, 0, 0) solid;
+                    border-radius: 9999px;
+                    background: rgba(var(--center-channel-color-rgb), 0.24);
+                    background-clip: padding-box;
+                }
+
+                .group-member-count {
+                    
+                    padding: 0 32px;
+                    margin: 12px 0 8px 0;
+                    font-family: inherit;
+                    font-size: inherit;
+                    font-weight: 600;
+                    line-height: inherit;
+                }
+
+                .group-member-row {
+                    display: flex;
+                    align-items: center;
+                    padding: 8px 32px;
+
+                    .group-member-name {
+                        padding-left: 12px;
+                    }
+
+                    .group-member-username {
+                        padding-left: 6px;
+                        color: rgba(var(--center-channel-color-rgb), 0.75);
+                        font-size: 12px;
+                        line-height: 18px;
+                    }
+
+                    button.remove-group-member {
+                        margin-right: 0;
+                        margin-left: auto;
+                        opacity: 0;
+                    }
+
+                    &:hover, &:focus-within {
+                        background: rgba(var(--center-channel-color-rgb), 0.08);
+
+                        button.remove-group-member {
+                            opacity: 1;
+                        }
+                    }
+                }
+            }
+        }
+    }
+}

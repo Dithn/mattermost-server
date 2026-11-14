@@ -1,0 +1,1736 @@
+// Copyright (c) 2015-present Mattermost, Inc. All Rights Reserved.
+// See LICENSE.txt for license information.
+
+package model
+
+import (
+	"crypto"
+	"crypto/aes"
+	"crypto/cipher"
+	"crypto/ecdsa"
+	"crypto/rand"
+	"encoding/asn1"
+	"encoding/base64"
+	"encoding/json"
+	"fmt"
+	"io"
+	"maps"
+	"math/big"
+	"net/http"
+	"net/url"
+	"reflect"
+	"regexp"
+	"slices"
+	"strconv"
+	"strings"
+	"time"
+
+	"github.com/hashicorp/go-multierror"
+	"github.com/pkg/errors"
+)
+
+const (
+	PostActionTypeButton              = "button"
+	PostActionTypeSelect              = "select"
+	DialogTitleMaxLength              = 80
+	DialogElementDisplayNameMaxLength = 24
+	DialogElementNameMaxLength        = 300
+	DialogElementHelpTextMaxLength    = 150
+	DialogElementTextMaxLength        = 150
+	DialogElementTextareaMaxLength    = 3000
+	DialogElementSelectMaxLength      = 3000
+	DialogElementBoolMaxLength        = 150
+	DialogElementFileMaxLength        = 300
+	DefaultTimeIntervalMinutes        = 60 // Default time interval for DateTime fields
+	DialogCollapsibleMaxDepth         = 3  // Maximum levels of nested collapsible sections (top-level collapsible is depth 1)
+	MaxDialogCheckboxGroupOptions     = 50
+	MaxDialogMatrixRows               = 30
+	MaxDialogMatrixColumns            = 10
+	DialogLabelPositionBefore         = "before"
+	DialogLabelPositionAfter          = "after"
+	DialogMatrixRowSelectionMultiple  = "multiple"
+	DialogMatrixRowSelectionSingle    = "single"
+	MaxDialogFileIds                  = 10
+	// MaxDialogSubmissionIDShapedTokenScan bounds defense-in-depth scanning of
+	// request.Submission for ID-shaped tokens (file IDs, user/channel select values,
+	// etc.). This is not the per-dialog file upload limit — see MaxDialogFileIds.
+	MaxDialogSubmissionIDShapedTokenScan = 256
+
+	// Go date/time format constants
+	ISODateFormat                 = "2006-01-02"                // YYYY-MM-DD
+	ISODateTimeFormat             = "2006-01-02T15:04:05Z"      // RFC3339 UTC
+	ISODateTimeWithTimezoneFormat = "2006-01-02T15:04:05-07:00" // RFC3339 with timezone
+	ISODateTimeNoTimezoneFormat   = "2006-01-02T15:04:05"       // ISO datetime without timezone
+	ISODateTimeNoSecondsFormat    = "2006-01-02T15:04"          // ISO datetime without seconds
+)
+
+// Common datetime formats used by both date and datetime validation
+var commonDateTimeFormats = []string{
+	ISODateTimeFormat,             // RFC3339 UTC
+	ISODateTimeWithTimezoneFormat, // RFC3339 with timezone
+	ISODateTimeNoTimezoneFormat,   // ISO datetime without timezone
+	ISODateTimeNoSecondsFormat,    // ISO datetime without seconds
+}
+
+var PostActionRetainPropKeys = []string{
+	PostPropsFromWebhook,
+	PostPropsFromBot,
+	PostPropsFromPlugin,
+	PostPropsOverrideUsername,
+	PostPropsOverrideIconURL,
+	PostPropsOverrideIconEmoji,
+	PostPropsWebhookDisplayName,
+}
+
+// PostActionPreserve captures post fields preserved across an interactive action update.
+type PostActionPreserve struct {
+	Retain               map[string]any
+	Remove               []string
+	OriginalProps        map[string]any
+	OriginalIsPinned     bool
+	OriginalHasReactions bool
+	RootPostId           string
+}
+
+// PostActionPreserveState returns retain/remove props and metadata used when applying integration responses.
+func (o *Post) PostActionPreserveState() PostActionPreserve {
+	retain := map[string]any{}
+	remove := []string{}
+	for _, key := range PostActionRetainPropKeys {
+		value, ok := o.GetProps()[key]
+		if ok {
+			retain[key] = value
+		} else {
+			remove = append(remove, key)
+		}
+	}
+	rootPostId := o.Id
+	if o.RootId != "" {
+		rootPostId = o.RootId
+	}
+	var originalProps map[string]any
+	if props := o.GetProps(); props != nil {
+		originalProps = make(map[string]any, len(props))
+		maps.Copy(originalProps, props)
+	}
+	return PostActionPreserve{
+		Retain:               retain,
+		Remove:               remove,
+		OriginalProps:        originalProps,
+		OriginalIsPinned:     o.IsPinned,
+		OriginalHasReactions: o.HasReactions,
+		RootPostId:           rootPostId,
+	}
+}
+
+type DoPostActionRequest struct {
+	SelectedOption string            `json:"selected_option,omitempty"`
+	Cookie         string            `json:"cookie,omitempty"`
+	Query          map[string]string `json:"query,omitempty"`
+	// IntegrationFormat identifies which format originally had the action (attachment, mm_block, ...).
+	// Empty means a legacy client and is treated as attachment.
+	IntegrationFormat string `json:"integration_format,omitempty"`
+}
+
+// Integration format values for DoPostActionRequest.IntegrationFormat (client → server).
+const (
+	PostActionIntegrationFormatAttachment  = "attachment"
+	PostActionIntegrationFormatAppsBinding = "apps_binding"
+	PostActionIntegrationFormatBlock       = "block"
+	PostActionIntegrationFormatCard        = "card"
+	PostActionIntegrationFormatMmBlock     = "mm_block"
+)
+
+// NormalizePostActionIntegrationFormat returns a canonical integration format, defaulting to attachment when empty or unknown.
+func NormalizePostActionIntegrationFormat(s string) string {
+	c := strings.TrimSpace(strings.ToLower(s))
+	switch c {
+	case PostActionIntegrationFormatMmBlock,
+		PostActionIntegrationFormatAppsBinding,
+		PostActionIntegrationFormatBlock,
+		PostActionIntegrationFormatCard:
+		return c
+	case PostActionIntegrationFormatAttachment, "":
+		return PostActionIntegrationFormatAttachment
+	default:
+		return PostActionIntegrationFormatAttachment
+	}
+}
+
+const (
+	PostActionDataSourceUsers    = "users"
+	PostActionDataSourceChannels = "channels"
+
+	MaxMmBlocksActionsPerPost  = 50
+	MaxMmBlocksActionKeyLength = 64
+
+	MaxActionQueryEntries     = 50
+	MaxActionQueryKeyLength   = 128
+	MaxActionQueryValueLength = 2048
+)
+
+type PostAction struct {
+	// A unique Action ID. If not set, generated automatically.
+	Id string `json:"id,omitempty"`
+
+	// The type of the interactive element. Currently supported are
+	// "select" and "button".
+	Type string `json:"type,omitempty"`
+
+	// The text on the button, or in the select placeholder.
+	Name string `json:"name,omitempty"`
+
+	// Tooltip text displayed on hover.
+	Tooltip string `json:"tooltip,omitempty"`
+
+	// If the action is disabled.
+	Disabled bool `json:"disabled,omitempty"`
+
+	// Style defines a text and border style.
+	// Supported values are "default", "primary", "success", "good", "warning", "danger"
+	// and any hex color.
+	Style string `json:"style,omitempty"`
+
+	// DataSource indicates the data source for the select action. If left
+	// empty, the select is populated from Options. Other supported values
+	// are "users" and "channels".
+	DataSource string `json:"data_source,omitempty"`
+
+	// Options contains the values listed in a select dropdown on the post.
+	Options []*PostActionOptions `json:"options,omitempty"`
+
+	// DefaultOption contains the option, if any, that will appear as the
+	// default selection in a select box. It has no effect when used with
+	// other types of actions.
+	DefaultOption string `json:"default_option,omitempty"`
+
+	// Defines the interaction with the backend upon a user action.
+	// Integration contains Context, which is private plugin data;
+	// Integrations are stripped from Posts when they are sent to the
+	// client, or are encrypted in a Cookie.
+	Integration *PostActionIntegration `json:"integration,omitempty"`
+	Cookie      string                 `json:"cookie,omitempty" db:"-"`
+}
+
+// IsValid validates the action and returns an error if it is invalid.
+func (p *PostAction) IsValid() error {
+	var multiErr *multierror.Error
+
+	if p.Name == "" {
+		multiErr = multierror.Append(multiErr, fmt.Errorf("action must have a name"))
+	}
+
+	if p.Style != "" {
+		validStyles := []string{"default", "primary", "success", "good", "warning", "danger"}
+		// If not a predefined style, check if it's a hex color
+		if !slices.Contains(validStyles, p.Style) && !hexColorRegex.MatchString(p.Style) {
+			multiErr = multierror.Append(multiErr, fmt.Errorf("invalid style '%s' - must be one of [default, primary, success, good, warning, danger] or a hex color", p.Style))
+		}
+	}
+
+	switch p.Type {
+	case PostActionTypeButton:
+		if len(p.Options) > 0 {
+			multiErr = multierror.Append(multiErr, fmt.Errorf("button action must not have options"))
+		}
+		if p.DataSource != "" {
+			multiErr = multierror.Append(multiErr, fmt.Errorf("button action must not have a data source"))
+		}
+	case PostActionTypeSelect:
+		if p.DataSource != "" {
+			validSources := []string{PostActionDataSourceUsers, PostActionDataSourceChannels}
+			if !slices.Contains(validSources, p.DataSource) {
+				multiErr = multierror.Append(multiErr, fmt.Errorf("invalid data_source '%s' for select action", p.DataSource))
+			}
+
+			if len(p.Options) > 0 {
+				multiErr = multierror.Append(multiErr, fmt.Errorf("select action cannot have both DataSource and Options set"))
+			}
+		} else {
+			if len(p.Options) == 0 {
+				multiErr = multierror.Append(multiErr, fmt.Errorf("select action must have either DataSource or Options set"))
+			} else {
+				for i, opt := range p.Options {
+					if opt == nil {
+						multiErr = multierror.Append(multiErr, fmt.Errorf("select action contains nil option"))
+						continue
+					}
+					if err := opt.IsValid(); err != nil {
+						multiErr = multierror.Append(multiErr, multierror.Prefix(err, fmt.Sprintf("option at index %d is invalid:", i)))
+					}
+				}
+			}
+		}
+	default:
+		multiErr = multierror.Append(multiErr, fmt.Errorf("invalid action type: must be '%s' or '%s'", PostActionTypeButton, PostActionTypeSelect))
+	}
+
+	if p.Integration == nil {
+		multiErr = multierror.Append(multiErr, fmt.Errorf("action must have integration settings"))
+	} else {
+		if p.Integration.URL == "" {
+			multiErr = multierror.Append(multiErr, fmt.Errorf("action must have an integration URL"))
+		}
+		if !(strings.HasPrefix(p.Integration.URL, "/plugins/") || strings.HasPrefix(p.Integration.URL, "plugins/") || IsValidHTTPURL(p.Integration.URL)) {
+			multiErr = multierror.Append(multiErr, fmt.Errorf("action must have an valid integration URL"))
+		}
+	}
+
+	return multiErr.ErrorOrNil()
+}
+
+func (p *PostAction) Equals(input *PostAction) bool {
+	if p.Id != input.Id {
+		return false
+	}
+
+	if p.Type != input.Type {
+		return false
+	}
+
+	if p.Name != input.Name {
+		return false
+	}
+
+	if p.DataSource != input.DataSource {
+		return false
+	}
+
+	if p.DefaultOption != input.DefaultOption {
+		return false
+	}
+
+	if p.Cookie != input.Cookie {
+		return false
+	}
+
+	// Compare PostActionOptions
+	if len(p.Options) != len(input.Options) {
+		return false
+	}
+
+	for k := range p.Options {
+		if p.Options[k].Text != input.Options[k].Text {
+			return false
+		}
+
+		if p.Options[k].Value != input.Options[k].Value {
+			return false
+		}
+	}
+
+	// Compare PostActionIntegration
+
+	// If input is nil, then return true if original is also nil.
+	// Else return false.
+	if input.Integration == nil {
+		return p.Integration == nil
+	}
+
+	// At this point, input is not nil, so return false if original is.
+	if p.Integration == nil {
+		return false
+	}
+
+	// Both are unequal and not nil.
+	if p.Integration.URL != input.Integration.URL {
+		return false
+	}
+
+	if len(p.Integration.Context) != len(input.Integration.Context) {
+		return false
+	}
+
+	for key, value := range p.Integration.Context {
+		inputValue, ok := input.Integration.Context[key]
+		if !ok {
+			return false
+		}
+
+		switch inputValue.(type) {
+		case string, bool, int, float64:
+			if value != inputValue {
+				return false
+			}
+		default:
+			if !reflect.DeepEqual(value, inputValue) {
+				return false
+			}
+		}
+	}
+
+	return true
+}
+
+// PostActionCookie is set by the server, serialized and encrypted into
+// PostAction.Cookie. The clients should hold on to it, and include it with
+// subsequent DoPostAction requests. This allows the server to access the
+// action metadata even when it's not available in the database, for ephemeral
+// posts. Used for attachment-based interactive messages (legacy PostAction shape).
+//
+// mm_blocks uses [MmBlocksActionCookie] instead; see mm_blocks_actions.go.
+type PostActionCookie struct {
+	Type        string                 `json:"type,omitempty"`
+	PostId      string                 `json:"post_id,omitempty"`
+	RootPostId  string                 `json:"root_post_id,omitempty"`
+	ChannelId   string                 `json:"channel_id,omitempty"`
+	DataSource  string                 `json:"data_source,omitempty"`
+	Integration *PostActionIntegration `json:"integration,omitempty"`
+	RetainProps map[string]any         `json:"retain_props,omitempty"`
+	RemoveProps []string               `json:"remove_props,omitempty"`
+}
+
+// MmBlocksActionCookieKind is the JSON "kind" discriminator for [MmBlocksActionCookie] payloads.
+const MmBlocksActionCookieKind = "mm_blocks_actions"
+
+// MmBlocksActionCookie is the decrypted cookie payload for mm_blocks interactive messages
+// (encrypted into props.mm_blocks_actions for clients). It mirrors the shared post/channel
+// metadata of [PostActionCookie] but carries props.mm_blocks_actions as an actions map instead
+// of a single PostAction integration.
+type MmBlocksActionCookie struct {
+	Kind        string                    `json:"kind,omitempty"`
+	PostId      string                    `json:"post_id,omitempty"`
+	RootPostId  string                    `json:"root_post_id,omitempty"`
+	ChannelId   string                    `json:"channel_id,omitempty"`
+	RetainProps map[string]any            `json:"retain_props,omitempty"`
+	RemoveProps []string                  `json:"remove_props,omitempty"`
+	Actions     map[string]map[string]any `json:"actions"`
+}
+
+type PostActionOptions struct {
+	Text  string `json:"text"`
+	Value string `json:"value"`
+}
+
+func (o *PostActionOptions) IsValid() error {
+	var multiErr *multierror.Error
+
+	if o.Text == "" {
+		multiErr = multierror.Append(multiErr, fmt.Errorf("text is required"))
+	}
+	if o.Value == "" {
+		multiErr = multierror.Append(multiErr, fmt.Errorf("value is required"))
+	}
+
+	return multiErr.ErrorOrNil()
+}
+
+type PostActionIntegration struct {
+	// URL is the endpoint that the action will be sent to.
+	// It can be a relative path to a plugin.
+	URL     string         `json:"url,omitempty"`
+	Context map[string]any `json:"context,omitempty"`
+}
+
+type PostActionIntegrationRequest struct {
+	UserId      string         `json:"user_id"`
+	UserName    string         `json:"user_name"`
+	ChannelId   string         `json:"channel_id"`
+	ChannelName string         `json:"channel_name"`
+	TeamId      string         `json:"team_id"`
+	TeamName    string         `json:"team_domain"`
+	PostId      string         `json:"post_id"`
+	TriggerId   string         `json:"trigger_id"`
+	Type        string         `json:"type"`
+	DataSource  string         `json:"data_source"`
+	Context     map[string]any `json:"context,omitempty"`
+}
+
+type PostActionIntegrationResponse struct {
+	Update           *Post  `json:"update"`
+	EphemeralText    string `json:"ephemeral_text"`
+	SkipSlackParsing bool   `json:"skip_slack_parsing"` // Set to `true` to skip the Slack-compatibility handling of Text.
+	GotoLocation     string `json:"goto_location,omitempty"`
+}
+
+type PostActionAPIResponse struct {
+	Status       string `json:"status"` // needed to maintain backwards compatibility
+	TriggerId    string `json:"trigger_id"`
+	GotoLocation string `json:"goto_location,omitempty"`
+}
+
+type ExecuteDialogActionResponse struct {
+	TriggerId string `json:"trigger_id"`
+}
+
+// Dialog width tiers for Dialog.Size. Small is the historical width and the
+// default when Size is empty, so an existing dialog is unaffected.
+const (
+	DialogSizeSmall  = "small"
+	DialogSizeMedium = "medium"
+	DialogSizeLarge  = "large"
+)
+
+// DialogCollapsibleSubTypeGrid lays a collapsible's children out as a table
+// rather than stacking them. It is the only subtype a collapsible accepts;
+// empty means stacked.
+const DialogCollapsibleSubTypeGrid = "grid"
+
+type Dialog struct {
+	CallbackId       string          `json:"callback_id"`
+	Title            string          `json:"title"`
+	IntroductionText string          `json:"introduction_text"`
+	IconURL          string          `json:"icon_url"`
+	Elements         []DialogElement `json:"elements"`
+	SubmitLabel      string          `json:"submit_label"`
+	NotifyOnCancel   bool            `json:"notify_on_cancel"`
+	State            string          `json:"state"`
+	SourceURL        string          `json:"source_url,omitempty"`
+
+	// Size selects the dialog's width tier. Empty means DialogSizeSmall, which
+	// is the width every dialog had before this field existed, so leaving it
+	// unset never changes an existing dialog. The integration picks it because
+	// it is the party that knows how much content the form holds.
+	//
+	// Tiers rather than a pixel width, so the client stays free to theme them
+	// and to fall back sensibly on a narrow viewport.
+	Size string `json:"size,omitempty"`
+
+	// SubmitButtons names a select element whose options are rendered as submit
+	// buttons in place of the single submit button. The clicked option's value is
+	// submitted under that element's name, and the element itself is not rendered.
+	SubmitButtons string `json:"submit_buttons,omitempty"`
+
+	// RefreshOnReturn re-fetches the dialog from SourceURL when a dialog opened on top
+	// of it closes. The refresh request has no selected_field.
+	RefreshOnReturn bool `json:"refresh_on_return,omitempty"`
+}
+
+// DialogDateTimeConfig groups date/datetime specific configuration
+type DialogDateTimeConfig struct {
+	// MinDate: Minimum allowed date (ISO date, datetime, or relative like "+2H", "today")
+	MinDate string `json:"min_date,omitempty"`
+	// MaxDate: Maximum allowed date (ISO date, datetime, or relative like "+7d", "tomorrow")
+	MaxDate string `json:"max_date,omitempty"`
+	// TimeInterval: Minutes between time options in dropdown (default: 60)
+	TimeInterval int `json:"time_interval,omitempty"`
+	// LocationTimezone: IANA timezone for display (e.g., "America/Denver", "Asia/Tokyo")
+	LocationTimezone string `json:"location_timezone,omitempty"`
+	// ManualTimeEntry: Allow manual text entry for time instead of dropdown
+	ManualTimeEntry bool `json:"manual_time_entry,omitempty"`
+}
+
+// DialogMatrixConfig groups checkbox_matrix specific configuration.
+type DialogMatrixConfig struct {
+	Rows         []*PostActionOptions `json:"rows"`
+	Columns      []*PostActionOptions `json:"columns"`
+	RowSelection string               `json:"row_selection,omitempty"` // "multiple" | "single"
+}
+
+type DialogElement struct {
+	DisplayName   string               `json:"display_name"`
+	Name          string               `json:"name"`
+	Type          string               `json:"type"`
+	SubType       string               `json:"subtype"`
+	Default       string               `json:"default"`
+	Placeholder   string               `json:"placeholder"`
+	HelpText      string               `json:"help_text"`
+	Optional      bool                 `json:"optional"`
+	MinLength     int                  `json:"min_length"`
+	MaxLength     int                  `json:"max_length"`
+	DataSource    string               `json:"data_source"`
+	DataSourceURL string               `json:"data_source_url,omitempty"`
+	Options       []*PostActionOptions `json:"options"`
+	MultiSelect   bool                 `json:"multiselect"`
+	AllowMultiple bool                 `json:"allow_multiple,omitempty"`
+	Refresh       bool                 `json:"refresh,omitempty"`
+
+	// CollapsibleConfig holds child elements and display options for a
+	// "collapsible" element. Nil for all other element types.
+	CollapsibleConfig *DialogElementCollapsibleConfig `json:"collapsible_config,omitempty"`
+
+	// Date/datetime field configuration
+	DateTimeConfig *DialogDateTimeConfig `json:"datetime_config,omitempty"`
+
+	LabelPosition string              `json:"label_position,omitempty"` // "before" | "after"
+	MatrixConfig  *DialogMatrixConfig `json:"matrix_config,omitempty"`
+	// Action button configuration (type "action_button")
+	ActionButton *DialogActionButton `json:"action_button,omitempty"`
+}
+
+// EffectiveDateTimeConfig returns the resolved date/datetime configuration,
+// treating a nil DateTimeConfig as the zero value.
+func (e *DialogElement) EffectiveDateTimeConfig() DialogDateTimeConfig {
+	if e.DateTimeConfig != nil {
+		return *e.DateTimeConfig
+	}
+	return DialogDateTimeConfig{}
+}
+
+// EffectiveMatrixConfig returns the resolved checkbox_matrix configuration.
+func (e *DialogElement) EffectiveMatrixConfig() DialogMatrixConfig {
+	if e.MatrixConfig == nil {
+		return DialogMatrixConfig{RowSelection: DialogMatrixRowSelectionMultiple}
+	}
+	cfg := *e.MatrixConfig
+	if cfg.RowSelection == "" {
+		cfg.RowSelection = DialogMatrixRowSelectionMultiple
+	}
+	return cfg
+}
+
+type DialogActionButton struct {
+	URL     string            `json:"url"`
+	Context map[string]string `json:"context,omitempty"`
+}
+
+type DialogElementCollapsibleConfig struct {
+	// Elements are the child elements rendered inside the collapsible section.
+	Elements []DialogElement `json:"elements,omitempty"`
+	// Collapsed controls the initial open/closed state. False means expanded.
+	Collapsed bool `json:"collapsed,omitempty"`
+	// Borderless controls whether the section renders without a box outline.
+	Borderless bool `json:"borderless,omitempty"`
+}
+
+type OpenDialogRequest struct {
+	TriggerId string `json:"trigger_id"`
+	URL       string `json:"url"`
+	Dialog    Dialog `json:"dialog"`
+
+	// ChannelId is populated by the server from the trigger and sent to the client,
+	// which echoes it back on submit so the submission targets the correct channel.
+	ChannelId string `json:"channel_id,omitempty"`
+}
+
+type SubmitDialogRequest struct {
+	Type       string         `json:"type"`
+	URL        string         `json:"url,omitempty"`
+	CallbackId string         `json:"callback_id"`
+	State      string         `json:"state"`
+	UserId     string         `json:"user_id"`
+	ChannelId  string         `json:"channel_id"`
+	TeamId     string         `json:"team_id"`
+	Submission map[string]any `json:"submission"`
+	Cancelled  bool           `json:"cancelled"`
+	FileIds    []string       `json:"file_ids,omitempty"`
+}
+
+type SubmitDialogResponseType string
+
+const (
+	SubmitDialogResponseTypeEmpty    SubmitDialogResponseType = ""
+	SubmitDialogResponseTypeOK       SubmitDialogResponseType = "ok"
+	SubmitDialogResponseTypeForm     SubmitDialogResponseType = "form"
+	SubmitDialogResponseTypeNavigate SubmitDialogResponseType = "navigate"
+)
+
+type SubmitDialogResponse struct {
+	Error  string            `json:"error,omitempty"`
+	Errors map[string]string `json:"errors,omitempty"`
+	Type   string            `json:"type,omitempty"`
+	Form   *Dialog           `json:"form,omitempty"`
+}
+
+type ExecuteDialogActionRequest struct {
+	URL       string            `json:"url"`
+	Context   map[string]string `json:"context,omitempty"`
+	ChannelId string            `json:"channel_id"`
+	TeamId    string            `json:"team_id"`
+}
+
+func (r *SubmitDialogResponse) IsValid() error {
+	// If Error or Errors are set, this is valid and everything else is ignored
+	if r.Error != "" || len(r.Errors) > 0 {
+		return nil
+	}
+
+	// Validate Type field and handle Form field appropriately for each type
+	switch SubmitDialogResponseType(r.Type) {
+	case SubmitDialogResponseTypeEmpty, SubmitDialogResponseTypeOK, SubmitDialogResponseTypeNavigate:
+		// Completion types - Form field should be nil
+		if r.Form != nil {
+			return errors.Errorf("form field must be nil for type %q", r.Type)
+		}
+	case SubmitDialogResponseTypeForm:
+		// Continuation type - Form field is required and must be valid
+		if r.Form == nil {
+			return errors.New("form field is required for form type")
+		}
+		if err := r.Form.IsValid(); err != nil {
+			return errors.Wrap(err, "invalid form")
+		}
+	default:
+		return errors.Errorf("invalid type %q, must be one of: empty, ok, form, navigate", r.Type)
+	}
+
+	return nil
+}
+
+// DialogSelectOption represents an option in a select dropdown for dialogs
+type DialogSelectOption struct {
+	Text  string `json:"text"`
+	Value string `json:"value"`
+}
+
+// LookupDialogResponse represents the response for a lookup dialog request.
+type LookupDialogResponse struct {
+	Items []DialogSelectOption `json:"items"`
+}
+
+// signForGenerateTriggerId wraps the signing operation with panic recovery
+// to handle invalid signers that may cause panics in the crypto package
+func signForGenerateTriggerId(s crypto.Signer, digest []byte, opts crypto.SignerOpts) (signature []byte, err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			signature = nil
+			err = fmt.Errorf("invalid signing key: %v", r)
+		}
+	}()
+
+	return s.Sign(rand.Reader, digest, opts)
+}
+
+// GenerateTriggerId signs the context an interactive dialog needs on submit.
+func GenerateTriggerId(userId, channelId string, s crypto.Signer) (string, string, *AppError) {
+	clientTriggerId := NewId()
+	triggerData := strings.Join([]string{clientTriggerId, userId, strconv.FormatInt(GetMillis(), 10), channelId}, ":") + ":"
+
+	h := crypto.SHA256
+	sum := h.New()
+	sum.Write([]byte(triggerData))
+	signature, err := signForGenerateTriggerId(s, sum.Sum(nil), h)
+	if err != nil {
+		return "", "", NewAppError("GenerateTriggerId", "interactive_message.generate_trigger_id.signing_failed", nil, "", http.StatusInternalServerError).Wrap(err)
+	}
+
+	base64Sig := base64.StdEncoding.EncodeToString(signature)
+
+	triggerId := base64.StdEncoding.EncodeToString([]byte(triggerData + base64Sig))
+	return clientTriggerId, triggerId, nil
+}
+
+func (r *PostActionIntegrationRequest) GenerateTriggerId(s crypto.Signer) (string, string, *AppError) {
+	clientTriggerId, triggerId, appErr := GenerateTriggerId(r.UserId, r.ChannelId, s)
+	if appErr != nil {
+		return "", "", appErr
+	}
+
+	r.TriggerId = triggerId
+	return clientTriggerId, triggerId, nil
+}
+
+// DecodeAndVerifyTriggerId returns the client trigger ID, the user the trigger was
+// minted for, and the channel it originated in.
+func DecodeAndVerifyTriggerId(triggerId string, s *ecdsa.PrivateKey, timeout time.Duration) (string, string, string, *AppError) {
+	triggerIdBytes, err := base64.StdEncoding.DecodeString(triggerId)
+	if err != nil {
+		return "", "", "", NewAppError("DecodeAndVerifyTriggerId", "interactive_message.decode_trigger_id.base64_decode_failed", nil, "", http.StatusBadRequest).Wrap(err)
+	}
+
+	split := strings.Split(string(triggerIdBytes), ":")
+	if len(split) < 5 {
+		return "", "", "", NewAppError("DecodeAndVerifyTriggerId", "interactive_message.decode_trigger_id.missing_data", nil, "", http.StatusBadRequest)
+	}
+
+	clientTriggerId := split[0]
+	userId := split[1]
+	timestampStr := split[2]
+	timestamp, _ := strconv.ParseInt(timestampStr, 10, 64)
+	channelId := split[3]
+	signatureStr := split[len(split)-1]
+
+	if time.Since(time.UnixMilli(timestamp)) > timeout {
+		return "", "", "", NewAppError("DecodeAndVerifyTriggerId", "interactive_message.decode_trigger_id.expired", map[string]any{"Duration": timeout.String()}, "", http.StatusBadRequest)
+	}
+
+	signature, err := base64.StdEncoding.DecodeString(signatureStr)
+	if err != nil {
+		return "", "", "", NewAppError("DecodeAndVerifyTriggerId", "interactive_message.decode_trigger_id.base64_decode_failed_signature", nil, "", http.StatusBadRequest).Wrap(err)
+	}
+
+	var esig struct {
+		R, S *big.Int
+	}
+
+	if _, err := asn1.Unmarshal(signature, &esig); err != nil {
+		return "", "", "", NewAppError("DecodeAndVerifyTriggerId", "interactive_message.decode_trigger_id.signature_decode_failed", nil, "", http.StatusBadRequest).Wrap(err)
+	}
+
+	triggerData := strings.Join(split[:len(split)-1], ":") + ":"
+
+	h := crypto.SHA256
+	sum := h.New()
+	sum.Write([]byte(triggerData))
+
+	if !ecdsa.Verify(&s.PublicKey, sum.Sum(nil), esig.R, esig.S) {
+		return "", "", "", NewAppError("DecodeAndVerifyTriggerId", "interactive_message.decode_trigger_id.verify_signature_failed", nil, "", http.StatusBadRequest)
+	}
+
+	return clientTriggerId, userId, channelId, nil
+}
+
+func (r *OpenDialogRequest) DecodeAndVerifyTriggerId(s *ecdsa.PrivateKey, timeout time.Duration) (string, string, string, *AppError) {
+	return DecodeAndVerifyTriggerId(r.TriggerId, s, timeout)
+}
+
+func (r *OpenDialogRequest) IsValid() error {
+	var multiErr *multierror.Error
+	if r.URL == "" {
+		multiErr = multierror.Append(multiErr, errors.New("empty URL"))
+	}
+
+	if r.TriggerId == "" {
+		multiErr = multierror.Append(multiErr, errors.New("empty trigger id"))
+	}
+
+	err := r.Dialog.IsValid()
+	if err != nil {
+		multiErr = multierror.Append(multiErr, err)
+	}
+
+	return multiErr.ErrorOrNil()
+}
+
+func (d *Dialog) IsValid() error {
+	var multiErr *multierror.Error
+
+	if d.Title == "" || len(d.Title) > DialogTitleMaxLength {
+		multiErr = multierror.Append(multiErr, errors.Errorf("invalid dialog title %q", d.Title))
+	}
+
+	switch d.Size {
+	case "", DialogSizeSmall, DialogSizeMedium, DialogSizeLarge:
+	default:
+		multiErr = multierror.Append(multiErr, errors.Errorf("invalid dialog size %q", d.Size))
+	}
+
+	if d.IconURL != "" && !IsValidHTTPURL(d.IconURL) {
+		multiErr = multierror.Append(multiErr, errors.New("invalid icon url"))
+	}
+
+	if len(d.Elements) != 0 {
+		elementMap := make(map[string]bool)
+
+		for _, element := range d.Elements {
+			if elementMap[element.Name] {
+				multiErr = multierror.Append(multiErr, errors.Errorf("duplicate dialog element %q", element.Name))
+			}
+			elementMap[element.Name] = true
+
+			err := element.isValid(elementMap)
+			if err != nil {
+				multiErr = multierror.Append(multiErr, errors.Wrapf(err, "%q field is not valid", element.Name))
+			}
+		}
+	}
+
+	if d.SubmitButtons != "" {
+		// The named element is hidden and its options become the submit buttons, so it
+		// must be a static, single-value select with at least one option.
+		element := findDialogElement(d.Elements, d.SubmitButtons)
+		if element == nil || element.Type != "select" || element.DataSource != "" || element.MultiSelect || len(element.Options) == 0 {
+			multiErr = multierror.Append(multiErr, errors.Errorf("submit_buttons %q must name a static select element with at least one option", d.SubmitButtons))
+		}
+	}
+
+	if d.RefreshOnReturn && d.SourceURL == "" {
+		multiErr = multierror.Append(multiErr, errors.New("refresh_on_return requires source_url"))
+	}
+	return multiErr.ErrorOrNil()
+}
+
+// findDialogElement returns the element with the given name, searching inside
+// collapsible sections, or nil if there is none.
+func findDialogElement(elements []DialogElement, name string) *DialogElement {
+	for i := range elements {
+		if elements[i].Name == name {
+			return &elements[i]
+		}
+		if elements[i].CollapsibleConfig != nil {
+			if found := findDialogElement(elements[i].CollapsibleConfig.Elements, name); found != nil {
+				return found
+			}
+		}
+	}
+	return nil
+}
+
+func (e *DialogElement) IsValid() error {
+	seen := make(map[string]bool)
+	if e.Name != "" {
+		seen[e.Name] = true
+	}
+	return e.isValid(seen)
+}
+
+// isValid validates the element, threading a shared seen-name set through
+// recursive validation of collapsible children so duplicate names are detected
+// across the whole element tree, not just at the top level.
+func (e *DialogElement) isValid(seen map[string]bool) error {
+	var multiErr *multierror.Error
+	textSubTypes := map[string]bool{
+		"":         true,
+		"text":     true,
+		"email":    true,
+		"number":   true,
+		"tel":      true,
+		"url":      true,
+		"password": true,
+	}
+
+	multiErr = multierror.Append(multiErr, e.validateCommon())
+
+	multiErr = multierror.Append(multiErr, validateDialogElementLabelPosition(e))
+	multiErr = multierror.Append(multiErr, validateDialogElementMatrixConfigPlacement(e))
+
+	if e.AllowMultiple && e.Type != "file" {
+		multiErr = multierror.Append(multiErr, errors.Errorf("allow_multiple can only be used with file elements, got type %q", e.Type))
+	}
+
+	switch e.Type {
+	case "text":
+		multiErr = multierror.Append(multiErr, checkMaxLength("Default", e.Default, DialogElementTextMaxLength))
+		multiErr = multierror.Append(multiErr, checkMaxLength("Placeholder", e.Placeholder, DialogElementTextMaxLength))
+		if _, ok := textSubTypes[e.SubType]; !ok {
+			multiErr = multierror.Append(multiErr, errors.Errorf("invalid subtype %q", e.Type))
+		}
+
+	case "textarea":
+		multiErr = multierror.Append(multiErr, checkMaxLength("Default", e.Default, DialogElementTextareaMaxLength))
+		multiErr = multierror.Append(multiErr, checkMaxLength("Placeholder", e.Placeholder, DialogElementTextareaMaxLength))
+
+		if _, ok := textSubTypes[e.SubType]; !ok {
+			multiErr = multierror.Append(multiErr, errors.Errorf("invalid subtype %q", e.Type))
+		}
+
+	case "select":
+		multiErr = multierror.Append(multiErr, checkMaxLength("Default", e.Default, DialogElementSelectMaxLength))
+		multiErr = multierror.Append(multiErr, checkMaxLength("Placeholder", e.Placeholder, DialogElementSelectMaxLength))
+		if e.DataSource != "" && e.DataSource != "users" && e.DataSource != "channels" && e.DataSource != "dynamic" {
+			multiErr = multierror.Append(multiErr, errors.Errorf("invalid data source %q, allowed are 'users', 'channels', or 'dynamic'", e.DataSource))
+		}
+		if e.DataSource == "dynamic" {
+			// Dynamic selects should have a data_source_url
+			if e.DataSourceURL == "" {
+				multiErr = multierror.Append(multiErr, errors.New("dynamic data_source requires data_source_url"))
+			} else if !IsValidLookupURL(e.DataSourceURL) {
+				multiErr = multierror.Append(multiErr, errors.New("invalid data_source_url for dynamic select"))
+			}
+			// Dynamic selects should not have static options
+			if len(e.Options) > 0 {
+				multiErr = multierror.Append(multiErr, errors.New("dynamic select element should not have static options"))
+			}
+		} else if e.DataSource == "" {
+			if e.MultiSelect {
+				if !isMultiSelectDefaultInOptions(e.Default, e.Options) {
+					multiErr = multierror.Append(multiErr, errors.Errorf("multiselect default value %q contains values not in options", e.Default))
+				}
+			} else if !isDefaultInOptions(e.Default, e.Options) {
+				multiErr = multierror.Append(multiErr, errors.Errorf("default value %q doesn't exist in options ", e.Default))
+			}
+		}
+
+	case "bool":
+		if e.Default != "" && e.Default != "true" && e.Default != "false" {
+			multiErr = multierror.Append(multiErr, errors.New("invalid default of bool"))
+		}
+		multiErr = multierror.Append(multiErr, checkMaxLength("Placeholder", e.Placeholder, DialogElementBoolMaxLength))
+
+	case "radio":
+		if !isDefaultInOptions(e.Default, e.Options) {
+			multiErr = multierror.Append(multiErr, errors.Errorf("default value %q doesn't exist in options ", e.Default))
+		}
+
+	case "checkbox_group":
+		multiErr = multierror.Append(multiErr, validateDialogElementOptions(e.Options, 1, MaxDialogCheckboxGroupOptions, "options", ",")...)
+		multiErr = multierror.Append(multiErr, checkMaxLength("Default", e.Default, DialogElementSelectMaxLength))
+		if !isMultiSelectDefaultInOptions(e.Default, e.Options) {
+			multiErr = multierror.Append(multiErr, errors.Errorf("default value %q contains values not in options", e.Default))
+		}
+		if e.MultiSelect {
+			multiErr = multierror.Append(multiErr, errors.New("multiselect cannot be used with checkbox_group elements"))
+		}
+		if e.DataSource != "" {
+			multiErr = multierror.Append(multiErr, errors.New("checkbox_group elements cannot have a data source"))
+		}
+		if e.Placeholder != "" {
+			multiErr = multierror.Append(multiErr, errors.New("checkbox_group elements cannot have a placeholder"))
+		}
+
+	case "checkbox_matrix":
+		multiErr = multierror.Append(multiErr, validateDialogElementMatrixConfig(e)...)
+		multiErr = multierror.Append(multiErr, checkMaxLength("Default", e.Default, DialogElementSelectMaxLength))
+		if e.Default != "" {
+			multiErr = multierror.Append(multiErr, validateMatrixDefaultValue(e.Default, e.EffectiveMatrixConfig())...)
+		}
+		if len(e.Options) > 0 {
+			multiErr = multierror.Append(multiErr, errors.New("checkbox_matrix elements cannot have options"))
+		}
+		if e.MultiSelect {
+			multiErr = multierror.Append(multiErr, errors.New("multiselect cannot be used with checkbox_matrix elements"))
+		}
+		if e.DataSource != "" {
+			multiErr = multierror.Append(multiErr, errors.New("checkbox_matrix elements cannot have a data source"))
+		}
+		if e.Placeholder != "" {
+			multiErr = multierror.Append(multiErr, errors.New("checkbox_matrix elements cannot have a placeholder"))
+		}
+
+	case "date":
+		cfg := e.EffectiveDateTimeConfig()
+		multiErr = multierror.Append(multiErr, checkMaxLength("Default", e.Default, DialogElementTextMaxLength))
+		multiErr = multierror.Append(multiErr, checkMaxLength("Placeholder", e.Placeholder, DialogElementTextMaxLength))
+		multiErr = multierror.Append(multiErr, validateDateFormat(e.Default))
+		multiErr = multierror.Append(multiErr, validateDateFormat(cfg.MinDate))
+		multiErr = multierror.Append(multiErr, validateDateFormat(cfg.MaxDate))
+
+	case "datetime":
+		cfg := e.EffectiveDateTimeConfig()
+		multiErr = multierror.Append(multiErr, checkMaxLength("Default", e.Default, DialogElementTextMaxLength))
+		multiErr = multierror.Append(multiErr, checkMaxLength("Placeholder", e.Placeholder, DialogElementTextMaxLength))
+		multiErr = multierror.Append(multiErr, validateDateTimeFormat(e.Default))
+		multiErr = multierror.Append(multiErr, validateDateOrDateTimeFormat(cfg.MinDate))
+		multiErr = multierror.Append(multiErr, validateDateOrDateTimeFormat(cfg.MaxDate))
+		// Validate time_interval for datetime fields (0 means omitted — treated as default)
+		timeInterval := cfg.TimeInterval
+		if timeInterval != 0 {
+			if timeInterval < 1 || timeInterval > 1440 {
+				multiErr = multierror.Append(multiErr, errors.Errorf("time_interval must be between 1 and 1440 minutes, got %d", timeInterval))
+			} else if 1440%timeInterval != 0 {
+				multiErr = multierror.Append(multiErr, errors.Errorf("time_interval must be a divisor of 1440 (24 hours * 60 minutes) to create valid time intervals, got %d", timeInterval))
+			}
+		}
+
+	case "collapsible":
+		multiErr = multierror.Append(multiErr, e.validateCollapsible(1, seen))
+
+	case "file":
+		multiErr = multierror.Append(multiErr, checkMaxLength("Placeholder", e.Placeholder, DialogElementFileMaxLength))
+		multiErr = multierror.Append(multiErr, checkMaxLength("Default", e.Default, DialogElementFileMaxLength))
+		if e.Default != "" {
+			ids := strings.Split(e.Default, ",")
+			parsedIds := make([]string, 0, len(ids))
+			for _, id := range ids {
+				id = strings.TrimSpace(id)
+				if id == "" {
+					continue
+				}
+				if !IsValidId(id) {
+					multiErr = multierror.Append(multiErr, errors.Errorf("default file ID %q is not a valid ID", id))
+					continue
+				}
+				parsedIds = append(parsedIds, id)
+			}
+			if !e.AllowMultiple && len(parsedIds) > 1 {
+				multiErr = multierror.Append(multiErr, errors.New("default may not contain more than one file ID when allow_multiple is false"))
+			}
+			if len(parsedIds) > MaxDialogFileIds {
+				multiErr = multierror.Append(multiErr, errors.Errorf("default may not contain more than %d file IDs, got %d", MaxDialogFileIds, len(parsedIds)))
+			}
+		}
+		if len(e.Options) > 0 {
+			multiErr = multierror.Append(multiErr, errors.New("file elements cannot have options"))
+		}
+		if e.DataSource != "" {
+			multiErr = multierror.Append(multiErr, errors.New("file elements cannot have a data source"))
+		}
+
+	case "action_button":
+		if e.ActionButton == nil {
+			multiErr = multierror.Append(multiErr, errors.New("action_button element requires action_button configuration"))
+		} else if e.ActionButton.URL == "" {
+			multiErr = multierror.Append(multiErr, errors.New("action_button requires a non-empty URL"))
+		} else if !IsValidLookupURL(e.ActionButton.URL) {
+			multiErr = multierror.Append(multiErr, errors.Wrap(errors.New("invalid URL"), "invalid action_button URL"))
+		}
+
+	default:
+		multiErr = multierror.Append(multiErr, errors.Errorf("invalid element type: %q", e.Type))
+	}
+
+	return multiErr.ErrorOrNil()
+}
+
+// validateCommon runs the field-level checks that apply to every element type,
+// independent of any type-specific rules. It is shared by both leaf elements
+// (via isValid) and nested collapsible sections (via validateCollapsible) so
+// that DisplayName/Name/HelpText, MinLength/MaxLength, and MultiSelect are
+// validated for every element in the tree.
+func (e *DialogElement) validateCommon() error {
+	var multiErr *multierror.Error
+
+	if e.MinLength < 0 {
+		multiErr = multierror.Append(multiErr, errors.Errorf("min length cannot be a negative number, got %d", e.MinLength))
+	}
+	if e.MinLength > e.MaxLength {
+		multiErr = multierror.Append(multiErr, errors.Errorf("min length should be less than max length, got %d > %d", e.MinLength, e.MaxLength))
+	}
+
+	multiErr = multierror.Append(multiErr, checkMaxLength("DisplayName", e.DisplayName, DialogElementDisplayNameMaxLength))
+	multiErr = multierror.Append(multiErr, checkMaxLength("Name", e.Name, DialogElementNameMaxLength))
+	multiErr = multierror.Append(multiErr, checkMaxLength("HelpText", e.HelpText, DialogElementHelpTextMaxLength))
+
+	if e.MultiSelect && e.Type != "select" {
+		multiErr = multierror.Append(multiErr, errors.Errorf("multiselect can only be used with select elements, got type %q", e.Type))
+	}
+
+	return multiErr.ErrorOrNil()
+}
+
+// validateCollapsible validates a collapsible element and its children, enforcing
+// the maximum nesting depth. depth is the level of this collapsible, where a
+// top-level collapsible is depth 1.
+func (e *DialogElement) validateCollapsible(depth int, seen map[string]bool) error {
+	var multiErr *multierror.Error
+
+	// Checked here rather than in isValid's type switch so that a nested
+	// collapsible is covered too: nesting recurses straight into this method to
+	// preserve depth tracking and never passes back through that switch.
+	//
+	// Reporting an unknown subtype matches how Dialog.Size is handled. What
+	// that is worth is bounded by the caller: App.OpenInteractiveDialog logs
+	// whatever IsValid returns and opens the dialog anyway, so a typo like
+	// "Grid" shows up in the server log rather than being refused. The client
+	// does not rely on this and falls back to stacked for a subtype it does not
+	// recognise.
+	if e.SubType != "" && e.SubType != DialogCollapsibleSubTypeGrid {
+		multiErr = multierror.Append(multiErr, errors.Errorf("invalid collapsible subtype %q", e.SubType))
+	}
+
+	cfg := e.CollapsibleConfig
+	if cfg == nil || len(cfg.Elements) == 0 {
+		multiErr = multierror.Append(multiErr, errors.New("collapsible element must have at least one child element"))
+	}
+
+	var children []DialogElement
+	if cfg != nil {
+		children = cfg.Elements
+	}
+	for i, child := range children {
+		if seen[child.Name] {
+			multiErr = multierror.Append(multiErr, errors.Errorf("duplicate dialog element %q", child.Name))
+		}
+		seen[child.Name] = true
+
+		if child.Type == "collapsible" {
+			// Nested collapsibles are validated directly (rather than via
+			// isValid) to preserve depth tracking, so run the common
+			// field-level checks here that isValid would otherwise apply.
+			if err := child.validateCommon(); err != nil {
+				multiErr = multierror.Append(multiErr, errors.Wrapf(err, "%q child element is not valid", child.Name))
+			}
+			if depth >= DialogCollapsibleMaxDepth {
+				multiErr = multierror.Append(multiErr, errors.Errorf("collapsible nesting exceeds maximum depth of %d (child %q at index %d)", DialogCollapsibleMaxDepth, child.Name, i))
+				continue
+			}
+			if err := child.validateCollapsible(depth+1, seen); err != nil {
+				multiErr = multierror.Append(multiErr, errors.Wrapf(err, "%q child element is not valid", child.Name))
+			}
+			continue
+		}
+		if err := child.isValid(seen); err != nil {
+			multiErr = multierror.Append(multiErr, errors.Wrapf(err, "%q child element is not valid", child.Name))
+		}
+	}
+
+	return multiErr.ErrorOrNil()
+}
+
+func isDefaultInOptions(defaultValue string, options []*PostActionOptions) bool {
+	if defaultValue == "" {
+		return true
+	}
+
+	for _, option := range options {
+		if option != nil && defaultValue == option.Value {
+			return true
+		}
+	}
+
+	return false
+}
+
+func isMultiSelectDefaultInOptions(defaultValue string, options []*PostActionOptions) bool {
+	if defaultValue == "" {
+		return true
+	}
+
+	for value := range strings.SplitSeq(defaultValue, ",") {
+		// Trim whitespace around each comma-separated token so defaults like
+		// "a, b" match, without stripping spaces inside an option value (e.g.
+		// an option whose value is legitimately "high risk").
+		value = strings.TrimSpace(value)
+		if value == "" {
+			continue
+		}
+		found := false
+		for _, option := range options {
+			if option != nil && value == option.Value {
+				found = true
+				break
+			}
+		}
+		if !found {
+			return false
+		}
+	}
+
+	return true
+}
+
+func validateDialogElementLabelPosition(e *DialogElement) error {
+	if e.LabelPosition == "" {
+		return nil
+	}
+	if e.LabelPosition != DialogLabelPositionBefore && e.LabelPosition != DialogLabelPositionAfter {
+		return errors.Errorf("invalid label_position %q, must be %q or %q", e.LabelPosition, DialogLabelPositionBefore, DialogLabelPositionAfter)
+	}
+	switch e.Type {
+	case "bool", "radio", "checkbox_group":
+		return nil
+	default:
+		return errors.Errorf("label_position cannot be used with type %q", e.Type)
+	}
+}
+
+func validateDialogElementMatrixConfigPlacement(e *DialogElement) error {
+	if e.MatrixConfig == nil {
+		return nil
+	}
+	if e.Type != "checkbox_matrix" {
+		return errors.Errorf("matrix_config can only be used with checkbox_matrix elements, got type %q", e.Type)
+	}
+	return nil
+}
+
+func validateDialogElementOptions(options []*PostActionOptions, minOptions, maxOptions int, fieldName, disallowedChars string) []error {
+	var errs []error
+	if len(options) < minOptions {
+		errs = append(errs, errors.Errorf("%s must contain at least %d option(s), got %d", fieldName, minOptions, len(options)))
+		return errs
+	}
+	if len(options) > maxOptions {
+		errs = append(errs, errors.Errorf("%s may not contain more than %d option(s), got %d", fieldName, maxOptions, len(options)))
+	}
+	seen := make(map[string]bool, len(options))
+	for i, option := range options {
+		if option == nil {
+			errs = append(errs, errors.Errorf("%s[%d] is nil", fieldName, i))
+			continue
+		}
+		if err := option.IsValid(); err != nil {
+			errs = append(errs, errors.Wrapf(err, "%s[%d] is invalid", fieldName, i))
+		}
+		if disallowedChars != "" && strings.ContainsAny(option.Value, disallowedChars) {
+			errs = append(errs, errors.Errorf("%s[%d] value %q must not contain any of %q", fieldName, i, option.Value, disallowedChars))
+		}
+		if seen[option.Value] {
+			errs = append(errs, errors.Errorf("%s[%d] duplicate value %q", fieldName, i, option.Value))
+		}
+		seen[option.Value] = true
+	}
+	return errs
+}
+
+func validateDialogElementMatrixConfig(e *DialogElement) []error {
+	var errs []error
+	if e.MatrixConfig == nil {
+		errs = append(errs, errors.New("matrix_config is required for checkbox_matrix elements"))
+		return errs
+	}
+	cfg := e.MatrixConfig
+	if cfg.RowSelection != "" && cfg.RowSelection != DialogMatrixRowSelectionMultiple && cfg.RowSelection != DialogMatrixRowSelectionSingle {
+		errs = append(errs, errors.Errorf("invalid row_selection %q, must be %q or %q", cfg.RowSelection, DialogMatrixRowSelectionMultiple, DialogMatrixRowSelectionSingle))
+	}
+	// Disallow the three characters used to encode the matrix default value:
+	// ";" separates row entries, ":" separates a row from its columns, and ","
+	// separates columns. Allowing them in a row/column value would corrupt
+	// parsing of the default string in validateMatrixDefaultValue.
+	errs = append(errs, validateDialogElementOptions(cfg.Rows, 1, MaxDialogMatrixRows, "matrix_config.rows", ":,;")...)
+	errs = append(errs, validateDialogElementOptions(cfg.Columns, 1, MaxDialogMatrixColumns, "matrix_config.columns", ":,;")...)
+	return errs
+}
+
+// validateMatrixDefaultValue checks that defaultValue is a valid encoded matrix
+// selection. The format is semicolon-separated row entries, each of the form
+// "rowValue:col1,col2". For example:
+//
+//	multiple: "row1:colA,colB;row2:colA"
+//	single:   "row1:colA;row2:colB"
+func validateMatrixDefaultValue(defaultValue string, cfg DialogMatrixConfig) []error {
+	var errs []error
+	rowValues := make(map[string]bool, len(cfg.Rows))
+	for _, row := range cfg.Rows {
+		if row != nil {
+			rowValues[row.Value] = true
+		}
+	}
+	columnValues := make(map[string]bool, len(cfg.Columns))
+	for _, col := range cfg.Columns {
+		if col != nil {
+			columnValues[col.Value] = true
+		}
+	}
+	seenRows := make(map[string]bool)
+	for rowEntry := range strings.SplitSeq(defaultValue, ";") {
+		rowEntry = strings.TrimSpace(rowEntry)
+		if rowEntry == "" {
+			continue
+		}
+		rowValue, columnsPart, ok := strings.Cut(rowEntry, ":")
+		if !ok || rowValue == "" || columnsPart == "" {
+			errs = append(errs, errors.Errorf("invalid matrix default entry %q, expected row:col1,col2", rowEntry))
+			continue
+		}
+		if !rowValues[rowValue] {
+			errs = append(errs, errors.Errorf("matrix default row %q is not in matrix_config.rows", rowValue))
+		}
+		if seenRows[rowValue] {
+			errs = append(errs, errors.Errorf("duplicate row %q in matrix default", rowValue))
+		}
+		seenRows[rowValue] = true
+		columnCount := 0
+		for colValue := range strings.SplitSeq(columnsPart, ",") {
+			colValue = strings.TrimSpace(colValue)
+			if colValue == "" {
+				errs = append(errs, errors.Errorf("invalid empty column in matrix default entry %q", rowEntry))
+				continue
+			}
+			columnCount++
+			if !columnValues[colValue] {
+				errs = append(errs, errors.Errorf("matrix default column %q is not in matrix_config.columns", colValue))
+			}
+		}
+		if cfg.RowSelection == DialogMatrixRowSelectionSingle && columnCount > 1 {
+			errs = append(errs, errors.Errorf("matrix default entry %q has multiple columns but row_selection is single", rowEntry))
+		}
+	}
+	return errs
+}
+
+// validateRelativePattern validates relative date patterns like +1d, +2w, +1m, +2H, +30M, +90S
+// Case-sensitive: d=days, w=weeks, m=months, H=hours, M=minutes, S=seconds
+func validateRelativePattern(value string) bool {
+	if len(value) < 3 || len(value) > 5 || (value[0] != '+' && value[0] != '-') {
+		return false
+	}
+
+	lastChar := value[len(value)-1]
+	if !strings.ContainsRune("dwmHMS", rune(lastChar)) {
+		return false
+	}
+
+	numberPart := value[1 : len(value)-1]
+	_, err := strconv.Atoi(numberPart)
+	return err == nil
+}
+
+// isValidRelativeFormat checks if a string matches relative date patterns
+func isValidRelativeFormat(value string) bool {
+	relativeFormats := []string{"today", "tomorrow", "yesterday"}
+	return slices.Contains(relativeFormats, value) || validateRelativePattern(value)
+}
+
+// validateDateFormat validates date strings: ISO date, datetime (with warning), or relative formats
+func validateDateFormat(dateStr string) error {
+	if dateStr == "" {
+		return nil
+	}
+
+	if isValidRelativeFormat(dateStr) {
+		return nil
+	}
+	if _, err := time.Parse(ISODateFormat, dateStr); err == nil {
+		return nil
+	}
+
+	for _, format := range commonDateTimeFormats {
+		if parsedTime, err := time.Parse(format, dateStr); err == nil {
+			dateOnly := parsedTime.Format(ISODateFormat)
+			return fmt.Errorf("date field received datetime format %q, only date portion %q will be used. Consider using date format instead", dateStr, dateOnly)
+		}
+	}
+
+	return fmt.Errorf("invalid date format: %q, expected ISO format (YYYY-MM-DD), datetime format, or relative format", dateStr)
+}
+
+// validateDateTimeFormat validates datetime strings: ISO datetime or relative formats
+func validateDateTimeFormat(dateTimeStr string) error {
+	if dateTimeStr == "" || isValidRelativeFormat(dateTimeStr) {
+		return nil
+	}
+
+	for _, format := range commonDateTimeFormats {
+		if _, err := time.Parse(format, dateTimeStr); err == nil {
+			return nil
+		}
+	}
+
+	return fmt.Errorf("invalid datetime format: %q, expected ISO format (YYYY-MM-DDTHH:MM:SSZ) or relative format", dateTimeStr)
+}
+
+func validateDateOrDateTimeFormat(value string) error {
+	dateErr := validateDateFormat(value)
+	if dateErr == nil {
+		return nil
+	}
+	dateTimeErr := validateDateTimeFormat(value)
+	if dateTimeErr == nil {
+		return nil
+	}
+	return fmt.Errorf("invalid date or datetime format: %q, expected ISO date (YYYY-MM-DD), datetime (YYYY-MM-DDTHH:MM:SSZ), or relative format", value)
+}
+
+func checkMaxLength(fieldName string, field string, maxLength int) error {
+	// DisplayName and Name are required fields
+	if fieldName == "DisplayName" || fieldName == "Name" {
+		if len(field) == 0 {
+			return errors.Errorf("%v cannot be empty", fieldName)
+		}
+	}
+
+	if len(field) > maxLength {
+		return errors.Errorf("%v cannot be longer than %d characters, got %d", fieldName, maxLength, len(field))
+	}
+
+	return nil
+}
+
+func (o *Post) StripActionIntegrations() {
+	attachments := o.Attachments()
+	if o.GetProp(PostPropsAttachments) != nil {
+		o.AddProp(PostPropsAttachments, attachments)
+	}
+	for _, attachment := range attachments {
+		for _, action := range attachment.Actions {
+			action.Integration = nil
+		}
+	}
+	o.StripMmBlocksActionSecrets()
+}
+
+func (o *Post) GetAction(id string) *PostAction {
+	for _, attachment := range o.Attachments() {
+		for _, action := range attachment.Actions {
+			if action != nil && action.Id == id {
+				return action
+			}
+		}
+	}
+	if spec := o.GetMmBlocksActionSpec(id); spec != nil && spec.Type == MmBlocksActionTypeExternal && spec.URL != "" {
+		// Synthesize a PostAction so the existing click pipeline can
+		// dispatch without branching on action source. Pre-merge the
+		// spec's static per-action query into the URL here; per-click
+		// query (from DoPostActionRequest.Query) is merged on top by the
+		// caller via MergeQueryIntoURL, with per-click overriding static
+		// values on overlapping keys.
+		url := spec.URL
+		if len(spec.Query) > 0 {
+			merged, err := MergeQueryIntoURL(spec.URL, spec.Query)
+			if err != nil {
+				// Spec URL is malformed. ValidateMmBlocksActions
+				// should have rejected it at save time, so this is a
+				// belt-and-suspenders guard. Returning nil routes the
+				// caller through the standard "action not found"
+				// 404 path rather than firing a request to a URL
+				// that's missing the static query params.
+				return nil
+			}
+			url = merged
+		}
+		return &PostAction{
+			Id:   id,
+			Type: PostActionTypeButton,
+			Integration: &PostActionIntegration{
+				URL:     url,
+				Context: spec.Context,
+			},
+		}
+	}
+	return nil
+}
+
+var mmBlocksActionIDRegex = regexp.MustCompile(`^[A-Za-z0-9_-]+$`)
+
+// ValidateMmBlocksActions verifies the post's mm_blocks_actions prop has the
+// expected shape and bounds. Each entry must coerce to a valid spec via
+// mmBlocksEntryMapToSpec.
+func ValidateMmBlocksActions(o *Post) error {
+	referenced := CollectInteractiveActionIDsFromPost(o)
+	raw := o.GetProp(PostPropsMmBlocksActions)
+	if raw == nil {
+		if len(referenced) > 0 {
+			return fmt.Errorf("interactive content requires mm_blocks_actions")
+		}
+		return nil
+	}
+	actions, ok := coerceToStringAnyMap(raw)
+	if !ok {
+		return fmt.Errorf("mm_blocks_actions must be a map")
+	}
+	if len(actions) > MaxMmBlocksActionsPerPost {
+		return fmt.Errorf("mm_blocks_actions exceeds maximum of %d entries", MaxMmBlocksActionsPerPost)
+	}
+	for key, entry := range actions {
+		if len(key) > MaxMmBlocksActionKeyLength {
+			return fmt.Errorf("mm_blocks_actions key exceeds %d chars", MaxMmBlocksActionKeyLength)
+		}
+		if !mmBlocksActionIDRegex.MatchString(key) {
+			return fmt.Errorf("mm_blocks_actions key %q must contain only letters, numbers, underscores, or hyphens", key)
+		}
+		entryMap, ok := coerceToStringAnyMap(entry)
+		if !ok {
+			return fmt.Errorf("mm_blocks_actions entry %q must be an object", key)
+		}
+		spec := mmBlocksEntryMapToSpec(entryMap)
+		if spec == nil {
+			return fmt.Errorf("mm_blocks_actions entry %q has invalid type or shape", key)
+		}
+		switch spec.Type {
+		case MmBlocksActionTypeExternal:
+			if err := validateIntegrationURL(spec.URL); err != nil {
+				return fmt.Errorf("mm_blocks_actions entry %q: %w", key, err)
+			}
+			// Bound the per-spec static query so a bot cannot stash
+			// unbounded data in the post that gets merged into the
+			// outgoing URL on every click.
+			if err := ValidateActionQuery(spec.Query); err != nil {
+				return fmt.Errorf("mm_blocks_actions entry %q static query: %w", key, err)
+			}
+			// Bound entry count and key length on the static context.
+			// Values are arbitrary JSON, so size is constrained by the
+			// outer post-size limit; we cap entries to prevent crafted
+			// posts from inflating GetAction's clone cost.
+			if len(spec.Context) > MaxActionQueryEntries {
+				return fmt.Errorf("mm_blocks_actions entry %q context exceeds maximum of %d entries", key, MaxActionQueryEntries)
+			}
+			for k := range spec.Context {
+				if len(k) > MaxActionQueryKeyLength {
+					return fmt.Errorf("mm_blocks_actions entry %q context key exceeds %d chars", key, MaxActionQueryKeyLength)
+				}
+			}
+		case MmBlocksActionTypeOpenURL:
+			if err := validateOpenURL(spec.URL); err != nil {
+				return fmt.Errorf("mm_blocks_actions entry %q: %w", key, err)
+			}
+			if err := ValidateActionQuery(spec.Query); err != nil {
+				return fmt.Errorf("mm_blocks_actions entry %q static query: %w", key, err)
+			}
+		}
+	}
+	return validateMmBlocksActionsPairing(o, actions)
+}
+
+// ValidateActionQuery bounds the size of user-supplied per-click query
+// parameters so a crafted post cannot trigger unbounded memory use in the
+// plugin-request path.
+func ValidateActionQuery(q map[string]string) error {
+	if len(q) > MaxActionQueryEntries {
+		return fmt.Errorf("query exceeds maximum of %d entries", MaxActionQueryEntries)
+	}
+	for key, value := range q {
+		if len(key) > MaxActionQueryKeyLength {
+			return fmt.Errorf("query key exceeds %d chars", MaxActionQueryKeyLength)
+		}
+		if len(value) > MaxActionQueryValueLength {
+			return fmt.Errorf("query value for %q exceeds %d chars", key, MaxActionQueryValueLength)
+		}
+	}
+	return nil
+}
+
+func validateIntegrationURL(rawURL string) error {
+	if rawURL == "" {
+		return fmt.Errorf("must have a non-empty URL")
+	}
+	if !(strings.HasPrefix(rawURL, "/plugins/") || strings.HasPrefix(rawURL, "plugins/") || IsValidHTTPURL(rawURL)) {
+		return fmt.Errorf("must have a valid integration URL")
+	}
+	// Reject path-traversal segments. /plugins/ URLs are routed by the
+	// local server, so a `..` segment can escape the plugin namespace and
+	// hit unrelated server routes. url.Parse decodes percent-encoded path
+	// bytes into u.Path, which is the same single decode pass that
+	// doPluginRequest performs at dispatch — so encoded forms like
+	// %2e%2e%2f are caught here symmetrically with how the router would
+	// resolve them.
+	u, parseErr := url.Parse(rawURL)
+	if parseErr != nil {
+		return fmt.Errorf("must have a valid integration URL: %w", parseErr)
+	}
+	if pathHasTraversalSegment(u.Path) {
+		return fmt.Errorf("integration URL must not contain path traversal segments")
+	}
+	return nil
+}
+
+// validateOpenURL bounds openURL goto targets. Relative paths (/) are used
+// for in-app navigation via applyIntegrationGotoLocation; http(s) URLs open in
+// a new tab. Plugin integration paths are not allowed here — those belong on
+// external actions.
+func validateOpenURL(rawURL string) error {
+	if rawURL == "" {
+		return fmt.Errorf("must have a non-empty URL")
+	}
+	if strings.HasPrefix(rawURL, "/") {
+		if strings.HasPrefix(rawURL, "//") {
+			return fmt.Errorf("must not be a protocol-relative URL")
+		}
+		if strings.HasPrefix(rawURL, "/plugins/") {
+			return fmt.Errorf("plugin paths are not allowed for openURL actions")
+		}
+		u, parseErr := url.Parse(rawURL)
+		if parseErr != nil {
+			return fmt.Errorf("must have a valid path: %w", parseErr)
+		}
+		if pathHasTraversalSegment(u.Path) {
+			return fmt.Errorf("must not contain path traversal segments")
+		}
+		return nil
+	}
+	if !IsValidHTTPURL(rawURL) {
+		return fmt.Errorf("must have a valid http or https URL, or a path starting with /")
+	}
+	return nil
+}
+
+func pathHasTraversalSegment(path string) bool {
+	return strings.Contains(path, "/../") || strings.HasSuffix(path, "/..") ||
+		path == "/.." || strings.HasPrefix(path, "/..")
+}
+
+func (o *Post) GenerateActionIds() {
+	if o.GetProp(PostPropsAttachments) != nil {
+		o.AddProp(PostPropsAttachments, o.Attachments())
+	}
+	if attachments, ok := o.GetProp(PostPropsAttachments).([]*MessageAttachment); ok {
+		for _, attachment := range attachments {
+			for _, action := range attachment.Actions {
+				if action != nil && action.Id == "" {
+					action.Id = NewId()
+				}
+			}
+		}
+	}
+}
+
+func AddPostActionCookies(o *Post, secret []byte) *Post {
+	p := o.Clone()
+
+	// retainedProps carry over their value from the old post, including no value
+	retainProps := map[string]any{}
+	removeProps := []string{}
+	for _, key := range PostActionRetainPropKeys {
+		value, ok := p.GetProps()[key]
+		if ok {
+			retainProps[key] = value
+		} else {
+			removeProps = append(removeProps, key)
+		}
+	}
+
+	attachments := p.Attachments()
+	for _, attachment := range attachments {
+		for _, action := range attachment.Actions {
+			c := &PostActionCookie{
+				Type:        action.Type,
+				ChannelId:   p.ChannelId,
+				DataSource:  action.DataSource,
+				Integration: action.Integration,
+				RetainProps: retainProps,
+				RemoveProps: removeProps,
+			}
+
+			c.PostId = p.Id
+			if p.RootId == "" {
+				c.RootPostId = p.Id
+			} else {
+				c.RootPostId = p.RootId
+			}
+
+			b, _ := json.Marshal(c)
+			action.Cookie, _ = EncryptPostActionCookie(string(b), secret)
+		}
+	}
+
+	AddMmBlocksActionCookies(p, secret)
+
+	return p
+}
+
+// EncryptPostActionCookie encrypts a plaintext post action cookie payload.
+// Exposed for testing.
+func EncryptPostActionCookie(plain string, secret []byte) (string, error) {
+	if len(secret) == 0 {
+		return plain, nil
+	}
+
+	block, err := aes.NewCipher(secret)
+	if err != nil {
+		return "", err
+	}
+
+	aesgcm, err := cipher.NewGCM(block)
+	if err != nil {
+		return "", err
+	}
+
+	nonce := make([]byte, aesgcm.NonceSize())
+	_, err = io.ReadFull(rand.Reader, nonce)
+	if err != nil {
+		return "", err
+	}
+
+	sealed := aesgcm.Seal(nil, nonce, []byte(plain), nil)
+
+	combined := append(nonce, sealed...) //nolint:makezero
+	encoded := make([]byte, base64.StdEncoding.EncodedLen(len(combined)))
+	base64.StdEncoding.Encode(encoded, combined)
+
+	return string(encoded), nil
+}
+
+func DecryptPostActionCookie(encoded string, secret []byte) (string, error) {
+	if len(secret) == 0 {
+		return encoded, nil
+	}
+
+	block, err := aes.NewCipher(secret)
+	if err != nil {
+		return "", err
+	}
+
+	aesgcm, err := cipher.NewGCM(block)
+	if err != nil {
+		return "", err
+	}
+
+	decoded := make([]byte, base64.StdEncoding.DecodedLen(len(encoded)))
+	n, err := base64.StdEncoding.Decode(decoded, []byte(encoded))
+	if err != nil {
+		return "", err
+	}
+	decoded = decoded[:n]
+
+	nonceSize := aesgcm.NonceSize()
+	if len(decoded) < nonceSize {
+		return "", fmt.Errorf("cookie too short")
+	}
+
+	nonce, decoded := decoded[:nonceSize], decoded[nonceSize:]
+	plain, err := aesgcm.Open(nil, nonce, decoded, nil)
+	if err != nil {
+		return "", err
+	}
+
+	return string(plain), nil
+}
+
+// IsValidLookupURL validates if a URL is safe for lookup operations
+func IsValidLookupURL(url string) bool {
+	if url == "" {
+		return false
+	}
+
+	// Allow plugin paths that start with /plugins/
+	if strings.HasPrefix(url, "/plugins/") {
+		// Additional validation for plugin paths - ensure no path traversal
+		if strings.Contains(url, "..") || strings.Contains(url, "//") {
+			return false
+		}
+		return true
+	}
+
+	// For external URLs, use the same basic validation as other models
+	return IsValidHTTPURL(url)
+}

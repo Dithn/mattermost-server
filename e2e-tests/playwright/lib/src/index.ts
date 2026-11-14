@@ -1,0 +1,186 @@
+// Copyright (c) 2015-present Mattermost, Inc. All Rights Reserved.
+// See LICENSE.txt for license information.
+
+export {test, expect, PlaywrightExtended} from './test_fixture';
+export type {ExtendedFixtures} from './test_fixture';
+export {testConfig, TESTCONTAINERS_SERVICE_NAMES, SERVER_DEPLOYMENTS} from './test_config';
+export type {TestContainersServiceName, ServerDeployment} from './test_config';
+export {
+    assertUpgradeFromFreshStart,
+    assertUpgradeToRequiresPriorFromRun,
+    exportUpgradePathProjectSelection,
+    getUpgradeFromServerImage,
+    getUpgradeToServerImage,
+    isUpgradeFromProjectSelected,
+    isUpgradePathProjectSelected,
+    isUpgradeToPhaseProjectSelected,
+    logUpgradeFromServerImage,
+    logUpgradeToServerImage,
+    UPGRADE_FROM_SERVER_IMAGE_ENV,
+} from './upgrade_env';
+export {baseGlobalSetup} from './global_setup';
+export {clearGlobalSetupFailure, readGlobalSetupFailure, recordGlobalSetupFailure} from './global_setup_failure';
+export {TestBrowser} from './browser_context';
+export {assetPath, getBlobFromAsset, getFileFromAsset, getFileData, getBlobData} from './file';
+export {setupFileServer} from './file_server';
+export {decomposeKorean, koreanTestPhrase, typeHangulCharacterWithIme, typeHangulWithIme} from './ime';
+export {type SizeObservation, type SizeWatcher, watchElementSize} from './layout_shift';
+export {duration, getRandomId, wait, newTestPassword} from './util';
+export {LicenseSkus, appsPluginId, callsPluginId, demoPluginId, demoPluginUrl, playbooksPluginId} from './constant';
+
+export {
+    getAdminClient,
+    getRecentEmail,
+    extractEmailLink,
+    isWebhookTestServerReachable,
+    setupWebhookTestServer,
+    PlaywrightClient4,
+    generateLdapUser,
+    createLdapUser,
+    updateLdapUser,
+    deleteLdapUser,
+    ldapServerConfig,
+    ensureOpenldap,
+    createKeycloakUser,
+    deleteKeycloakUser,
+    listMinioObjectKeys,
+    ensureMinio,
+    samlServerConfig,
+    ensureKeycloak,
+    elasticsearchServerConfig,
+    opensearchServerConfig,
+    ensureElasticsearch,
+    ensureOpensearch,
+    ensureAzurite,
+    listAzuriteBlobNames,
+    ensureLocalFile,
+    listMattermostDataFiles,
+    ensurePostgresSearch,
+    ensureFeatureFlag,
+    requireSubpathServer,
+    runMmctl,
+    ensureMmctl,
+    upgradeServerImage,
+    saveUpgradePhaseLogs,
+    ensureDemoPlugin,
+    installAndEnablePlugin,
+    getPluginStatus,
+    isPluginActive,
+    buildWebappPluginBundle,
+    ensureTestWebappPlugins,
+    postAuthTestPluginId,
+    preAuthTestPluginId,
+    removeTestWebappPlugins,
+    testWebappPluginMarkerTestId,
+    testWebappPluginRoute,
+} from './server';
+export type {
+    EnsureDemoPluginOptions,
+    WebappPluginBundleOptions,
+    InbucketEmail,
+    LdapUser,
+    KeycloakUser,
+    MmctlResult,
+    UpgradeLogPhase,
+} from './server';
+
+export {startStack, stopStack, withStackLock} from './containers';
+
+export {
+    ChannelsPage,
+    LandingLoginPage,
+    LoginPage,
+    RecapsPage,
+    ResetPasswordPage,
+    SignupPage,
+    ScheduledPostsPage,
+    SystemConsolePage,
+    DraftsPage,
+} from './ui/pages';
+
+export {
+    components,
+    AboutBuildModal,
+    GlobalHeader,
+    SearchBox,
+    ChannelsCenterView,
+    ChannelsSidebarLeft,
+    ChannelsSidebarRight,
+    ChannelsAppBar,
+    ChannelsHeader,
+    ChannelsPostCreate,
+    ChannelsPostEdit,
+    ChannelsPost,
+    ChannelSettingsModal,
+    DraftPost,
+    FindChannelsModal,
+    DeletePostModal,
+    DeleteScheduledPostModal,
+    SettingsModal,
+    PostDotMenu,
+    PostMenu,
+    ThreadFooter,
+    Footer,
+    MainHeader,
+    PostReminderMenu,
+    EmojiGifPicker,
+    GenericConfirmModal,
+    ScheduleMessageMenu,
+    ScheduleMessageModal,
+    ScheduledPostIndicator,
+    ScheduledDraftModal,
+    ScheduledPost,
+    SendMessageNowModal,
+    SystemConsoleFeatureDiscovery,
+    MessagePriority,
+    UserProfilePopover,
+    UserAccountMenu,
+    DeletePostConfirmationDialog,
+    RestorePostConfirmationDialog,
+    ProfileModal,
+    WysiwygEditor,
+} from './ui/components';
+export type {PriorityOption} from './ui/components';
+
+export {setWysiwygUserPreference, WYSIWYG_PREF_CATEGORY, WYSIWYG_PREF_NAME} from './wysiwyg_helpers';
+
+export {TextInputSetting} from './ui/components/system_console/base_components';
+
+export {expectFilesVisible, expectFilesRedacted} from './ui/components/channels/post';
+
+export {TestArgs, ScreenshotOptions} from './types';
+
+export {
+    enableAutotranslationConfig,
+    disableAutotranslationConfig,
+    enableChannelAutotranslation,
+    disableChannelAutotranslation,
+    setUserChannelAutotranslation,
+    setMockSourceLanguage,
+} from './autotranslation_helpers';
+export type {EnableAutotranslationOptions} from './autotranslation_helpers';
+export {
+    hasAutotranslationLicense,
+    hasEnterpriseLicense,
+    hasSharedChannelsLicense,
+    hasCustomPermissionsSchemesLicense,
+    licenseTier,
+} from './license_helpers';
+
+// ABAC (Attribute-Based Access Control) helpers
+export {
+    createUserWithAttributes,
+    enableABAC,
+    disableABAC,
+    navigateToABACPage,
+    navigateToPermissionPoliciesPage,
+    navigateToAttributeBasedAccessPage,
+    createBasicPolicy,
+    createAdvancedPolicy,
+    editPolicy,
+    deletePolicy,
+    runSyncJob,
+    verifyUserInChannel,
+    verifyUserNotInChannel,
+    updateUserAttributes,
+} from './server';

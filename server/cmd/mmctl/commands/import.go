@@ -1,0 +1,783 @@
+// Copyright (c) 2015-present Mattermost, Inc. All Rights Reserved.
+// See LICENSE.txt for license information.
+
+package commands
+
+import (
+	"bufio"
+	"context"
+	"errors"
+	"fmt"
+	"io"
+	"os"
+	"path"
+	"path/filepath"
+	"runtime"
+	"strconv"
+	"strings"
+	"text/template"
+	"time"
+
+	"golang.org/x/term"
+
+	"github.com/mattermost/mattermost/server/public/model"
+	"github.com/spf13/cobra"
+
+	"github.com/mattermost/mattermost/server/v8/cmd/mmctl/client"
+	"github.com/mattermost/mattermost/server/v8/cmd/mmctl/commands/importer"
+	"github.com/mattermost/mattermost/server/v8/cmd/mmctl/printer"
+)
+
+var ImportCmd = &cobra.Command{
+	Use:   "import",
+	Short: "Management of imports",
+}
+
+var ImportUploadCmd = &cobra.Command{
+	Use:     "upload [filepath]",
+	Short:   "Upload import files",
+	Example: "  import upload import_file.zip",
+	Args:    cobra.ExactArgs(1),
+	RunE:    withClient(importUploadCmdF),
+}
+
+var ImportDeleteCmd = &cobra.Command{
+	Use:     "delete [importname]",
+	Short:   "Delete an import file",
+	Example: "  import delete import_file.zip",
+	Args:    cobra.ExactArgs(1),
+	RunE:    withClient(importDeleteCmdF),
+}
+
+var ImportListCmd = &cobra.Command{
+	Use:     "list",
+	Aliases: []string{"ls"},
+	Short:   "List import files",
+	Example: " import list",
+}
+
+var ImportListAvailableCmd = &cobra.Command{
+	Use:     "available",
+	Short:   "List available import files",
+	Example: "  import list available",
+	Args:    cobra.NoArgs,
+	RunE:    withClient(importListAvailableCmdF),
+}
+
+var ImportJobCmd = &cobra.Command{
+	Use:   "job",
+	Short: "List and show import jobs",
+}
+
+var ImportListIncompleteCmd = &cobra.Command{
+	Use:     "incomplete",
+	Short:   "List incomplete import files uploads",
+	Example: "  import list incomplete",
+	Args:    cobra.NoArgs,
+	RunE:    withClient(importListIncompleteCmdF),
+}
+
+var ImportJobListCmd = &cobra.Command{
+	Use:     "list",
+	Example: "  import job list",
+	Short:   "List import jobs",
+	Aliases: []string{"ls"},
+	Args:    cobra.NoArgs,
+	RunE:    withClient(importJobListCmdF),
+}
+
+var ImportJobShowCmd = &cobra.Command{
+	Use:     "show [importJobID]",
+	Example: " import job show f3d68qkkm7n8xgsfxwuo498rah",
+	Short:   "Show import job",
+	Args:    cobra.ExactArgs(1),
+	RunE:    withClient(importJobShowCmdF),
+}
+
+var ImportProcessCmd = &cobra.Command{
+	Use:     "process [importname]",
+	Example: "  import process 35uy6cwrqfnhdx3genrhqqznxc_import.zip",
+	Short:   "Start an import job",
+	Args:    cobra.ExactArgs(1),
+	RunE:    withClient(importProcessCmdF),
+}
+
+var ImportValidateCmd = &cobra.Command{
+	Use:     "validate [filepath]",
+	Example: "  import validate import_file.zip --team myteam --team myotherteam",
+	Short:   "Validate an import file",
+	Args:    cobra.ExactArgs(1),
+	RunE: func(command *cobra.Command, args []string) error {
+		return importValidateCmdF(nil, command, args)
+	},
+}
+
+func init() {
+	ImportUploadCmd.Flags().Bool("resume", false, "Set to true to resume an incomplete import upload.")
+	ImportUploadCmd.Flags().String("upload", "", "The ID of the import upload to resume.")
+
+	ImportJobListCmd.Flags().Int("page", 0, "Page number to fetch for the list of import jobs")
+	ImportJobListCmd.Flags().Int("per-page", DefaultPageSize, "Number of import jobs to be fetched")
+	ImportJobListCmd.Flags().Bool("all", false, "Fetch all import jobs. --page flag will be ignore if provided")
+
+	ImportValidateCmd.Flags().StringArray("team", nil, "Predefined team[s] to assume as already present on the destination server. Implies --check-missing-teams. The flag can be repeated")
+	ImportValidateCmd.Flags().Bool("check-missing-teams", false, "Check for teams that are not defined but referenced in the archive")
+	ImportValidateCmd.Flags().Bool("ignore-attachments", false, "Don't check if the attached files are present in the archive")
+	ImportValidateCmd.Flags().Bool("check-server-duplicates", true, "Set to false to ignore teams, channels, and users already present on the server")
+
+	ImportProcessCmd.Flags().Bool("bypass-upload", false, "If this is set, the file is not processed from the server, but rather directly read from the filesystem. Works only in --local mode.")
+	ImportProcessCmd.Flags().Bool("extract-content", true, "If this is set, document attachments will be extracted and indexed during the import process. It is advised to disable it to improve performance.")
+	ImportProcessCmd.Flags().Int("workers", 0, "The number of concurrent import worker goroutines. Controls database load during import. When set to 0 (default), uses the number of CPUs available. Maximum allowed is 4x the CPU count.")
+	ImportProcessCmd.Flags().String("destination-team-name", "", "Map the source team in the export to an existing team on the destination server (by name/slug). Works with both channel-scoped and full-team exports. Mutually exclusive with --destination-team-id.")
+	ImportProcessCmd.Flags().String("destination-team-id", "", "Map the source team in the export to an existing team on the destination server (by ID). Mutually exclusive with --destination-team-name.")
+	ImportProcessCmd.Flags().String("destination-channel-name", "", "Map the source channel in the export to a different channel name on the destination server (by name). Only valid for channel-scoped exports. Mutually exclusive with --destination-channel-id.")
+	ImportProcessCmd.Flags().String("destination-channel-id", "", "Map the source channel in the export to a different channel on the destination server (by ID). Only valid for channel-scoped exports. Mutually exclusive with --destination-channel-name.")
+	ImportProcessCmd.Flags().Bool("skip-preflight", false, "Skip the checks run before anything is imported. By default the import fails if an auth provider present in the export is not enabled on the destination, or if the import would take a team past TeamSettings.MaxUsersPerTeam. Use this flag only after reviewing the preflight error and accepting the risk.")
+	ImportProcessCmd.Flags().String("imported-users", "", "Required for a scoped (team- or channel-scoped) export: the access posture for accounts the import creates. Use \"active\" when importing into a new instance these users are moving to, so they can sign in. Use \"inactive\" when importing into an existing instance, so accounts created from weak identity matches stay deactivated until an admin reviews them. Users deactivated on the source stay deactivated either way, and accounts that already exist on the destination are not affected. Ignored for a full-instance import.")
+
+	ImportListCmd.AddCommand(
+		ImportListAvailableCmd,
+		ImportListIncompleteCmd,
+	)
+	ImportJobCmd.AddCommand(
+		ImportJobListCmd,
+		ImportJobShowCmd,
+	)
+	ImportCmd.AddCommand(
+		ImportUploadCmd,
+		ImportListCmd,
+		ImportProcessCmd,
+		ImportJobCmd,
+		ImportValidateCmd,
+		ImportDeleteCmd,
+	)
+	RootCmd.AddCommand(ImportCmd)
+}
+
+func importListIncompleteCmdF(c client.Client, command *cobra.Command, args []string) error {
+	isLocal, _ := command.Flags().GetBool("local")
+	userID := "me"
+	if isLocal {
+		userID = model.UploadNoUserID
+	}
+
+	uploads, _, err := c.GetUploadsForUser(context.TODO(), userID)
+	if err != nil {
+		return fmt.Errorf("failed to get uploads: %w", err)
+	}
+
+	var hasImports bool
+	for _, us := range uploads {
+		if us.Type == model.UploadTypeImport {
+			completedPct := float64(us.FileOffset) / float64(us.FileSize) * 100
+			printer.PrintT(fmt.Sprintf("  ID: {{.Id}}\n  Name: {{.Filename}}\n  Uploaded: {{.FileOffset}}/{{.FileSize}} (%0.0f%%)\n", completedPct), us)
+			hasImports = true
+		}
+	}
+
+	if !hasImports {
+		printer.Print("No incomplete import uploads found")
+		return nil
+	}
+
+	return nil
+}
+
+func importListAvailableCmdF(c client.Client, command *cobra.Command, args []string) error {
+	imports, _, err := c.ListImports(context.TODO())
+	if err != nil {
+		return fmt.Errorf("failed to list imports: %w", err)
+	}
+
+	if len(imports) == 0 {
+		printer.Print("No import files found")
+		return nil
+	}
+
+	for _, name := range imports {
+		printer.Print(name)
+	}
+
+	return nil
+}
+
+func importUploadCmdF(c client.Client, command *cobra.Command, args []string) error {
+	filepath := args[0]
+
+	isLocal, _ := command.Flags().GetBool("local")
+	if isLocal {
+		printer.PrintWarning("In --local mode, you don't need to upload the file to server any more. Directly use the import process command with the --bypass-upload flag and pass the export file.")
+	}
+
+	file, err := os.Open(filepath)
+	if err != nil {
+		return fmt.Errorf("failed to open import file: %w", err)
+	}
+	defer file.Close()
+
+	info, err := file.Stat()
+	if err != nil {
+		return fmt.Errorf("failed to stat import file: %w", err)
+	}
+
+	shouldResume, _ := command.Flags().GetBool("resume")
+	var us *model.UploadSession
+	if shouldResume {
+		uploadID, nErr := command.Flags().GetString("upload")
+		if nErr != nil || !model.IsValidId(uploadID) {
+			return errors.New("upload session ID is missing or invalid")
+		}
+
+		us, _, err = c.GetUpload(context.TODO(), uploadID)
+		if err != nil {
+			return fmt.Errorf("failed to get upload session: %w", err)
+		}
+
+		if us.FileSize != info.Size() {
+			return fmt.Errorf("file sizes do not match")
+		}
+
+		if _, nErr := file.Seek(us.FileOffset, io.SeekStart); nErr != nil {
+			return fmt.Errorf("failed to get seek file: %w", nErr)
+		}
+	} else {
+		isLocal, _ := command.Flags().GetBool("local")
+		userID := "me"
+		if isLocal {
+			userID = model.UploadNoUserID
+		}
+
+		us, _, err = c.CreateUpload(context.TODO(), &model.UploadSession{
+			Filename: info.Name(),
+			FileSize: info.Size(),
+			Type:     model.UploadTypeImport,
+			UserId:   userID,
+		})
+		if err != nil {
+			return fmt.Errorf("failed to create upload session: %w", err)
+		}
+
+		printer.PrintT("Upload session successfully created, ID: {{.Id}} ", us)
+	}
+
+	finfo, _, err := c.UploadData(context.TODO(), us.Id, file)
+	if err != nil {
+		return fmt.Errorf("failed to upload data: %w", err)
+	}
+
+	printer.PrintT("Import file successfully uploaded, name: {{.Id}}", finfo)
+
+	return nil
+}
+
+func importDeleteCmdF(c client.Client, command *cobra.Command, args []string) error {
+	importName := args[0]
+
+	if _, err := c.DeleteImport(context.TODO(), importName); err != nil {
+		return fmt.Errorf("failed to delete import: %w", err)
+	}
+
+	printer.Print(fmt.Sprintf("Import file %q has been deleted", importName))
+	return nil
+}
+
+func importProcessCmdF(c client.Client, command *cobra.Command, args []string) error {
+	importFile := args[0]
+
+	isLocal, _ := command.Flags().GetBool("local")
+	bypassUpload, _ := command.Flags().GetBool("bypass-upload")
+	if bypassUpload {
+		if isLocal {
+			// First, we validate whether the server is in HA.
+			config, _, err := c.GetClientConfig(context.TODO(), "")
+			if err != nil {
+				return err
+			}
+
+			enableCluster, err := strconv.ParseBool(config["EnableCluster"])
+			if err != nil {
+				return fmt.Errorf("failed to parse EnableCluster: %w", err)
+			}
+
+			if enableCluster {
+				return errors.New("--bypass-upload flag doesn't work if the server is in HA. Because the file has to be present locally on the server where the job request hits. Please disable HA and try again.")
+			}
+
+			// in local mode, we tell the server to directly read from this file.
+			if _, err := os.Stat(importFile); errors.Is(err, os.ErrNotExist) {
+				return fmt.Errorf("file %s doesn't exist. NOTE: If this file was uploaded to the server via mmctl import upload, please omit the --bypass-upload flag to revert to old behavior.", importFile)
+			}
+			// If it's not an absolute path, then we make it
+			if !path.IsAbs(importFile) {
+				var err2 error
+				importFile, err2 = filepath.Abs(importFile)
+				if err2 != nil {
+					return fmt.Errorf("error is getting the absolute path to %s: %w", importFile, err2)
+				}
+			}
+		} else {
+			printer.PrintWarning("--bypass-upload has no effect in non-local mode.")
+		}
+	}
+
+	extractContent, _ := command.Flags().GetBool("extract-content")
+	workers, _ := command.Flags().GetInt("workers")
+
+	maxWorkers := runtime.NumCPU() * 4
+	if workers > maxWorkers {
+		return fmt.Errorf("workers value %d exceeds maximum allowed (%d = 4 * CPU count)", workers, maxWorkers)
+	}
+
+	destinationTeamName, _ := command.Flags().GetString("destination-team-name")
+	destinationTeamNameID, _ := command.Flags().GetString("destination-team-id")
+	skipPreflight, _ := command.Flags().GetBool("skip-preflight")
+
+	// Only the value is validated here. Whether a choice is *required* depends on
+	// whether the archive is scoped, which only the server can see — it enforces
+	// that at the version line. Catching a typo locally still beats having the job
+	// fail server-side with the flag silently dropped.
+	importedUsersFlag, _ := command.Flags().GetString("imported-users")
+	importedUsers := model.ImportedUsersPosture(importedUsersFlag)
+	if importedUsers != model.ImportedUsersUnset && !importedUsers.IsValid() {
+		return fmt.Errorf("invalid --imported-users value %q: must be %q or %q", importedUsers, model.ImportedUsersActive, model.ImportedUsersInactive)
+	}
+
+	if destinationTeamName != "" && destinationTeamNameID != "" {
+		return fmt.Errorf("--destination-team-name and --destination-team-id are mutually exclusive")
+	}
+	if destinationTeamNameID != "" {
+		team, _, err := c.GetTeam(context.TODO(), destinationTeamNameID, "")
+		if err != nil {
+			return fmt.Errorf("failed to lookup destination team by ID %q: %w", destinationTeamNameID, err)
+		}
+		if team == nil {
+			return fmt.Errorf("destination team with ID %q not found", destinationTeamNameID)
+		}
+		destinationTeamName = team.Name
+	}
+
+	destinationChannelName, _ := command.Flags().GetString("destination-channel-name")
+	destinationChannelID, _ := command.Flags().GetString("destination-channel-id")
+
+	if destinationChannelName != "" && destinationChannelID != "" {
+		return fmt.Errorf("--destination-channel-name and --destination-channel-id are mutually exclusive")
+	}
+	if destinationChannelID != "" {
+		channel, _, err := c.GetChannel(context.TODO(), destinationChannelID)
+		if err != nil {
+			return fmt.Errorf("failed to lookup destination channel by ID %q: %w", destinationChannelID, err)
+		}
+		if channel == nil {
+			return fmt.Errorf("destination channel with ID %q not found", destinationChannelID)
+		}
+		destinationChannelName = channel.Name
+	}
+
+	jobData := map[string]string{
+		"import_file":     importFile,
+		"local_mode":      strconv.FormatBool(isLocal && bypassUpload),
+		"extract_content": strconv.FormatBool(extractContent),
+	}
+	if workers > 0 {
+		jobData["workers"] = strconv.Itoa(workers)
+	}
+	if destinationTeamName != "" {
+		jobData["destination_team_name"] = destinationTeamName
+	}
+	if destinationChannelName != "" {
+		jobData["destination_channel_name"] = destinationChannelName
+	}
+	if skipPreflight {
+		jobData["skip_preflight"] = "true"
+	}
+	if importedUsers != model.ImportedUsersUnset {
+		jobData["imported_users"] = string(importedUsers)
+	}
+
+	// Check for a previous failed import of the same file with a checkpoint.
+	// If stdin is not a terminal (CI/pipes) skip the prompt entirely — auto-resuming
+	// on EOF would silently replay a partial import without the user's consent.
+	if checkpoint, checkpointFile, totalLines, maybeRunning := findImportCheckpoint(c, importFile); checkpoint > 0 && checkpointFile == importFile && term.IsTerminal(int(os.Stdin.Fd())) {
+		progress := fmt.Sprintf("line %d", checkpoint)
+		if totalLines > 0 {
+			progress = fmt.Sprintf("line %d of %d (%.0f%% complete)", checkpoint, totalLines, float64(checkpoint)/float64(totalLines)*100)
+		}
+
+		// Written straight to stderr, not through printer: printer buffers until the
+		// command returns, so a prompt sent through it would only appear after the
+		// operator had already answered.
+		//
+		// A job still marked in_progress may genuinely be running: checkpoints are
+		// only written at segment boundaries, so a large import can sit idle for
+		// longer than staleInProgressThreshold without being abandoned. Say so, and
+		// require an explicit yes rather than defaulting to resume.
+		resume := false
+		if maybeRunning {
+			fmt.Fprintf(os.Stderr, "\nAn import of '%s' is still marked in progress, with a checkpoint at %s.\n", importFile, progress)
+			fmt.Fprintln(os.Stderr, "It may still be running — checkpoints are only written between segments, so a large import can look idle for a long time. Check 'mmctl import job list' before continuing; resuming a live import duplicates its work.")
+			fmt.Fprintln(os.Stderr, "Resume from the checkpoint anyway? Answering no starts a fresh import from the beginning.")
+			fmt.Fprint(os.Stderr, "[y/N]: ")
+			resume = readYesNo(os.Stdin, false)
+		} else {
+			fmt.Fprintf(os.Stderr, "\nA previous import of '%s' failed at %s.\n", importFile, progress)
+			fmt.Fprintln(os.Stderr, "Resume from that point? Starting fresh will re-import everything from the beginning.")
+			fmt.Fprint(os.Stderr, "[Y/n]: ")
+			resume = readYesNo(os.Stdin, true)
+		}
+
+		if resume {
+			jobData["checkpoint"] = strconv.Itoa(checkpoint)
+			jobData["checkpoint_file"] = checkpointFile
+			printer.Print(fmt.Sprintf("Resuming from line %d.", checkpoint))
+		} else {
+			printer.Print("Starting fresh.")
+		}
+	}
+
+	job, _, err := c.CreateJob(context.TODO(), &model.Job{
+		Type: model.JobTypeImportProcess,
+		Data: jobData,
+	})
+	if err != nil {
+		return fmt.Errorf("failed to create import process job: %w", err)
+	}
+
+	printer.PrintT("Import process job successfully created, ID: {{.Id}}", job)
+
+	return nil
+}
+
+// readYesNo reads a yes/no answer from in, falling back to def for anything that
+// isn't an explicit yes or no — a bare enter, or an EOF from closed stdin. Note
+// that def is returned for EOF too, so a caller whose risky answer is "yes" must
+// pass def=false to keep an answer the operator never gave from meaning consent.
+func readYesNo(in io.Reader, def bool) bool {
+	answer, _ := bufio.NewReader(in).ReadString('\n')
+	switch strings.TrimSpace(strings.ToLower(answer)) {
+	case "y", "yes":
+		return true
+	case "n", "no":
+		return false
+	default:
+		return def
+	}
+}
+
+// staleInProgressThreshold is how long an import_process job must have gone
+// without a checkpoint update before findImportCheckpoint treats a job still
+// marked "in_progress" as abandoned (e.g. the server process was killed) rather
+// than genuinely still running. A hard process kill never transitions the job
+// to JobStatusError — only a recovered panic does — so without this, a
+// checkpoint saved by a crashed job would never be found.
+const staleInProgressThreshold = 10 * time.Minute
+
+// findImportCheckpoint searches recent import jobs for an interrupted run of
+// the given file that has a checkpoint stored — either a job that failed
+// outright, or one still marked "in_progress" whose last checkpoint update is
+// old enough to indicate the process died rather than being genuinely still
+// running. Also checks for a prior successful run to derive the total line
+// count for percentage display.
+// Returns (checkpoint, checkpointFile, totalLines, maybeRunning). totalLines is 0
+// if unknown. maybeRunning is true when the checkpoint came from a job still
+// marked in_progress: staleInProgressThreshold can only guess that such a job was
+// abandoned, so resuming it may duplicate an import that is still running.
+func findImportCheckpoint(c client.Client, importFile string) (int, string, int, bool) {
+	extract := func(job *model.Job) (int, string, int, bool) {
+		if job.Data["import_file"] != importFile {
+			return 0, "", 0, false
+		}
+		cpStr := job.Data["checkpoint"]
+		if cpStr == "" {
+			return 0, "", 0, false
+		}
+		n, err := strconv.Atoi(cpStr)
+		if err != nil || n <= 0 {
+			return 0, "", 0, false
+		}
+		// total_lines is stored by the pre-creation pass at the start of the
+		// import — available even on first failure, no prior successful run needed.
+		totalLines := 0
+		if tlStr := job.Data["total_lines"]; tlStr != "" {
+			if tl, err := strconv.Atoi(tlStr); err == nil {
+				totalLines = tl
+			}
+		}
+		return n, job.Data["checkpoint_file"], totalLines, true
+	}
+
+	if jobs, _, err := c.GetJobs(context.TODO(), model.JobTypeImportProcess, model.JobStatusError, 0, 10); err == nil {
+		for _, job := range jobs {
+			if n, file, total, ok := extract(job); ok {
+				return n, file, total, false
+			}
+		}
+	}
+
+	if jobs, _, err := c.GetJobs(context.TODO(), model.JobTypeImportProcess, model.JobStatusInProgress, 0, 10); err == nil {
+		staleBefore := model.GetMillis() - staleInProgressThreshold.Milliseconds()
+		for _, job := range jobs {
+			if job.LastActivityAt > staleBefore {
+				// Recently active — likely still genuinely running; don't offer to
+				// resume it out from under itself.
+				continue
+			}
+			if n, file, total, ok := extract(job); ok {
+				return n, file, total, true
+			}
+		}
+	}
+
+	return 0, "", 0, false
+}
+
+func importJobShowCmdF(c client.Client, command *cobra.Command, args []string) error {
+	job, _, err := c.GetJob(context.TODO(), args[0])
+	if err != nil {
+		return fmt.Errorf("failed to get import job: %w", err)
+	}
+
+	printJob(job)
+
+	// Scoped migrations may leave entries that couldn't be matched on this server:
+	// unmatched users and memberships skipped for a missing team or channel. The count
+	// is the number of report rows, not distinct users, so phrase it as entries. Surface
+	// it and the report path explicitly rather than leaving the operator to spot them in
+	// the raw Data map.
+	if count := job.Data["unmatched_users_count"]; count != "" && count != "0" {
+		noun := "entries"
+		if count == "1" {
+			noun = "entry"
+		}
+		printer.Print(fmt.Sprintf("\n%s import %s could not be matched on this server (unmatched users and skipped team or channel memberships).", count, noun))
+		if reportPath := job.Data["unmatched_users_report"]; reportPath != "" {
+			printer.Print(fmt.Sprintf("See the report for details: %s", reportPath))
+		}
+	}
+
+	return nil
+}
+
+func importJobListCmdF(c client.Client, command *cobra.Command, args []string) error {
+	return jobListCmdF(c, command, model.JobTypeImportProcess, "")
+}
+
+type Statistics struct {
+	Roles          uint64 `json:"roles"`
+	Schemes        uint64 `json:"schemes"`
+	Teams          uint64 `json:"teams"`
+	Channels       uint64 `json:"channels"`
+	Users          uint64 `json:"users"`
+	Emojis         uint64 `json:"emojis"`
+	Posts          uint64 `json:"posts"`
+	DirectChannels uint64 `json:"direct_channels"`
+	DirectPosts    uint64 `json:"direct_posts"`
+	Attachments    uint64 `json:"attachments"`
+}
+
+type ImportValidationResult struct {
+	FileName   string                            `json:"file_name"`
+	TotalLines uint64                            `json:"total_lines"`
+	Elapsed    time.Duration                     `json:"elapsed_time_ns"`
+	Errors     []*importer.ImportValidationError `json:"errors"`
+}
+
+func importValidateCmdF(c client.Client, command *cobra.Command, args []string) error {
+	configurePrinter()
+	defer printer.Print("Validation complete\n")
+
+	var (
+		serverTeams    = make(map[string]*model.Team) // initialize it in case we need to add teams manually
+		serverChannels map[importer.ChannelTeam]*model.Channel
+		serverUsers    map[string]*model.User
+		serverEmails   map[string]*model.User
+		maxPostSize    int
+	)
+
+	preRunWithClient := func(c client.Client, cmd *cobra.Command, args []string) error {
+		users, err := getPages(func(page, numPerPage int, etag string) ([]*model.User, *model.Response, error) {
+			return c.GetUsers(context.TODO(), page, numPerPage, etag)
+		}, DefaultPageSize)
+		if err != nil {
+			return err
+		}
+
+		config, _, err := c.GetClientConfig(context.TODO(), "")
+		if err != nil {
+			return err
+		}
+
+		maxPostSize, err = strconv.Atoi(config["MaxPostSize"])
+		if err != nil {
+			return fmt.Errorf("failed to parse MaxPostSize: %w", err)
+		}
+
+		serverUsers = make(map[string]*model.User)
+		serverEmails = make(map[string]*model.User)
+		for _, user := range users {
+			serverUsers[user.Nickname] = user
+			serverEmails[user.Email] = user
+		}
+
+		teams, err := getPages(func(page, numPerPage int, etag string) ([]*model.Team, *model.Response, error) {
+			return c.GetAllTeams(context.TODO(), etag, page, numPerPage)
+		}, DefaultPageSize)
+		if err != nil {
+			return err
+		}
+
+		serverChannels = make(map[importer.ChannelTeam]*model.Channel)
+		for _, team := range teams {
+			serverTeams[team.Name] = team
+
+			publicChannels, err := getPages(func(page, numPerPage int, etag string) ([]*model.Channel, *model.Response, error) {
+				return c.GetPublicChannelsForTeam(context.TODO(), team.Id, page, numPerPage, etag)
+			}, DefaultPageSize)
+			if err != nil {
+				return err
+			}
+
+			privateChannels, err := getPages(func(page, numPerPage int, etag string) ([]*model.Channel, *model.Response, error) {
+				return c.GetPrivateChannelsForTeam(context.TODO(), team.Id, page, numPerPage, etag)
+			}, DefaultPageSize)
+			if err != nil {
+				return err
+			}
+
+			for _, channel := range publicChannels {
+				serverChannels[importer.ChannelTeam{Channel: channel.Name, Team: team.Name}] = channel
+			}
+			for _, channel := range privateChannels {
+				serverChannels[importer.ChannelTeam{Channel: channel.Name, Team: team.Name}] = channel
+			}
+		}
+
+		return nil
+	}
+
+	var err error
+	if c != nil {
+		err = preRunWithClient(c, command, args)
+	} else {
+		err = withClient(preRunWithClient)(command, args)
+	}
+	if err != nil {
+		printer.Print(fmt.Sprintf("could not initialize client (%s), skipping online checks\n", err.Error()))
+	}
+
+	injectedTeams, err := command.Flags().GetStringArray("team")
+	if err != nil {
+		return err
+	}
+	for _, team := range injectedTeams {
+		if _, ok := serverTeams[team]; !ok {
+			serverTeams[team] = &model.Team{
+				Id:          "<predefined>",
+				Name:        team,
+				DisplayName: "team was predefined",
+			}
+		}
+	}
+
+	checkMissingTeams, err := command.Flags().GetBool("check-missing-teams")
+	if err != nil {
+		return err
+	}
+
+	ignoreAttachments, err := command.Flags().GetBool("ignore-attachments")
+	if err != nil {
+		return err
+	}
+
+	checkServerDuplicates, err := command.Flags().GetBool("check-server-duplicates")
+	if err != nil {
+		return err
+	}
+
+	if maxPostSize == 0 {
+		maxPostSize = model.PostMessageMaxRunesV2
+	}
+
+	createMissingTeams := !checkMissingTeams && len(injectedTeams) == 0
+	validator := importer.NewValidator(
+		args[0],               // input file
+		ignoreAttachments,     // ignore attachments flag
+		createMissingTeams,    // create missing teams flag
+		checkServerDuplicates, // check for server duplicates flag
+		serverTeams,           // map of existing teams
+		serverChannels,        // map of existing channels
+		serverUsers,           // map of users by name
+		serverEmails,          // map of users by email
+		maxPostSize,
+	)
+
+	var errors []*importer.ImportValidationError
+	templateError := template.Must(template.New("").Parse("{{ .Error }}\n"))
+	validator.OnError(func(ive *importer.ImportValidationError) error {
+		printer.PrintPreparedT(templateError, ive)
+		errors = append(errors, ive)
+		return nil
+	})
+
+	err = validator.Validate()
+	if err != nil {
+		return err
+	}
+
+	stat := Statistics{
+		Roles:          validator.Roles(),
+		Schemes:        validator.Schemes(),
+		Teams:          validator.TeamCount(),
+		Channels:       validator.ChannelCount(),
+		Users:          validator.UserCount(),
+		Posts:          (validator.PostCount()),
+		DirectChannels: (validator.DirectChannelCount()),
+		DirectPosts:    (validator.DirectPostCount()),
+		Emojis:         (validator.Emojis()),
+		Attachments:    uint64(len(validator.Attachments())),
+	}
+
+	printStatistics(stat)
+
+	createdTeams := validator.CreatedTeams()
+	if createMissingTeams && len(createdTeams) != 0 {
+		printer.PrintT("Automatically created teams: {{ join .CreatedTeams \", \" }}\n", struct {
+			CreatedTeams []string `json:"created_teams"`
+		}{createdTeams})
+	}
+
+	unusedAttachments := validator.UnusedAttachments()
+	if len(unusedAttachments) > 0 {
+		printer.PrintT("Unused Attachments ({{ len .UnusedAttachments }}):\n"+
+			"{{ range .UnusedAttachments }}  {{ . }}\n{{ end }}", struct {
+			UnusedAttachments []string `json:"unused_attachments"`
+		}{unusedAttachments})
+	}
+
+	printer.PrintT("It took {{ .Elapsed }} to validate {{ .TotalLines }} lines in {{ .FileName }}\n", ImportValidationResult{args[0], validator.Lines(), validator.Duration(), errors})
+
+	return nil
+}
+
+func configurePrinter() {
+	// we want to manage the newlines ourselves
+	printer.SetNoNewline(true)
+
+	// define a join function
+	printer.SetTemplateFunc("join", strings.Join)
+}
+
+func printStatistics(stat Statistics) {
+	tmpl := "\n" +
+		"Roles           {{ .Roles }}\n" +
+		"Schemes         {{ .Schemes }}\n" +
+		"Teams           {{ .Teams }}\n" +
+		"Channels        {{ .Channels }}\n" +
+		"Users           {{ .Users }}\n" +
+		"Emojis          {{ .Emojis }}\n" +
+		"Posts           {{ .Posts }}\n" +
+		"Direct Channels {{ .DirectChannels }}\n" +
+		"Direct Posts    {{ .DirectPosts }}\n" +
+		"Attachments     {{ .Attachments }}\n"
+
+	printer.PrintT(tmpl, stat)
+}

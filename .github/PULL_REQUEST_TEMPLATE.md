@@ -1,50 +1,35 @@
-<!-- Thank you for contributing a pull request! Here are a few tips to help you:
-
-1. If this is your first contribution, make sure you've read the Contribution Checklist https://developers.mattermost.com/contribute/getting-started/contribution-checklist/
-2. Read our blog post about "Submitting Great PRs" https://developers.mattermost.com/blog/2019-01-24-submitting-great-prs
-3. Take a look at other repository specific documentation at https://developers.mattermost.com/contribute
--->
+<!-- Summary and Release Note are required. Include Ticket Link and Screenshots as needed. -->
 
 #### Summary
-<!--
-A description of what this pull request does, as well as QA test steps (if applicable and if not already added to the Jira ticket).
--->
+<!-- What does this PR do? Include QA steps if not covered in the ticket. -->
 
 #### Ticket Link
 <!--
-If this pull request addresses a Help Wanted ticket, please link the relevant GitHub issue, e.g.
-
-  Fixes https://github.com/mattermost/mattermost-server/issues/XXXXX
-
-Otherwise, link the JIRA ticket.
+Fixes: https://github.com/mattermost/mattermost/issues/XXX
+Fixes: https://mattermost.atlassian.net/browse/MM-XXX
 -->
+
+#### Screenshots
+<!-- Include screenshots or GIFs for UI changes. -->
 
 #### Release Note
 <!--
-Add a release note for each of the following conditions:
+Write a release note if this PR includes any of:
+* API or config changes.
+* Schema migrations (added/dropped tables or columns, index changes, column type changes).
+* User-visible behavior changes (UI, CLI, websocket).
+* Deprecations, breaking changes, or compatibility notes.
 
-* Config changes (additions, deletions, updates)
-* API additions—new endpoint, new response fields, or newly accepted request parameters
-* Database changes (any)
-* Websocket additions or changes
-* Anything noteworthy to a Mattermost instance administrator (err on the side of over-communicating)
-* New features and improvements, including behavioural changes, UI changes and CLI changes
-* Bug fixes and fixes of previous known issues
-* Deprecation warnings, breaking changes, or compatibility notes
+The release-note block must always be present. Use past tense. Write NONE if none of the above apply. Newlines are stripped.
+If a docs page documents the change, add it on its own line starting with "Docs:" so the changelog links it.
 
-If no release notes are required write NONE. Use past-tense. Newlines are stripped.
-
-Examples:
-
-```
-Added new API endpoints POST /api/v4/foo, GET api/v4/foo, and GET api/v4/foo/:foo_id.
+Example:
+```release-note
+Added new API endpoints POST /api/v4/foo and GET /api/v4/foo/:foo_id.
+Docs: https://docs.mattermost.com/administration-guide/manage/admin/foo
 ```
 
-```
-Added a new config setting ServiceSettings.FooBar. Added a new column Foo to the Users table.
-```
-
-```
+```release-note
 NONE
 ```
 -->

@@ -1,0 +1,50 @@
+// Copyright (c) 2015-present Mattermost, Inc. All Rights Reserved.
+// See LICENSE.txt for license information.
+
+package einterfaces
+
+import (
+	"github.com/mattermost/mattermost/server/public/model"
+	"github.com/mattermost/mattermost/server/public/shared/request"
+)
+
+type ClusterMessageHandler func(msg *model.ClusterMessage)
+
+// NodeLogs is one node's result from ClusterInterface.QueryLogs. Err is set when the node's logs couldn't be fetched.
+type NodeLogs struct {
+	Lines []string
+	Err   *model.AppError
+}
+
+type ClusterInterface interface {
+	StartInterNodeCommunication()
+	StopInterNodeCommunication()
+	RegisterClusterMessageHandler(event model.ClusterEvent, crm ClusterMessageHandler)
+	GetClusterId() string
+	IsLeader() bool
+	// HealthScore returns a number which is indicative of how well an instance is meeting
+	// the soft real-time requirements of the protocol. Lower numbers are better,
+	// and zero means "totally healthy".
+	HealthScore() int
+	GetMyClusterInfo() *model.ClusterInfo
+	GetClusterInfos() ([]*model.ClusterInfo, error)
+	SendClusterMessage(msg *model.ClusterMessage)
+	SendClusterMessageToNode(nodeID string, msg *model.ClusterMessage) error
+	Shutdown()
+	NotifyMsg(buf []byte)
+	GetClusterStats(rctx request.CTX) ([]*model.ClusterStats, *model.AppError)
+	QueryLogs(rctx request.CTX, page, perPage int, logFilter *model.LogFilter) (map[string]NodeLogs, *model.AppError)
+	GenerateSupportPacket(rctx request.CTX, options *model.SupportPacketOptions) (map[string][]model.FileData, error)
+	// CollectHealthDiagnostics collects every other connected node's diagnostics for a health
+	// check, keyed by cluster ID. It waits for each node until the context is done; a node that
+	// did not reply by then, or failed to, has no entry.
+	CollectHealthDiagnostics(rctx request.CTX) map[string]*model.NodeDiagnostics
+	GetPluginStatuses() (model.PluginStatuses, *model.AppError)
+	ConfigChanged(previousConfig *model.Config, newConfig *model.Config, sendToOtherServer bool) *model.AppError
+	// WebConnCountForUser returns the number of active webconn connections
+	// for a given userID.
+	WebConnCountForUser(userID string) (int, *model.AppError)
+	// GetWSQueues returns the necessary websocket queues from a cluster for a given
+	// connectionID and sequence number.
+	GetWSQueues(userID, connectionID string, seqNum int64) (map[string]*model.WSQueues, error)
+}

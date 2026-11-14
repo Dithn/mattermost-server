@@ -1,0 +1,90 @@
+.job-table__data-retention {
+    .job-table__table {
+        // Match AdminPanel table scroll chrome (e.g. compliance-panel__table).
+        border: 1px solid rgba(var(--sys-center-channel-color-rgb), 0.08);
+        border-radius: var(--radius-m);
+    }
+
+    .table > thead > tr > th,
+    .table > tbody > tr > th,
+    .table > tfoot > tr > th,
+    .table > thead > tr > td,
+    .table > tbody > tr > td,
+    .table > tfoot > tr > td {
+        border-top: none;
+    }
+
+    .table > thead > tr > th {
+        border-bottom: 1px solid rgba(var(--sys-center-channel-color-rgb), 0.16);
+    }
+
+    // Nested under Compass AdminPanel body (`spacing-xxl`). Drop legacy Card-era
+    // inset padding/background so the daily-time row sits at the same top edge
+    // as other System Console AdminPanel content.
+    .help-text {
+        padding: 0;
+        background: transparent;
+        color: var(--sys-center-channel-color);
+    }
+
+    .cancel-button-field {
+        width: 30px;
+    }
+}
+
+.JobTable.AdminPanel {
+    .job-table__table {
+        max-height: none;
+        padding: 0;
+        border: none;
+        margin: 0;
+        background: transparent;
+    }
+}
+
+.JobTable {
+    .clickable {
+        cursor: pointer;
+        &:hover {
+            background-color: rgba(0, 0, 0, 0.05);
+
+            .view-details-link {
+                --button-fg: var(--button-bg);
+            }
+        }
+
+        // Align with the hover-only cancel button.
+        > td {
+            vertical-align: middle;
+        }
+    }
+
+    .view-details-field {
+        text-align: right;
+    }
+
+    // Muted at rest so the row hover has something to reveal. Compass
+    // quaternary is --link-color out of the box, which left the link already
+    // blue and the hover a no-op. Colours go through --button-fg because the
+    // Compass label does not read `color`.
+    .view-details-link {
+        --button-fg: rgba(var(--sys-center-channel-color-rgb), 0.56);
+
+        padding: 0;
+        background: transparent;
+        white-space: nowrap;
+
+        &:hover,
+        &:focus {
+            --button-fg: var(--button-bg);
+
+            background: transparent;
+        }
+    }
+
+    .DataGrid_footer {
+        padding: 8px;
+        border-top: solid 1px rgba(0, 0, 0, 0.1);
+        text-align: right;
+    }
+}

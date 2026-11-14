@@ -1,0 +1,394 @@
+// Copyright (c) 2015-present Mattermost, Inc. All Rights Reserved.
+// See LICENSE.txt for license information.
+
+package app
+
+import (
+	"crypto/subtle"
+	"errors"
+	"fmt"
+	"net/http"
+	"net/url"
+	"os"
+	"strconv"
+	"strings"
+	"time"
+
+	"github.com/avct/uasurfer"
+
+	"github.com/mattermost/mattermost/server/public/model"
+	"github.com/mattermost/mattermost/server/public/plugin"
+	"github.com/mattermost/mattermost/server/public/shared/mlog"
+	"github.com/mattermost/mattermost/server/public/shared/request"
+	"github.com/mattermost/mattermost/server/v8/channels/store"
+	"github.com/mattermost/mattermost/server/v8/channels/utils"
+)
+
+const (
+	cwsTokenEnv = "CWS_CLOUD_TOKEN"
+	// cwsLoginIDEnv names the only user the CWS token may log in as. CWS login is refused when unset.
+	cwsLoginIDEnv = "CWS_CLOUD_LOGIN_ID"
+)
+
+func (a *App) AuthenticateUserForLogin(rctx request.CTX, id, loginId, password, mfaToken, cwsToken string, ldapOnly bool) (user *model.User, err *model.AppError) {
+	// Do statistics
+	defer func() {
+		if a.Metrics() != nil {
+			if user == nil || err != nil {
+				a.Metrics().IncrementLoginFail()
+			} else {
+				a.Metrics().IncrementLogin()
+			}
+		}
+	}()
+
+	cwsLogin := cwsToken != ""
+	if password == "" && !cwsLogin {
+		return nil, model.NewAppError("AuthenticateUserForLogin", "api.user.login.blank_pwd.app_error", nil, "", http.StatusBadRequest)
+	}
+
+	if cwsLogin && !a.cwsLoginIDMatches(id, loginId) {
+		return nil, model.NewAppError("AuthenticateUserForLogin",
+			"api.user.login_by_cws.invalid_token.app_error", nil, "", http.StatusBadRequest)
+	}
+
+	// Get the MM user we are trying to login
+	if user, err = a.GetUserForLogin(rctx, id, loginId); err != nil {
+		return nil, err
+	}
+
+	// CWS login allow to use the one-time token to login the users when they're redirected to their
+	// installation for the first time
+	if cwsLogin {
+		if err := checkUserNotDisabled(user); err != nil {
+			return nil, model.AsAppError(err)
+		}
+		if err := checkUserNotBot(user); err != nil {
+			return nil, model.AsAppError(err)
+		}
+		if user.LastLogin > 0 {
+			return nil, model.NewAppError("AuthenticateUserForLogin",
+				"api.user.login_by_cws.invalid_token.app_error", nil, "", http.StatusBadRequest)
+		}
+		token, err := a.Srv().Store().Token().GetByToken(cwsToken)
+		if nfErr := new(store.ErrNotFound); err != nil && !errors.As(err, &nfErr) {
+			rctx.Logger().Debug("Error retrieving the cws token from the store", mlog.Err(err))
+			return nil, model.NewAppError("AuthenticateUserForLogin",
+				"api.user.login_by_cws.invalid_token.app_error", nil, "", http.StatusInternalServerError).Wrap(err)
+		}
+		// If token is stored in the database that means it was used
+		if token != nil {
+			return nil, model.NewAppError("AuthenticateUserForLogin",
+				"api.user.login_by_cws.invalid_token.app_error", nil, "", http.StatusBadRequest)
+		}
+		envToken := a.Srv().cwsTokenOverride
+		if envToken == "" {
+			envToken, _ = os.LookupEnv(cwsTokenEnv)
+		}
+		if envToken != "" && subtle.ConstantTimeCompare([]byte(envToken), []byte(cwsToken)) == 1 {
+			token = &model.Token{
+				Token:    cwsToken,
+				CreateAt: model.GetMillis(),
+				Type:     model.TokenTypeCWSAccess,
+			}
+			err := a.Srv().Store().Token().Save(token)
+			if err != nil {
+				rctx.Logger().Debug("Error storing the cws token in the store", mlog.Err(err))
+				return nil, model.NewAppError("AuthenticateUserForLogin",
+					"api.user.login_by_cws.invalid_token.app_error", nil, "", http.StatusInternalServerError)
+			}
+			return user, nil
+		}
+		return nil, model.NewAppError("AuthenticateUserForLogin",
+			"api.user.login_by_cws.invalid_token.app_error", nil, "", http.StatusBadRequest)
+	}
+
+	// and then authenticate them
+	if user, err = a.authenticateUser(rctx, user, password, mfaToken); err != nil {
+		return nil, err
+	}
+
+	return user, nil
+}
+
+func (a *App) GetUserForLogin(rctx request.CTX, id, loginId string) (*model.User, *model.AppError) {
+	enableUsername := *a.Config().EmailSettings.EnableSignInWithUsername
+	enableEmail := *a.Config().EmailSettings.EnableSignInWithEmail
+
+	if enableEmail || enableUsername {
+		// If we are given a userID then fail if we can't find a user with that ID
+		if id != "" {
+			user, err := a.GetUser(rctx, id)
+			if err != nil {
+				if err.Id != MissingAccountError {
+					err.StatusCode = http.StatusInternalServerError
+					return nil, err
+				}
+				err.StatusCode = http.StatusBadRequest
+				return nil, err
+			}
+			return user, nil
+		}
+
+		// Try to get the user by username/email
+		if user, err := a.Srv().Store().User().GetForLogin(loginId, enableUsername, enableEmail); err == nil {
+			return user, nil
+		}
+	}
+
+	// Try to get the user with LDAP if enabled
+	if *a.Config().LdapSettings.Enable && a.Ldap() != nil {
+		if ldapUser, err := a.Ldap().GetUser(rctx, loginId); err == nil {
+			if user, err := a.GetUserByAuth(ldapUser.AuthData, model.UserAuthServiceLdap); err == nil {
+				return user, nil
+			}
+			return ldapUser, nil
+		}
+	}
+
+	return nil, model.NewAppError("GetUserForLogin", "store.sql_user.get_for_login.app_error", nil, "", http.StatusBadRequest)
+}
+
+func (a *App) DoLogin(rctx request.CTX, w http.ResponseWriter, r *http.Request, user *model.User, opts model.LoginOptions) (*model.Session, *model.AppError) {
+	if err := checkUserNotDisabled(user); err != nil {
+		return nil, model.AsAppError(err)
+	}
+
+	if err := checkUserNotBot(user); err != nil {
+		return nil, model.AsAppError(err)
+	}
+
+	var rejectionReason string
+	pluginContext := pluginContext(rctx)
+	a.ch.RunMultiHook(func(hooks plugin.Hooks, _ *model.Manifest) bool {
+		rejectionReason = hooks.UserWillLogIn(pluginContext, user)
+		return rejectionReason == ""
+	}, plugin.UserWillLogInID)
+
+	if rejectionReason != "" {
+		return nil, model.NewAppError("DoLogin", "Login rejected by plugin: "+rejectionReason, nil, "", http.StatusBadRequest)
+	}
+
+	if opts.DeviceId != "" && !model.IsValidStandardDeviceId(opts.DeviceId) {
+		return nil, model.NewAppError("DoLogin", "api.user.attach_device_id.invalid_device_id.app_error", nil, "", http.StatusBadRequest)
+	}
+	if opts.VoIPDeviceId != "" && !model.IsValidVoIPDeviceId(opts.VoIPDeviceId) {
+		return nil, model.NewAppError("DoLogin", "api.user.attach_device_id.invalid_voip_device_id.app_error", nil, "", http.StatusBadRequest)
+	}
+
+	// Presence of a device or VoIP token is authoritative for mobile-ness:
+	// trust the explicit signal over the user-agent sniff.
+	if opts.DeviceId != "" || opts.VoIPDeviceId != "" {
+		opts.IsMobile = true
+	}
+
+	session := &model.Session{
+		UserId:       user.Id,
+		Roles:        user.GetRawRoles(),
+		DeviceId:     opts.DeviceId,
+		VoIPDeviceId: opts.VoIPDeviceId,
+		IsOAuth:      false,
+		Props: map[string]string{
+			model.UserAuthServiceIsMobile: strconv.FormatBool(opts.IsMobile),
+			model.UserAuthServiceIsSaml:   strconv.FormatBool(opts.IsSaml),
+			model.UserAuthServiceIsOAuth:  strconv.FormatBool(opts.IsOAuthUser),
+		},
+	}
+	session.GenerateCSRF()
+
+	if opts.IsMobile {
+		a.ch.srv.platform.SetSessionExpireInHours(session, *a.Config().ServiceSettings.SessionLengthMobileInHours)
+	} else if opts.IsOAuthUser || opts.IsSaml {
+		a.ch.srv.platform.SetSessionExpireInHours(session, *a.Config().ServiceSettings.SessionLengthSSOInHours)
+	} else {
+		a.ch.srv.platform.SetSessionExpireInHours(session, *a.Config().ServiceSettings.SessionLengthWebInHours)
+	}
+
+	if opts.DeviceId != "" {
+		if err := a.RevokeOtherSessionsForDeviceId(rctx, user.Id, opts.DeviceId, ""); err != nil {
+			err.StatusCode = http.StatusInternalServerError
+			return nil, err
+		}
+	}
+	if opts.VoIPDeviceId != "" {
+		if err := a.RevokeOtherSessionsForVoIPDeviceId(rctx, user.Id, opts.VoIPDeviceId, ""); err != nil {
+			err.StatusCode = http.StatusInternalServerError
+			return nil, err
+		}
+	}
+
+	ua := uasurfer.Parse(r.UserAgent())
+
+	plat := getPlatformName(ua, r.UserAgent())
+	os := getOSName(ua, r.UserAgent())
+	bname := getBrowserName(ua, r.UserAgent())
+	bversion := getBrowserVersion(ua, r.UserAgent())
+
+	session.AddProp(model.SessionPropPlatform, plat)
+	session.AddProp(model.SessionPropOs, os)
+	session.AddProp(model.SessionPropBrowser, fmt.Sprintf("%v/%v", bname, bversion))
+	if user.IsGuest() {
+		session.AddProp(model.SessionPropIsGuest, "true")
+	} else {
+		session.AddProp(model.SessionPropIsGuest, "false")
+	}
+
+	var err *model.AppError
+	if session, err = a.CreateSession(rctx, session); err != nil {
+		err.StatusCode = http.StatusInternalServerError
+		return nil, err
+	}
+
+	if user.LastLogin == 0 && len(user.Props) > 0 && user.Props[model.UserPropsKeyImportedInactive] == "true" {
+		delete(user.Props, model.UserPropsKeyImportedInactive)
+		if _, appErr := a.UpdateUser(rctx, user, false); appErr != nil {
+			rctx.Logger().Warn("Failed to clear importedInactive prop on first login", mlog.Err(appErr))
+		}
+	}
+
+	if updateErr := a.Srv().Store().User().UpdateLastLogin(user.Id, session.CreateAt); updateErr != nil {
+		return nil, model.NewAppError("DoLogin", "app.login.doLogin.updateLastLogin.error", nil, "", http.StatusInternalServerError).Wrap(updateErr)
+	}
+
+	w.Header().Set(model.HeaderToken, session.Token)
+
+	rctx = rctx.WithSession(session)
+
+	if a.Srv().License() != nil && *a.Srv().License().Features.LDAP && a.Ldap() != nil {
+		userVal := *user
+		sessionVal := *session
+		a.Srv().Go(func() {
+			a.Ldap().UpdateProfilePictureIfNecessary(rctx, userVal, sessionVal)
+		})
+	}
+
+	a.Srv().Go(func() {
+		a.ch.RunMultiHook(func(hooks plugin.Hooks, _ *model.Manifest) bool {
+			hooks.UserHasLoggedIn(pluginContext, user)
+			return true
+		}, plugin.UserHasLoggedInID)
+	})
+
+	return session, nil
+}
+
+func (a *App) AttachCloudSessionCookie(rctx request.CTX, w http.ResponseWriter, r *http.Request) {
+	secure := false
+	if GetProtocol(r) == "https" {
+		secure = true
+	}
+
+	maxAgeSeconds := *a.Config().ServiceSettings.SessionLengthWebInHours * 60 * 60
+	subpath, _ := utils.GetSubpathFromConfig(a.Config())
+	expiresAt := time.Unix(model.GetMillis()/1000+int64(maxAgeSeconds), 0)
+
+	domain := ""
+	if siteURL, err := url.Parse(a.GetSiteURL()); err == nil {
+		domain = siteURL.Hostname()
+	}
+
+	if domain == "" {
+		return
+	}
+
+	var workspaceName string
+	if strings.Contains(domain, "localhost") {
+		workspaceName = "localhost"
+	} else {
+		// ensure we have a format for a cloud workspace url i.e. example.cloud.mattermost.com
+		if len(strings.Split(domain, ".")) != 4 {
+			return
+		}
+		workspaceName = strings.SplitN(domain, ".", 2)[0]
+		domain = strings.SplitN(domain, ".", 3)[2]
+		domain = "." + domain
+	}
+
+	cookie := &http.Cookie{
+		Name:    model.SessionCookieCloudUrl,
+		Value:   workspaceName,
+		Path:    subpath,
+		MaxAge:  maxAgeSeconds,
+		Expires: expiresAt,
+		Domain:  domain,
+		Secure:  secure,
+	}
+
+	http.SetCookie(w, cookie)
+}
+
+func (a *App) AttachSessionCookies(rctx request.CTX, w http.ResponseWriter, r *http.Request) {
+	secure := false
+	if GetProtocol(r) == "https" {
+		secure = true
+	}
+
+	maxAgeSeconds := *a.Config().ServiceSettings.SessionLengthWebInHours * 60 * 60
+	domain := a.GetCookieDomain()
+	subpath, _ := utils.GetSubpathFromConfig(a.Config())
+
+	expiresAt := time.Unix(model.GetMillis()/1000+int64(maxAgeSeconds), 0)
+	sessionCookie := &http.Cookie{
+		Name:     model.SessionCookieToken,
+		Value:    rctx.Session().Token,
+		Path:     subpath,
+		MaxAge:   maxAgeSeconds,
+		Expires:  expiresAt,
+		HttpOnly: true,
+		Domain:   domain,
+		Secure:   secure,
+	}
+
+	userCookie := &http.Cookie{
+		Name:    model.SessionCookieUser,
+		Value:   rctx.Session().UserId,
+		Path:    subpath,
+		MaxAge:  maxAgeSeconds,
+		Expires: expiresAt,
+		Domain:  domain,
+		Secure:  secure,
+	}
+
+	csrfCookie := &http.Cookie{
+		Name:    model.SessionCookieCsrf,
+		Value:   rctx.Session().GetCSRF(),
+		Path:    subpath,
+		MaxAge:  maxAgeSeconds,
+		Expires: expiresAt,
+		Domain:  domain,
+		Secure:  secure,
+	}
+
+	if secure && utils.CheckEmbeddedCookie(r) {
+		sessionCookie.SameSite = http.SameSiteNoneMode
+		userCookie.SameSite = http.SameSiteNoneMode
+		csrfCookie.SameSite = http.SameSiteNoneMode
+	}
+
+	http.SetCookie(w, sessionCookie)
+	http.SetCookie(w, userCookie)
+	http.SetCookie(w, csrfCookie)
+
+	// For context see: https://mattermost.atlassian.net/browse/MM-39583
+	if a.License().IsCloud() {
+		a.AttachCloudSessionCookie(rctx, w, r)
+	}
+}
+
+func GetProtocol(r *http.Request) string {
+	if r.Header.Get(model.HeaderForwardedProto) == "https" || r.TLS != nil {
+		return "https"
+	}
+	return "http"
+}
+
+// cwsLoginIDMatches reports whether CWS_CLOUD_LOGIN_ID is set and login_id matches it
+// case-insensitively, as GetForLogin does. strings.EqualFold is not used because it folds
+// more than SQL lower() (e.g. σ and ς), so it could accept a login_id resolving to another user.
+func (a *App) cwsLoginIDMatches(id, loginID string) bool {
+	expected := a.Srv().cwsLoginIDOverride
+	if expected == "" {
+		expected = os.Getenv(cwsLoginIDEnv)
+	}
+	return expected != "" && id == "" && strings.ToLower(loginID) == strings.ToLower(expected) //nolint:staticcheck
+}

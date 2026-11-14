@@ -1,0 +1,109 @@
+// Copyright (c) 2015-present Mattermost, Inc. All Rights Reserved.
+// See LICENSE.txt for license information.
+
+import classNames from 'classnames';
+import React, {memo, useCallback, useRef} from 'react';
+import {FormattedMessage, useIntl} from 'react-intl';
+import {useSelector, useDispatch} from 'react-redux';
+
+import {StarIcon, StarOutlineIcon} from '@mattermost/compass-icons/components';
+import {Icon} from '@mattermost/compass-ui/components/icon';
+import {IconButton} from '@mattermost/compass-ui/components/icon-button';
+import {WithTooltip} from '@mattermost/shared/components/tooltip';
+
+import {favoriteChannel, unfavoriteChannel} from 'mattermost-redux/actions/channels';
+import {isChannelInManagedCategory} from 'mattermost-redux/selectors/entities/channel_categories';
+import {getCurrentChannel, isCurrentChannelFavorite} from 'mattermost-redux/selectors/entities/channels';
+
+import type {A11yFocusEventDetail} from 'utils/constants';
+import {A11yCustomEventTypes} from 'utils/constants';
+
+import type {GlobalState} from 'types/store';
+
+const ChannelHeaderTitleFavorite = () => {
+    const intl = useIntl();
+    const dispatch = useDispatch();
+    const isFavorite = useSelector(isCurrentChannelFavorite);
+    const channel = useSelector(getCurrentChannel);
+    const channelIsArchived = (channel?.delete_at ?? 0) > 0;
+    const isInManagedCategory = useSelector((state: GlobalState) => (channel ? isChannelInManagedCategory(state, channel.id) : false));
+    const favIconRef = useRef<HTMLButtonElement>(null);
+
+    const toggleFavoriteCallback = useCallback((e: React.MouseEvent<HTMLButtonElement>) => {
+        e.stopPropagation();
+        if (!channel) {
+            return;
+        }
+        if (isFavorite) {
+            dispatch(unfavoriteChannel(channel.id));
+        } else {
+            dispatch(favoriteChannel(channel.id));
+        }
+        requestAnimationFrame(() => {
+            if (favIconRef.current) {
+                document.dispatchEvent(
+                    new CustomEvent<A11yFocusEventDetail>(A11yCustomEventTypes.FOCUS, {
+                        detail: {
+                            target: favIconRef.current,
+                            keyboardOnly: false,
+                        },
+                    }),
+                );
+            }
+        });
+    }, [isFavorite, channel, dispatch]);
+
+    if (!channel || channelIsArchived) {
+        return null;
+    }
+
+    let ariaLabel = intl.formatMessage({id: 'channelHeader.addToFavorites', defaultMessage: 'Add to Favorites'});
+    if (isFavorite) {
+        ariaLabel = intl.formatMessage({id: 'channelHeader.removeFromFavorites', defaultMessage: 'Remove from Favorites'});
+    }
+    ariaLabel = ariaLabel.toLowerCase();
+
+    let title;
+    if (isInManagedCategory) {
+        title = (
+            <FormattedMessage
+                id='channelHeader.managedCategoryFavoriteDisabled'
+                defaultMessage='Channels in managed categories cannot be favorited.'
+            />
+        );
+    } else {
+        title = (
+            <>
+                {!isFavorite &&
+                    <FormattedMessage
+                        id='channelHeader.addToFavorites'
+                        defaultMessage='Add to Favorites'
+                    />}
+                {isFavorite &&
+                    <FormattedMessage
+                        id='channelHeader.removeFromFavorites'
+                        defaultMessage='Remove from Favorites'
+                    />}
+            </>
+        );
+    }
+
+    return (
+        <WithTooltip
+            title={title}
+        >
+            <IconButton
+                id='toggleFavorite'
+                size='small'
+                className={classNames('channel-header__favorites', {active: isFavorite, inactive: !isFavorite})}
+                icon={<Icon glyph={isFavorite ? <StarIcon/> : <StarOutlineIcon/>}/>}
+                onClick={toggleFavoriteCallback}
+                aria-label={ariaLabel}
+                ref={favIconRef}
+                disabled={isInManagedCategory}
+            />
+        </WithTooltip>
+    );
+};
+
+export default memo(ChannelHeaderTitleFavorite);

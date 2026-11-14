@@ -1,0 +1,3061 @@
+// Copyright (c) 2015-present Mattermost, Inc. All Rights Reserved.
+// See LICENSE.txt for license information.
+
+package app
+
+import (
+	"bufio"
+	"bytes"
+	"cmp"
+	"encoding/json"
+	"fmt"
+	"io"
+	"net"
+	"net/http"
+	"os"
+	"path/filepath"
+	"slices"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/mattermost/mattermost/server/v8/channels/testlib"
+
+	"github.com/mattermost/mattermost/server/public/shared/mlog"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+
+	"github.com/mattermost/mattermost/server/public/model"
+	"github.com/mattermost/mattermost/server/v8/channels/app/imports"
+	"github.com/mattermost/mattermost/server/v8/channels/utils"
+	"github.com/mattermost/mattermost/server/v8/channels/utils/fileutils"
+	"github.com/mattermost/mattermost/server/v8/platform/shared/filestore"
+)
+
+func TestReactionsOfPost(t *testing.T) {
+	mainHelper.Parallel(t)
+	th := Setup(t).InitBasic(t)
+
+	post := th.BasicPost
+	post.HasReactions = true
+	th.BasicUser2.DeleteAt = 1234
+	reactionObject := model.Reaction{
+		UserId:    th.BasicUser.Id,
+		PostId:    post.Id,
+		EmojiName: "smile",
+		CreateAt:  model.GetMillis(),
+	}
+	reactionObjectDeleted := model.Reaction{
+		UserId:    th.BasicUser2.Id,
+		PostId:    post.Id,
+		EmojiName: "smile",
+		CreateAt:  model.GetMillis(),
+	}
+
+	_, err := th.App.SaveReactionForPost(th.Context, &reactionObject)
+	require.Nil(t, err)
+	_, err = th.App.SaveReactionForPost(th.Context, &reactionObjectDeleted)
+	require.Nil(t, err)
+	reactionsOfPost, err := th.App.BuildPostReactions(th.Context, post.Id)
+	require.Nil(t, err)
+
+	assert.Equal(t, reactionObject.EmojiName, *(*reactionsOfPost)[0].EmojiName)
+}
+
+func TestExportUserNotifyProps(t *testing.T) {
+	mainHelper.Parallel(t)
+	th := SetupWithStoreMock(t)
+
+	userNotifyProps := model.StringMap{
+		model.DesktopNotifyProp:         model.UserNotifyAll,
+		model.DesktopSoundNotifyProp:    "true",
+		model.EmailNotifyProp:           "true",
+		model.PushNotifyProp:            model.UserNotifyAll,
+		model.PushStatusNotifyProp:      model.StatusOnline,
+		model.ChannelMentionsNotifyProp: "true",
+		model.CommentsNotifyProp:        model.CommentsNotifyRoot,
+		model.MentionKeysNotifyProp:     "valid,misc",
+	}
+
+	exportNotifyProps := th.App.buildUserNotifyProps(userNotifyProps)
+
+	require.Equal(t, userNotifyProps[model.DesktopNotifyProp], *exportNotifyProps.Desktop)
+	require.Equal(t, userNotifyProps[model.DesktopSoundNotifyProp], *exportNotifyProps.DesktopSound)
+	require.Equal(t, userNotifyProps[model.EmailNotifyProp], *exportNotifyProps.Email)
+	require.Equal(t, userNotifyProps[model.PushNotifyProp], *exportNotifyProps.Mobile)
+	require.Equal(t, userNotifyProps[model.PushStatusNotifyProp], *exportNotifyProps.MobilePushStatus)
+	require.Equal(t, userNotifyProps[model.ChannelMentionsNotifyProp], *exportNotifyProps.ChannelTrigger)
+	require.Equal(t, userNotifyProps[model.CommentsNotifyProp], *exportNotifyProps.CommentsTrigger)
+	require.Equal(t, userNotifyProps[model.MentionKeysNotifyProp], *exportNotifyProps.MentionKeys)
+}
+
+func TestExportUserChannels(t *testing.T) {
+	mainHelper.Parallel(t)
+	th := Setup(t).InitBasic(t)
+
+	channel := th.BasicChannel
+	user := th.BasicUser
+	team := th.BasicTeam
+	channelName := channel.Name
+	notifyProps := model.StringMap{
+		model.DesktopNotifyProp: model.UserNotifyAll,
+		model.PushNotifyProp:    model.UserNotifyNone,
+	}
+	preference := model.Preference{
+		UserId:   user.Id,
+		Category: model.PreferenceCategoryFavoriteChannel,
+		Name:     channel.Id,
+		Value:    "true",
+	}
+
+	_, appErr := th.App.MarkChannelsAsViewed(th.Context, []string{th.BasicPost.ChannelId}, user.Id, "", true, th.App.IsCRTEnabledForUser(th.Context, user.Id))
+	require.Nil(t, appErr)
+
+	var preferences model.Preferences
+	preferences = append(preferences, preference)
+	err := th.App.Srv().Store().Preference().Save(preferences)
+	require.NoError(t, err)
+
+	_, appErr = th.App.UpdateChannelMemberNotifyProps(th.Context, notifyProps, channel.Id, user.Id)
+	require.Nil(t, appErr)
+	exportData, appErr := th.App.buildUserChannelMemberships(th.Context, user.Id, team.Id, false, nil)
+	require.Nil(t, appErr)
+	assert.Equal(t, len(*exportData), 3)
+	for _, data := range *exportData {
+		if *data.Name == channelName {
+			assert.Equal(t, "all", *data.NotifyProps.Desktop)
+			assert.Equal(t, "none", *data.NotifyProps.Mobile)
+			assert.Equal(t, "all", *data.NotifyProps.MarkUnread) // default value
+			assert.True(t, *data.Favorite)
+			assert.NotEqualValues(t, 0, *data.LastViewedAt)
+			assert.NotEqualValues(t, 0, *data.MsgCount)
+		} else { // default values
+			assert.Equal(t, "default", *data.NotifyProps.Desktop)
+			assert.Equal(t, "default", *data.NotifyProps.Mobile)
+			assert.Equal(t, "all", *data.NotifyProps.MarkUnread)
+			assert.False(t, *data.Favorite)
+			assert.EqualValues(t, 0, *data.LastViewedAt)
+			assert.EqualValues(t, 0, *data.MsgCount)
+		}
+	}
+}
+
+func TestCopyEmojiImages(t *testing.T) {
+	mainHelper.Parallel(t)
+	th := SetupWithStoreMock(t)
+
+	emoji := &model.Emoji{
+		Id: model.NewId(),
+	}
+
+	tmpDir := t.TempDir()
+	pathToDir := tmpDir
+
+	filePath := filepath.Join(tmpDir, "data", "emoji", emoji.Id)
+	emojiImagePath := filepath.Join(filePath, "image")
+
+	err := os.MkdirAll(filePath, 0777)
+	require.NoError(t, err)
+
+	_, err = os.OpenFile(emojiImagePath, os.O_RDONLY|os.O_CREATE, 0777)
+	require.NoError(t, err)
+
+	copyError := th.App.copyEmojiImages(th.Context, emoji.Id, emojiImagePath, pathToDir)
+	require.NoError(t, copyError)
+
+	_, err = os.Stat(filepath.Join(pathToDir, emoji.Id, "image"))
+	require.False(t, os.IsNotExist(err), "File should exist ")
+}
+
+func TestExportCustomEmoji(t *testing.T) {
+	mainHelper.Parallel(t)
+	th := Setup(t)
+
+	filePath := "../demo.json"
+
+	fileWriter, err := os.Create(filePath)
+	require.NoError(t, err)
+	defer os.Remove(filePath)
+
+	dirNameToExportEmoji := "exported_emoji_test"
+
+	outPath, err := filepath.Abs(filePath)
+	require.NoError(t, err)
+
+	_, appErr := th.App.exportCustomEmoji(th.Context, nil, fileWriter, outPath, dirNameToExportEmoji, false)
+	require.Nil(t, appErr, "should not have failed")
+}
+
+func TestExportAllUsers(t *testing.T) {
+	mainHelper.Parallel(t)
+	th1 := Setup(t)
+
+	// Adding a user and deactivating it to check whether it gets included in bulk export
+	user := th1.CreateUser(t)
+	_, err := th1.App.UpdateActive(th1.Context, user, false)
+	require.Nil(t, err)
+
+	var b bytes.Buffer
+	err = th1.App.BulkExport(th1.Context, &b, "somePath", nil, model.BulkExportOpts{})
+	require.Nil(t, err)
+
+	var th2 *TestHelper
+	if mainHelper.Options.RunParallel {
+		th1.Store.DropAllTables()
+		th2 = th1
+	} else {
+		th2 = Setup(t)
+	}
+
+	i, err := th2.App.BulkImport(th2.Context, &b, nil, false, 5)
+	assert.Nil(t, err)
+	assert.EqualValues(t, 0, i)
+
+	users1, err := th1.App.GetUsersFromProfiles(&model.UserGetOptions{
+		Page:    0,
+		PerPage: 10,
+	})
+	assert.Nil(t, err)
+	users2, err := th2.App.GetUsersFromProfiles(&model.UserGetOptions{
+		Page:    0,
+		PerPage: 10,
+	})
+	assert.Nil(t, err)
+	assert.Equal(t, len(users1), len(users2))
+	assert.ElementsMatch(t, users1, users2)
+
+	// Checking whether deactivated users were included in bulk export
+	deletedUsers1, err := th1.App.GetUsersFromProfiles(&model.UserGetOptions{
+		Inactive: true,
+		Page:     0,
+		PerPage:  10,
+	})
+	assert.Nil(t, err)
+	deletedUsers2, err := th1.App.GetUsersFromProfiles(&model.UserGetOptions{
+		Inactive: true,
+		Page:     0,
+		PerPage:  10,
+	})
+	assert.Nil(t, err)
+	assert.Equal(t, len(deletedUsers1), len(deletedUsers2))
+	assert.ElementsMatch(t, deletedUsers1, deletedUsers2)
+}
+
+func TestExportAllBots(t *testing.T) {
+	mainHelper.Parallel(t)
+	th1 := Setup(t)
+
+	u := th1.CreateUser(t)
+	bot, err := th1.App.CreateBot(th1.Context, &model.Bot{
+		Username:    "bot_1",
+		DisplayName: model.NewId(),
+		OwnerId:     u.Id,
+	})
+	require.Nil(t, err)
+
+	var b bytes.Buffer
+	err = th1.App.BulkExport(th1.Context, &b, "somePath", nil, model.BulkExportOpts{})
+	require.Nil(t, err)
+
+	th2 := Setup(t)
+
+	i, err := th2.App.BulkImport(th2.Context, &b, nil, false, 5)
+	require.Nil(t, err)
+	assert.EqualValues(t, 0, i)
+
+	u, err = th2.App.GetUserByUsername(u.Username)
+	require.Nil(t, err)
+
+	bots, err := th2.App.GetBots(th2.Context, &model.BotGetOptions{
+		OwnerId: u.Id,
+		Page:    0,
+		PerPage: 10,
+	})
+	require.Nil(t, err)
+	require.Len(t, bots, 1)
+	assert.Equal(t, bot.Username, bots[0].Username)
+}
+
+func TestExportDMChannel(t *testing.T) {
+	mainHelper.Parallel(t)
+	t.Run("Export a DM channel to another server", func(t *testing.T) {
+		th1 := Setup(t).InitBasic(t)
+
+		// DM Channel
+		ch := th1.CreateDmChannel(t, th1.BasicUser2)
+
+		err := th1.App.Srv().Store().Preference().Save(model.Preferences{
+			{
+				UserId:   th1.BasicUser2.Id,
+				Category: model.PreferenceCategoryFavoriteChannel,
+				Name:     ch.Id,
+				Value:    "true",
+			},
+		})
+		require.NoError(t, err)
+
+		var b bytes.Buffer
+		appErr := th1.App.BulkExport(th1.Context, &b, "somePath", nil, model.BulkExportOpts{})
+		require.Nil(t, appErr)
+
+		channels, nErr := th1.App.Srv().Store().Channel().GetAllDirectChannelsForExportAfter(1000, "00000000", false)
+		require.NoError(t, nErr)
+		assert.Equal(t, 1, len(channels))
+
+		th2 := Setup(t)
+
+		channels, nErr = th2.App.Srv().Store().Channel().GetAllDirectChannelsForExportAfter(1000, "00000000", false)
+		require.NoError(t, nErr)
+		assert.Equal(t, 0, len(channels))
+
+		// import the exported channel
+		i, appErr := th2.App.BulkImport(th2.Context, &b, nil, false, 5)
+		require.Nil(t, appErr)
+		assert.Equal(t, 0, i)
+
+		// Ensure the Members of the imported DM channel is the same was from the exported
+		channels, nErr = th2.App.Srv().Store().Channel().GetAllDirectChannelsForExportAfter(1000, "00000000", false)
+		require.NoError(t, nErr)
+		require.Len(t, channels, 1)
+		require.Len(t, channels[0].Members, 2)
+		assert.ElementsMatch(t, []string{th1.BasicUser.Username, th1.BasicUser2.Username}, []string{channels[0].Members[0].Username, channels[0].Members[1].Username})
+
+		// Verify the users were imported and get their IDs in th2
+		_, appErr = th2.App.GetUserByUsername(th1.BasicUser.Username)
+		require.Nil(t, appErr)
+		importedUser2, appErr := th2.App.GetUserByUsername(th1.BasicUser2.Username)
+		require.Nil(t, appErr)
+
+		// Ensure the favorited channel was retained for the imported user
+		fav, nErr := th2.App.Srv().Store().Preference().Get(importedUser2.Id, model.PreferenceCategoryFavoriteChannel, channels[0].Id)
+		require.NoError(t, nErr)
+		require.NotNil(t, fav)
+		require.Equal(t, "true", fav.Value)
+	})
+
+	t.Run("Invalid DM channel export", func(t *testing.T) {
+		th1 := Setup(t).InitBasic(t)
+
+		// DM Channel
+		th1.CreateDmChannel(t, th1.BasicUser2)
+
+		channels, nErr := th1.App.Srv().Store().Channel().GetAllDirectChannelsForExportAfter(1000, "00000000", false)
+		require.NoError(t, nErr)
+		assert.Equal(t, 1, len(channels))
+
+		appErr := th1.App.PermanentDeleteUser(th1.Context, th1.BasicUser2)
+		require.Nil(t, appErr)
+		appErr = th1.App.PermanentDeleteUser(th1.Context, th1.BasicUser)
+		require.Nil(t, appErr)
+
+		var b bytes.Buffer
+		appErr = th1.App.BulkExport(th1.Context, &b, "somePath", nil, model.BulkExportOpts{})
+		require.Nil(t, appErr)
+
+		th2 := Setup(t).InitBasic(t)
+
+		// import the exported channel
+		_, appErr = th2.App.BulkImport(th2.Context, &b, nil, true, 5)
+		require.Nil(t, appErr)
+
+		channels, nErr = th2.App.Srv().Store().Channel().GetAllDirectChannelsForExportAfter(1000, "00000000", false)
+		require.NoError(t, nErr)
+		assert.Empty(t, channels)
+	})
+
+	t.Run("Should not export DM channel if other user is permanently deleted", func(t *testing.T) {
+		th1 := Setup(t).InitBasic(t)
+
+		// Create a DM Channel with another user
+		dmc1 := th1.CreateDmChannel(t, th1.BasicUser2)
+		th1.CreatePost(t, dmc1)
+
+		// Create a DM Channel with self
+		dmc2 := th1.CreateDmChannel(t, th1.BasicUser)
+		th1.CreatePost(t, dmc2)
+
+		channels, nErr := th1.App.Srv().Store().Channel().GetAllDirectChannelsForExportAfter(1000, "00000000", false)
+		require.NoError(t, nErr)
+		assert.Equal(t, 2, len(channels))
+
+		// Permanentley delete other user
+		appErr := th1.App.PermanentDeleteUser(th1.Context, th1.BasicUser2)
+		require.Nil(t, appErr)
+
+		var b bytes.Buffer
+		err := th1.App.BulkExport(th1.Context, &b, "somePath", nil, model.BulkExportOpts{})
+		require.Nil(t, err)
+
+		th2 := Setup(t).InitBasic(t)
+
+		// import the exported channel
+		_, err = th2.App.BulkImport(th2.Context, &b, nil, false, 5)
+		require.Nil(t, err)
+
+		channels, nErr = th2.App.Srv().Store().Channel().GetAllDirectChannelsForExportAfter(1000, "00000000", false)
+		require.NoError(t, nErr)
+		assert.Equal(t, 1, len(channels))
+
+		// Ensure the posts of the deleted DM channel do not leak to the self-DM channel
+		posts, nErr := th2.App.Srv().Store().Post().GetPosts(th2.Context,
+			model.GetPostsOptions{
+				ChannelId:      channels[0].Id,
+				PerPage:        1000,
+				IncludeDeleted: true,
+			}, false, nil)
+		require.NoError(t, nErr)
+		assert.Equal(t, 1, len(posts.Posts))
+	})
+}
+
+func TestExportDMChannelToSelf(t *testing.T) {
+	mainHelper.Parallel(t)
+	th1 := Setup(t).InitBasic(t)
+
+	// DM Channel with self (me channel)
+	th1.CreateDmChannel(t, th1.BasicUser)
+
+	var b bytes.Buffer
+	err := th1.App.BulkExport(th1.Context, &b, "somePath", nil, model.BulkExportOpts{})
+	require.Nil(t, err)
+
+	channels, nErr := th1.App.Srv().Store().Channel().GetAllDirectChannelsForExportAfter(1000, "00000000", false)
+	require.NoError(t, nErr)
+	assert.Equal(t, 1, len(channels))
+
+	th2 := Setup(t)
+
+	channels, nErr = th2.App.Srv().Store().Channel().GetAllDirectChannelsForExportAfter(1000, "00000000", false)
+	require.NoError(t, nErr)
+	assert.Equal(t, 0, len(channels))
+
+	// import the exported channel
+	i, err := th2.App.BulkImport(th2.Context, &b, nil, false, 5)
+	assert.Nil(t, err)
+	assert.EqualValues(t, 0, i)
+
+	channels, nErr = th2.App.Srv().Store().Channel().GetAllDirectChannelsForExportAfter(1000, "00000000", false)
+	require.NoError(t, nErr)
+	assert.Equal(t, 1, len(channels))
+	assert.Equal(t, 1, len((channels[0].Members)))
+	assert.Equal(t, th1.BasicUser.Username, channels[0].Members[0].Username)
+}
+
+func TestExportGMChannel(t *testing.T) {
+	mainHelper.Parallel(t)
+	th1 := Setup(t).InitBasic(t)
+
+	user1 := th1.CreateUser(t)
+	th1.LinkUserToTeam(t, user1, th1.BasicTeam)
+	user2 := th1.CreateUser(t)
+	th1.LinkUserToTeam(t, user2, th1.BasicTeam)
+
+	// GM Channel
+	th1.CreateGroupChannel(t, user1, user2)
+
+	var b bytes.Buffer
+	err := th1.App.BulkExport(th1.Context, &b, "somePath", nil, model.BulkExportOpts{})
+	require.Nil(t, err)
+
+	channels, nErr := th1.App.Srv().Store().Channel().GetAllDirectChannelsForExportAfter(1000, "00000000", false)
+	require.NoError(t, nErr)
+	assert.Equal(t, 1, len(channels))
+
+	th2 := Setup(t)
+
+	channels, nErr = th2.App.Srv().Store().Channel().GetAllDirectChannelsForExportAfter(1000, "00000000", false)
+	require.NoError(t, nErr)
+	assert.Equal(t, 0, len(channels))
+}
+
+func TestExportGMandDMChannels(t *testing.T) {
+	mainHelper.Parallel(t)
+	th1 := Setup(t).InitBasic(t)
+
+	// DM Channel
+	th1.CreateDmChannel(t, th1.BasicUser2)
+
+	user1 := th1.CreateUser(t)
+	th1.LinkUserToTeam(t, user1, th1.BasicTeam)
+	user2 := th1.CreateUser(t)
+	th1.LinkUserToTeam(t, user2, th1.BasicTeam)
+
+	// GM Channel
+	th1.CreateGroupChannel(t, user1, user2)
+
+	var b bytes.Buffer
+	err := th1.App.BulkExport(th1.Context, &b, "somePath", nil, model.BulkExportOpts{})
+	require.Nil(t, err)
+
+	channels, nErr := th1.App.Srv().Store().Channel().GetAllDirectChannelsForExportAfter(1000, "00000000", false)
+	require.NoError(t, nErr)
+	assert.Equal(t, 2, len(channels))
+
+	th2 := Setup(t)
+
+	channels, nErr = th2.App.Srv().Store().Channel().GetAllDirectChannelsForExportAfter(1000, "00000000", false)
+	require.NoError(t, nErr)
+	assert.Equal(t, 0, len(channels))
+
+	// import the exported channel
+	i, err := th2.App.BulkImport(th2.Context, &b, nil, false, 5)
+	assert.Nil(t, err)
+	assert.Equal(t, 0, i)
+
+	// Ensure the Members of the imported GM channel is the same was from the exported
+	channels, nErr = th2.App.Srv().Store().Channel().GetAllDirectChannelsForExportAfter(1000, "00000000", false)
+	require.NoError(t, nErr)
+
+	// Adding some determinism so its possible to assert on slice index
+	slices.SortFunc(channels, func(a, b *model.DirectChannelForExport) int { return cmp.Compare(b.Type, a.Type) })
+	assert.Equal(t, 2, len(channels))
+	assert.ElementsMatch(t, []string{th1.BasicUser.Username, user1.Username, user2.Username}, []string{channels[0].Members[0].Username, channels[0].Members[1].Username, channels[0].Members[2].Username})
+	assert.ElementsMatch(t, []string{th1.BasicUser.Username, th1.BasicUser2.Username}, []string{channels[1].Members[0].Username, channels[1].Members[1].Username})
+}
+
+func TestExportDMandGMPost(t *testing.T) {
+	mainHelper.Parallel(t)
+	th1 := Setup(t).InitBasic(t)
+
+	// DM Channel
+	dmChannel := th1.CreateDmChannel(t, th1.BasicUser2)
+	dmMembers := []string{th1.BasicUser.Username, th1.BasicUser2.Username}
+
+	user1 := th1.CreateUser(t)
+	th1.LinkUserToTeam(t, user1, th1.BasicTeam)
+	user2 := th1.CreateUser(t)
+	th1.LinkUserToTeam(t, user2, th1.BasicTeam)
+
+	// GM Channel
+	gmChannel := th1.CreateGroupChannel(t, user1, user2)
+	gmMembers := []string{th1.BasicUser.Username, user1.Username, user2.Username}
+
+	// DM posts
+	p1 := &model.Post{
+		ChannelId: dmChannel.Id,
+		Message:   "aa" + model.NewId() + "a",
+		UserId:    th1.BasicUser.Id,
+	}
+	_, _, appErr := th1.App.CreatePost(th1.Context, p1, dmChannel, model.CreatePostFlags{SetOnline: true})
+	require.Nil(t, appErr)
+
+	p2 := &model.Post{
+		ChannelId: dmChannel.Id,
+		Message:   "bb" + model.NewId() + "a",
+		UserId:    th1.BasicUser.Id,
+	}
+	_, _, appErr = th1.App.CreatePost(th1.Context, p2, dmChannel, model.CreatePostFlags{SetOnline: true})
+	require.Nil(t, appErr)
+
+	// GM posts
+	p3 := &model.Post{
+		ChannelId: gmChannel.Id,
+		Message:   "cc" + model.NewId() + "a",
+		UserId:    th1.BasicUser.Id,
+	}
+	_, _, appErr = th1.App.CreatePost(th1.Context, p3, gmChannel, model.CreatePostFlags{SetOnline: true})
+	require.Nil(t, appErr)
+
+	p4 := &model.Post{
+		ChannelId: gmChannel.Id,
+		Message:   "dd" + model.NewId() + "a",
+		UserId:    th1.BasicUser.Id,
+	}
+	_, _, appErr = th1.App.CreatePost(th1.Context, p4, gmChannel, model.CreatePostFlags{SetOnline: true})
+	require.Nil(t, appErr)
+
+	posts, err := th1.App.Srv().Store().Post().GetDirectPostParentsForExportAfter(1000, "0000000", false)
+	require.NoError(t, err)
+	assert.Equal(t, 4, len(posts))
+
+	var b bytes.Buffer
+	appErr = th1.App.BulkExport(th1.Context, &b, "somePath", nil, model.BulkExportOpts{})
+	require.Nil(t, appErr)
+
+	th2 := Setup(t)
+
+	posts, err = th2.App.Srv().Store().Post().GetDirectPostParentsForExportAfter(1000, "0000000", false)
+	require.NoError(t, err)
+	assert.Equal(t, 0, len(posts))
+
+	// import the exported posts
+	i, appErr := th2.App.BulkImport(th2.Context, &b, nil, false, 5)
+	assert.Nil(t, appErr)
+	assert.Equal(t, 0, i)
+
+	posts, err = th2.App.Srv().Store().Post().GetDirectPostParentsForExportAfter(1000, "0000000", false)
+	require.NoError(t, err)
+
+	// Adding some determinism so its possible to assert on slice index
+	slices.SortFunc(posts, func(a, b *model.DirectPostForExport) int { return cmp.Compare(b.Message, a.Message) })
+	assert.Equal(t, 4, len(posts))
+	assert.ElementsMatch(t, gmMembers, *posts[0].ChannelMembers)
+	assert.ElementsMatch(t, gmMembers, *posts[1].ChannelMembers)
+	assert.ElementsMatch(t, dmMembers, *posts[2].ChannelMembers)
+	assert.ElementsMatch(t, dmMembers, *posts[3].ChannelMembers)
+}
+
+func TestExportPostWithProps(t *testing.T) {
+	mainHelper.Parallel(t)
+	th1 := Setup(t).InitBasic(t)
+
+	attachments := []*model.MessageAttachment{{Footer: "footer"}}
+
+	// DM Channel
+	dmChannel := th1.CreateDmChannel(t, th1.BasicUser2)
+	dmMembers := []string{th1.BasicUser.Username, th1.BasicUser2.Username}
+
+	user1 := th1.CreateUser(t)
+	th1.LinkUserToTeam(t, user1, th1.BasicTeam)
+	user2 := th1.CreateUser(t)
+	th1.LinkUserToTeam(t, user2, th1.BasicTeam)
+
+	// GM Channel
+	gmChannel := th1.CreateGroupChannel(t, user1, user2)
+	gmMembers := []string{th1.BasicUser.Username, user1.Username, user2.Username}
+
+	// DM posts
+	p1 := &model.Post{
+		ChannelId: dmChannel.Id,
+		Message:   "aa" + model.NewId() + "a",
+		Props: map[string]any{
+			model.PostPropsAttachments: attachments,
+		},
+		UserId: th1.BasicUser.Id,
+	}
+	_, _, appErr := th1.App.CreatePost(th1.Context, p1, dmChannel, model.CreatePostFlags{SetOnline: true})
+	require.Nil(t, appErr)
+
+	p2 := &model.Post{
+		ChannelId: gmChannel.Id,
+		Message:   "dd" + model.NewId() + "a",
+		Props: map[string]any{
+			model.PostPropsAttachments: attachments,
+		},
+		UserId: th1.BasicUser.Id,
+	}
+	_, _, appErr = th1.App.CreatePost(th1.Context, p2, gmChannel, model.CreatePostFlags{SetOnline: true})
+	require.Nil(t, appErr)
+
+	posts, err := th1.App.Srv().Store().Post().GetDirectPostParentsForExportAfter(1000, "0000000", false)
+	require.NoError(t, err)
+	assert.Len(t, posts, 2)
+	require.NotEmpty(t, posts[0].Props)
+	require.NotEmpty(t, posts[1].Props)
+
+	var b bytes.Buffer
+	appErr = th1.App.BulkExport(th1.Context, &b, "somePath", nil, model.BulkExportOpts{})
+	require.Nil(t, appErr)
+
+	th2 := Setup(t)
+
+	posts, err = th2.App.Srv().Store().Post().GetDirectPostParentsForExportAfter(1000, "0000000", false)
+	require.NoError(t, err)
+	assert.Len(t, posts, 0)
+
+	// import the exported posts
+	i, appErr := th2.App.BulkImport(th2.Context, &b, nil, false, 5)
+	assert.Nil(t, appErr)
+	assert.Equal(t, 0, i)
+
+	posts, err = th2.App.Srv().Store().Post().GetDirectPostParentsForExportAfter(1000, "0000000", false)
+	require.NoError(t, err)
+
+	// Adding some determinism so its possible to assert on slice index
+	slices.SortFunc(posts, func(a, b *model.DirectPostForExport) int { return cmp.Compare(b.Message, a.Message) })
+	assert.Len(t, posts, 2)
+	assert.ElementsMatch(t, gmMembers, *posts[0].ChannelMembers)
+	assert.ElementsMatch(t, dmMembers, *posts[1].ChannelMembers)
+	assert.Contains(t, posts[0].Props[model.PostPropsAttachments].([]any)[0], "footer")
+	assert.Contains(t, posts[1].Props[model.PostPropsAttachments].([]any)[0], "footer")
+}
+
+func TestExportPostPriorityAndAcknowledgements(t *testing.T) {
+	mainHelper.Parallel(t)
+	th1 := Setup(t).InitBasic(t)
+
+	channelPost := th1.CreatePost(t, th1.BasicChannel)
+	dmPost := th1.CreatePost(t, th1.CreateDmChannel(t, th1.BasicUser2))
+	for _, post := range []*model.Post{channelPost, dmPost} {
+		_, err := th1.App.Srv().Store().PostPriority().Save(&model.PostPriority{
+			PostId:       post.Id,
+			ChannelId:    post.ChannelId,
+			Priority:     new(model.PostPriorityUrgent),
+			RequestedAck: new(true),
+		})
+		require.NoError(t, err)
+		_, err = th1.App.Srv().Store().PostAcknowledgement().BatchSave([]*model.PostAcknowledgement{{
+			PostId:         post.Id,
+			UserId:         th1.BasicUser2.Id,
+			ChannelId:      post.ChannelId,
+			AcknowledgedAt: post.CreateAt + 1,
+		}})
+		require.NoError(t, err)
+	}
+
+	var b bytes.Buffer
+	appErr := th1.App.BulkExport(th1.Context, &b, "somePath", nil, model.BulkExportOpts{})
+	require.Nil(t, appErr)
+
+	th2 := Setup(t)
+	i, appErr := th2.App.BulkImport(th2.Context, &b, nil, false, 5)
+	require.Nil(t, appErr)
+	require.Equal(t, 0, i)
+
+	team, appErr := th2.App.GetTeamByName(th1.BasicTeam.Name)
+	require.Nil(t, appErr)
+	channel, appErr := th2.App.GetChannelByName(th2.Context, th1.BasicChannel.Name, team.Id, false)
+	require.Nil(t, appErr)
+	channelPosts, err := th2.App.Srv().Store().Post().GetPostsCreatedAt(channel.Id, channelPost.CreateAt)
+	require.NoError(t, err)
+	require.Len(t, channelPosts, 1)
+	dmPosts, err := th2.App.Srv().Store().Post().GetDirectPostParentsForExportAfter(1000, strings.Repeat("0", 26), false)
+	require.NoError(t, err)
+	require.Len(t, dmPosts, 1)
+	user2, appErr := th2.App.GetUserByUsername(th1.BasicUser2.Username)
+	require.Nil(t, appErr)
+
+	for _, imported := range []struct {
+		id       string
+		createAt int64
+	}{{channelPosts[0].Id, channelPost.CreateAt}, {dmPosts[0].Id, dmPost.CreateAt}} {
+		priority, err := th2.App.Srv().Store().PostPriority().GetForPost(imported.id)
+		require.NoError(t, err)
+		assert.Equal(t, model.PostPriorityUrgent, *priority.Priority)
+		assert.True(t, *priority.RequestedAck)
+
+		acks, err := th2.App.Srv().Store().PostAcknowledgement().GetForPost(imported.id)
+		require.NoError(t, err)
+		require.Len(t, acks, 1)
+		assert.Equal(t, user2.Id, acks[0].UserId)
+		assert.Equal(t, imported.createAt+1, acks[0].AcknowledgedAt)
+	}
+}
+
+func TestExportUserCustomStatus(t *testing.T) {
+	mainHelper.Parallel(t)
+	th1 := Setup(t).InitBasic(t)
+
+	cs := &model.CustomStatus{
+		Emoji:     "palm_tree",
+		Text:      "on a vacation",
+		Duration:  "this_week",
+		ExpiresAt: time.Now().Add(24 * time.Hour),
+	}
+	appErr := th1.App.SetCustomStatus(th1.Context, th1.BasicUser.Id, cs)
+	require.Nil(t, appErr)
+
+	uname := th1.BasicUser.Username
+
+	var b bytes.Buffer
+	appErr = th1.App.BulkExport(th1.Context, &b, "somePath", nil, model.BulkExportOpts{})
+	require.Nil(t, appErr)
+
+	th2 := Setup(t)
+
+	i, appErr := th2.App.BulkImport(th2.Context, &b, nil, false, 1)
+	require.Nil(t, appErr)
+	assert.Equal(t, 0, i)
+
+	gotUser, err := th2.Server.Store().User().GetByUsername(uname)
+	require.NoError(t, err)
+	gotCs := gotUser.GetCustomStatus()
+	require.Equal(t, cs.Emoji, gotCs.Emoji)
+	require.Equal(t, cs.Text, gotCs.Text)
+}
+
+func TestExportDMPostWithSelf(t *testing.T) {
+	mainHelper.Parallel(t)
+	th1 := Setup(t).InitBasic(t)
+
+	// DM Channel with self (me channel)
+	dmChannel := th1.CreateDmChannel(t, th1.BasicUser)
+
+	th1.CreatePost(t, dmChannel)
+
+	var b bytes.Buffer
+	err := th1.App.BulkExport(th1.Context, &b, "somePath", nil, model.BulkExportOpts{})
+	require.Nil(t, err)
+
+	posts, nErr := th1.App.Srv().Store().Post().GetDirectPostParentsForExportAfter(1000, "0000000", false)
+	require.NoError(t, nErr)
+	assert.Equal(t, 1, len(posts))
+
+	th2 := Setup(t)
+
+	posts, nErr = th2.App.Srv().Store().Post().GetDirectPostParentsForExportAfter(1000, "0000000", false)
+	require.NoError(t, nErr)
+	assert.Equal(t, 0, len(posts))
+
+	// import the exported posts
+	i, err := th2.App.BulkImport(th2.Context, &b, nil, false, 5)
+	assert.Nil(t, err)
+	assert.Equal(t, 0, i)
+
+	posts, nErr = th2.App.Srv().Store().Post().GetDirectPostParentsForExportAfter(1000, "0000000", false)
+	require.NoError(t, nErr)
+	assert.Equal(t, 1, len(posts))
+	assert.Equal(t, 1, len((*posts[0].ChannelMembers)))
+	assert.Equal(t, th1.BasicUser.Username, (*posts[0].ChannelMembers)[0])
+}
+
+func TestExportPostsWithThread(t *testing.T) {
+	mainHelper.Parallel(t)
+	th1 := Setup(t).InitBasic(t)
+
+	assertThreadFollowers := func(t *testing.T, b *bytes.Buffer, postCreateAt int64, userNames []string) {
+		scanner := bufio.NewScanner(b)
+
+		usersToAssert := make([]string, 0)
+
+		for scanner.Scan() {
+			var line imports.LineImportData
+			err := json.Unmarshal(scanner.Bytes(), &line)
+			require.NoError(t, err)
+
+			switch line.Type {
+			case "post":
+				postLine := line.Post
+				require.NotNil(t, postLine)
+
+				if postLine.CreateAt != nil && *postLine.CreateAt != postCreateAt {
+					continue
+				}
+
+				for _, follower := range *postLine.ThreadFollowers {
+					if follower.User == nil {
+						require.Fail(t, "follower.User is nil")
+					}
+
+					usersToAssert = append(usersToAssert, *follower.User)
+				}
+			case "direct_post":
+				postLine := line.DirectPost
+				require.NotNil(t, postLine)
+
+				if postLine.CreateAt != nil && *postLine.CreateAt != postCreateAt {
+					continue
+				}
+
+				for _, follower := range *postLine.ThreadFollowers {
+					if follower.User == nil {
+						require.Fail(t, "follower.User is nil")
+					}
+
+					usersToAssert = append(usersToAssert, *follower.User)
+				}
+			default:
+				continue
+			}
+		}
+
+		require.ElementsMatch(t, userNames, usersToAssert)
+	}
+
+	t.Run("Export thread followers for a thread (public channel)", func(t *testing.T) {
+		thread := th1.CreatePost(t, th1.BasicChannel)
+		_ = th1.CreatePostReply(t, thread)
+
+		appErr := th1.App.UpdateThreadFollowForUser(th1.BasicUser2.Id, th1.BasicTeam.Id, thread.Id, true)
+		require.Nil(t, appErr)
+
+		member1, appErr := th1.App.GetThreadMembershipForUser(th1.BasicUser.Id, thread.Id)
+		require.Nil(t, appErr)
+		require.NotNil(t, member1)
+
+		member2, appErr := th1.App.GetThreadMembershipForUser(th1.BasicUser2.Id, thread.Id)
+		require.Nil(t, appErr)
+		require.NotNil(t, member2)
+
+		var b bytes.Buffer
+		err := th1.App.BulkExport(th1.Context, &b, "somePath", nil, model.BulkExportOpts{})
+		require.Nil(t, err)
+
+		assertThreadFollowers(t, &b, thread.CreateAt, []string{th1.BasicUser.Username, th1.BasicUser2.Username})
+	})
+
+	t.Run("Export thread followers for a thread (direct messages)", func(t *testing.T) {
+		dmc := th1.CreateDmChannel(t, th1.BasicUser2)
+
+		thread := th1.CreatePost(t, dmc)
+		_ = th1.CreatePostReply(t, thread)
+
+		appErr := th1.App.UpdateThreadFollowForUser(th1.BasicUser2.Id, th1.BasicTeam.Id, thread.Id, true)
+		require.Nil(t, appErr)
+
+		member1, appErr := th1.App.GetThreadMembershipForUser(th1.BasicUser.Id, thread.Id)
+		require.Nil(t, appErr)
+		require.NotNil(t, member1)
+
+		member2, appErr := th1.App.GetThreadMembershipForUser(th1.BasicUser2.Id, thread.Id)
+		require.Nil(t, appErr)
+		require.NotNil(t, member2)
+
+		var b bytes.Buffer
+		err := th1.App.BulkExport(th1.Context, &b, "somePath", nil, model.BulkExportOpts{})
+		require.Nil(t, err)
+		assertThreadFollowers(t, &b, thread.CreateAt, []string{th1.BasicUser.Username, th1.BasicUser2.Username})
+	})
+}
+
+func TestExportFileWarnings(t *testing.T) {
+	testCases := []struct {
+		Description string
+		ConfigFunc  func(cfg *model.Config)
+	}{
+		{
+			"local",
+			func(cfg *model.Config) {
+				cfg.FileSettings.DriverName = model.NewPointer(model.ImageDriverLocal)
+			},
+		},
+		{
+			"s3",
+			func(cfg *model.Config) {
+				s3Host := os.Getenv("CI_MINIO_HOST")
+				if s3Host == "" {
+					s3Host = "localhost"
+				}
+
+				s3Port := os.Getenv("CI_MINIO_PORT")
+				if s3Port == "" {
+					s3Port = "9000"
+				}
+
+				s3Endpoint := fmt.Sprintf("%s:%s", s3Host, s3Port)
+				cfg.FileSettings.DriverName = model.NewPointer(model.ImageDriverS3)
+				cfg.FileSettings.AmazonS3AccessKeyId = model.NewPointer(model.MinioAccessKey)
+				cfg.FileSettings.AmazonS3SecretAccessKey = model.NewPointer(model.MinioSecretKey)
+				cfg.FileSettings.AmazonS3Bucket = model.NewPointer(model.MinioBucket)
+				cfg.FileSettings.AmazonS3PathPrefix = new("")
+				cfg.FileSettings.AmazonS3Endpoint = new(s3Endpoint)
+				cfg.FileSettings.AmazonS3Region = new("")
+				cfg.FileSettings.AmazonS3SSL = new(false)
+			},
+		},
+	}
+
+	for _, testCase := range testCases {
+		t.Run(testCase.Description, func(t *testing.T) {
+			th := Setup(t)
+
+			th.App.UpdateConfig(testCase.ConfigFunc)
+
+			// Create a buffer to capture logs
+			buffer := &mlog.Buffer{}
+			err := mlog.AddWriterTarget(th.TestLogger, buffer, true, mlog.StdAll...)
+			require.NoError(t, err)
+
+			testsDir, _ := fileutils.FindDir("tests")
+			dir, err := os.MkdirTemp("", "import_test")
+			require.NoError(t, err)
+			defer os.RemoveAll(dir)
+
+			extractImportFile := func(filePath string) *os.File {
+				importFile, err2 := os.Open(filePath)
+				require.NoError(t, err2)
+				defer importFile.Close()
+
+				info, err2 := importFile.Stat()
+				require.NoError(t, err2)
+
+				paths, err2 := utils.UnzipToPath(importFile, info.Size(), dir)
+				require.NoError(t, err2)
+				require.NotEmpty(t, paths)
+
+				jsonFile, err2 := os.Open(filepath.Join(dir, "import.jsonl"))
+				require.NoError(t, err2)
+
+				return jsonFile
+			}
+
+			jsonFile := extractImportFile(filepath.Join(testsDir, "import_test.zip"))
+			defer jsonFile.Close()
+
+			_, appErr := th.App.BulkImportWithPath(th.Context, jsonFile, nil, false, true, 1, dir)
+			require.Nil(t, appErr)
+
+			// delete one of the files
+			params := &model.SearchParams{Terms: "test3.png", SearchWithoutUserId: true}
+			results, err := th.App.Srv().Store().FileInfo().Search(th.Context, []*model.SearchParams{params}, "", "", 0, 20)
+			require.NoError(t, err)
+			require.Len(t, results.FileInfos, 1)
+
+			for _, info2 := range results.FileInfos {
+				err2 := th.App.RemoveFile(info2.Path)
+				require.Nil(t, err2)
+			}
+
+			exportFile, err := os.Create(filepath.Join(dir, "export.zip"))
+			require.NoError(t, err)
+
+			job, appErr := th.App.Srv().Jobs.CreateJob(th.Context, model.JobTypeExportProcess, nil)
+			require.Nil(t, appErr)
+			newJob, appErr := th.App.Srv().Jobs.ClaimJob(job)
+			require.Nil(t, appErr)
+			require.NotNil(t, newJob)
+
+			opts := model.BulkExportOpts{
+				IncludeAttachments: true,
+				CreateArchive:      true,
+			}
+			appErr = th.App.BulkExport(th.Context, exportFile, dir, newJob, opts)
+			// should not get an error for the missing file
+			require.Nil(t, appErr)
+
+			// should get a warning instead:
+			testlib.AssertLog(t, buffer, mlog.LvlWarn.Name, "Unable to export file attachment")
+
+			// should get info in the newJob data:
+			newJob, appErr = th.App.Srv().Jobs.GetJob(th.Context, newJob.Id)
+			require.Nil(t, appErr)
+			warnings, ok := newJob.Data["num_warnings"]
+			require.True(t, ok)
+			require.Equal(t, "1", warnings)
+
+			exportFile.Close()
+
+			// Verify warnings.txt exists in the zip and contains expected content
+			exportZipPath := filepath.Join(dir, "export.zip")
+			exportZipFile, err := os.Open(exportZipPath)
+			require.NoError(t, err)
+			defer exportZipFile.Close()
+
+			info, err := exportZipFile.Stat()
+			require.NoError(t, err)
+
+			paths, err := utils.UnzipToPath(exportZipFile, info.Size(), dir)
+			require.NoError(t, err)
+			require.Contains(t, paths, filepath.Join(dir, warningsFilename))
+
+			warningsContent, err := os.ReadFile(filepath.Join(dir, warningsFilename))
+			require.NoError(t, err)
+			require.Contains(t, string(warningsContent), "Unable to export file attachment, attachment path:")
+		})
+	}
+}
+
+func TestBulkExport(t *testing.T) {
+	mainHelper.Parallel(t)
+	th := Setup(t)
+	testsDir, _ := fileutils.FindDir("tests")
+
+	dir, err := os.MkdirTemp("", "import_test")
+	require.NoError(t, err)
+	defer os.RemoveAll(dir)
+
+	extractImportFile := func(filePath string) *os.File {
+		importFile, err2 := os.Open(filePath)
+		require.NoError(t, err2)
+		defer importFile.Close()
+
+		info, err2 := importFile.Stat()
+		require.NoError(t, err2)
+
+		paths, err2 := utils.UnzipToPath(importFile, info.Size(), dir)
+		require.NoError(t, err2)
+		require.NotEmpty(t, paths)
+
+		jsonFile, err2 := os.Open(filepath.Join(dir, "import.jsonl"))
+		require.NoError(t, err2)
+
+		return jsonFile
+	}
+
+	jsonFile := extractImportFile(filepath.Join(testsDir, "import_test.zip"))
+	defer jsonFile.Close()
+
+	_, appErr := th.App.BulkImportWithPath(th.Context, jsonFile, nil, false, true, 1, dir)
+	require.Nil(t, appErr)
+
+	exportFile, err := os.Create(filepath.Join(dir, "export.zip"))
+	require.NoError(t, err)
+	defer exportFile.Close()
+
+	opts := model.BulkExportOpts{
+		IncludeAttachments: true,
+		CreateArchive:      true,
+	}
+	appErr = th.App.BulkExport(th.Context, exportFile, dir, nil, opts)
+	require.Nil(t, appErr)
+
+	th = Setup(t)
+
+	jsonFile = extractImportFile(filepath.Join(dir, "export.zip"))
+	defer jsonFile.Close()
+
+	_, appErr = th.App.BulkImportWithPath(th.Context, jsonFile, nil, false, true, 1, filepath.Join(dir, "data"))
+	require.Nil(t, appErr)
+}
+
+func TestBuildPostReplies(t *testing.T) {
+	mainHelper.Parallel(t)
+	th := Setup(t).InitBasic(t)
+
+	createPostWithAttachments := func(th *TestHelper, n int, rootID string) *model.Post {
+		var fileIDs []string
+		for i := range n {
+			info, err := th.App.Srv().Store().FileInfo().Save(th.Context, &model.FileInfo{
+				CreatorId: th.BasicUser.Id,
+				Name:      fmt.Sprintf("file%d", i),
+				Path:      fmt.Sprintf("/data/file%d", i),
+			})
+			require.NoError(t, err)
+			fileIDs = append(fileIDs, info.Id)
+		}
+
+		post, _, err := th.App.CreatePost(th.Context, &model.Post{UserId: th.BasicUser.Id, ChannelId: th.BasicChannel.Id, RootId: rootID, FileIds: fileIDs}, th.BasicChannel, model.CreatePostFlags{SetOnline: true})
+		require.Nil(t, err)
+
+		return post
+	}
+
+	t.Run("basic post", func(t *testing.T) {
+		data, attachments, err := th.App.buildPostReplies(th.Context, th.BasicPost.Id, true)
+		require.Nil(t, err)
+		require.Empty(t, data)
+		require.Empty(t, attachments)
+	})
+
+	t.Run("root post with attachments and no replies", func(t *testing.T) {
+		post := createPostWithAttachments(th, 5, "")
+		data, attachments, err := th.App.buildPostReplies(th.Context, post.Id, true)
+		require.Nil(t, err)
+		require.Empty(t, data)
+		require.Empty(t, attachments)
+	})
+
+	t.Run("root post with attachments and a reply", func(t *testing.T) {
+		post := createPostWithAttachments(th, 5, "")
+		createPostWithAttachments(th, 0, post.Id)
+		data, attachments, err := th.App.buildPostReplies(th.Context, post.Id, true)
+		require.Nil(t, err)
+		require.Len(t, data, 1)
+		require.Empty(t, attachments)
+	})
+
+	t.Run("root post with attachments and multiple replies with attachments", func(t *testing.T) {
+		post := createPostWithAttachments(th, 5, "")
+		reply1 := createPostWithAttachments(th, 2, post.Id)
+		reply2 := createPostWithAttachments(th, 3, post.Id)
+		data, attachments, err := th.App.buildPostReplies(th.Context, post.Id, true)
+		require.Nil(t, err)
+		require.Len(t, data, 2)
+		require.Len(t, attachments, 5)
+		if reply1.Id < reply2.Id {
+			require.Len(t, *data[0].Attachments, 2)
+			require.Len(t, *data[1].Attachments, 3)
+		} else {
+			require.Len(t, *data[1].Attachments, 2)
+			require.Len(t, *data[0].Attachments, 3)
+		}
+	})
+}
+
+func TestExportDeletedTeams(t *testing.T) {
+	mainHelper.Parallel(t)
+	th1 := Setup(t).InitBasic(t)
+
+	team1 := th1.CreateTeam(t)
+	channel1 := th1.CreateChannel(t, team1)
+	th1.CreatePost(t, channel1)
+
+	// Delete the team to check that this is handled correctly on import.
+	err := th1.App.SoftDeleteTeam(team1.Id)
+	require.Nil(t, err)
+
+	var b bytes.Buffer
+	err = th1.App.BulkExport(th1.Context, &b, "somePath", nil, model.BulkExportOpts{})
+	require.Nil(t, err)
+
+	var th2 *TestHelper
+	if mainHelper.Options.RunParallel {
+		th1.Store.DropAllTables()
+		th2 = th1
+	} else {
+		th2 = Setup(t)
+	}
+
+	i, err := th2.App.BulkImport(th2.Context, &b, nil, false, 5)
+	assert.Nil(t, err)
+	assert.Equal(t, 0, i)
+
+	teams1, err := th1.App.GetAllTeams()
+	assert.Nil(t, err)
+	teams2, err := th2.App.GetAllTeams()
+	assert.Nil(t, err)
+	assert.Equal(t, len(teams1), len(teams2))
+	assert.ElementsMatch(t, teams1, teams2)
+
+	channels1, err := th1.App.GetAllChannels(th1.Context, 0, 10, model.ChannelSearchOpts{})
+	assert.Nil(t, err)
+	channels2, err := th2.App.GetAllChannels(th1.Context, 0, 10, model.ChannelSearchOpts{})
+	assert.Nil(t, err)
+	assert.Equal(t, len(channels1), len(channels2))
+	assert.ElementsMatch(t, channels1, channels2)
+	for _, team := range teams2 {
+		assert.NotContains(t, team.Name, team1.Name)
+		assert.NotContains(t, team.Id, team1.Id)
+	}
+}
+
+func TestExportArchivedChannels(t *testing.T) {
+	mainHelper.Parallel(t)
+	th1 := Setup(t).InitBasic(t)
+
+	archivedChannel := th1.CreateChannel(t, th1.BasicTeam)
+	th1.CreatePost(t, archivedChannel)
+	appErr := th1.App.DeleteChannel(th1.Context, archivedChannel, th1.SystemAdminUser.Id)
+	require.Nil(t, appErr)
+
+	var b bytes.Buffer
+	appErr = th1.App.BulkExport(th1.Context, &b, "somePath", nil, model.BulkExportOpts{
+		IncludeArchivedChannels: true,
+	})
+	require.Nil(t, appErr)
+
+	th2 := Setup(t)
+
+	i, err := th2.App.BulkImport(th2.Context, &b, nil, false, 5)
+	assert.Nil(t, err)
+	assert.Equal(t, 0, i)
+
+	channels2, err := th2.App.GetAllChannels(th1.Context, 0, 10, model.ChannelSearchOpts{
+		IncludeDeleted: true,
+	})
+	assert.Nil(t, err)
+	found := false
+	for i := range channels2 {
+		if channels2[i].Name == archivedChannel.Name {
+			found = true
+			break
+		}
+	}
+	require.True(t, found, "archived channel not found after import")
+}
+
+func TestExportRoles(t *testing.T) {
+	mainHelper.Parallel(t)
+	t.Run("defaults", func(t *testing.T) {
+		th1 := Setup(t).InitBasic(t)
+
+		var b bytes.Buffer
+		appErr := th1.App.BulkExport(th1.Context, &b, "", nil, model.BulkExportOpts{})
+		require.Nil(t, appErr)
+
+		exportedRoles, appErr := th1.App.GetAllRoles()
+		assert.Nil(t, appErr)
+		assert.NotEmpty(t, exportedRoles)
+
+		th2 := Setup(t)
+
+		i, appErr := th2.App.BulkImport(th2.Context, &b, nil, false, 1)
+		assert.Nil(t, appErr)
+		assert.Equal(t, 0, i)
+
+		importedRoles, appErr := th2.App.GetAllRoles()
+		assert.Nil(t, appErr)
+		assert.NotEmpty(t, importedRoles)
+
+		require.Equal(t, len(exportedRoles), len(importedRoles))
+	})
+
+	t.Run("modified roles", func(t *testing.T) {
+		th1 := Setup(t).InitBasic(t)
+
+		exportedRole, appErr := th1.App.GetRoleByName(th1.Context, model.TeamUserRoleId)
+		require.Nil(t, appErr)
+
+		exportedRole.Permissions = exportedRole.Permissions[1:]
+
+		_, appErr = th1.App.UpdateRole(exportedRole)
+		require.Nil(t, appErr)
+
+		var b bytes.Buffer
+		appErr = th1.App.BulkExport(th1.Context, &b, "", nil, model.BulkExportOpts{
+			IncludeRolesAndSchemes: true,
+		})
+		require.Nil(t, appErr)
+
+		th2 := Setup(t)
+
+		i, appErr := th2.App.BulkImport(th2.Context, &b, nil, false, 1)
+		require.Nil(t, appErr)
+		require.Equal(t, 0, i)
+
+		importedRole, appErr := th2.App.GetRoleByName(th2.Context, model.TeamUserRoleId)
+		require.Nil(t, appErr)
+
+		require.Equal(t, exportedRole.DisplayName, importedRole.DisplayName)
+		require.Equal(t, exportedRole.Description, importedRole.Description)
+		require.Equal(t, exportedRole.SchemeManaged, importedRole.SchemeManaged)
+		require.Equal(t, exportedRole.BuiltIn, importedRole.BuiltIn)
+		require.ElementsMatch(t, exportedRole.Permissions, importedRole.Permissions)
+	})
+
+	t.Run("custom roles", func(t *testing.T) {
+		th1 := Setup(t).InitBasic(t)
+
+		exportedRoles, appErr := th1.App.GetAllRoles()
+		require.Nil(t, appErr)
+		require.NotEmpty(t, exportedRoles)
+
+		customRole, appErr := th1.App.CreateRole(&model.Role{
+			Name:        "custom_role",
+			DisplayName: "custom_role",
+			Permissions: exportedRoles[0].Permissions,
+		})
+		require.Nil(t, appErr)
+
+		var b bytes.Buffer
+		appErr = th1.App.BulkExport(th1.Context, &b, "", nil, model.BulkExportOpts{
+			IncludeRolesAndSchemes: true,
+		})
+		require.Nil(t, appErr)
+
+		th2 := Setup(t)
+
+		i, appErr := th2.App.BulkImport(th2.Context, &b, nil, false, 1)
+		require.Nil(t, appErr)
+		require.Equal(t, 0, i)
+
+		importedCustomRole, appErr := th2.App.GetRoleByName(th2.Context, customRole.Name)
+		require.Nil(t, appErr)
+
+		require.Equal(t, customRole.DisplayName, importedCustomRole.DisplayName)
+		require.Equal(t, customRole.Description, importedCustomRole.Description)
+		require.Equal(t, customRole.SchemeManaged, importedCustomRole.SchemeManaged)
+		require.Equal(t, customRole.BuiltIn, importedCustomRole.BuiltIn)
+		require.ElementsMatch(t, customRole.Permissions, importedCustomRole.Permissions)
+	})
+}
+
+func TestExportSchemes(t *testing.T) {
+	mainHelper.Parallel(t)
+	t.Run("no schemes", func(t *testing.T) {
+		th1 := Setup(t).InitBasic(t)
+
+		// Need to set this or working with schemes won't work until the job is
+		// completed which is unnecessary for the purpose of this test.
+		err := th1.App.Srv().Store().System().Save(&model.System{Name: model.MigrationKeyAdvancedPermissionsPhase2, Value: "true"})
+		require.NoError(t, err)
+
+		schemes, err := th1.App.Srv().Store().Scheme().GetAllPage(model.SchemeScopeChannel, 0, 1)
+		require.NoError(t, err)
+		require.Empty(t, schemes)
+
+		schemes, err = th1.App.Srv().Store().Scheme().GetAllPage(model.SchemeScopeTeam, 0, 1)
+		require.NoError(t, err)
+		require.Empty(t, schemes)
+
+		var b bytes.Buffer
+		appErr := th1.App.BulkExport(th1.Context, &b, "", nil, model.BulkExportOpts{
+			IncludeRolesAndSchemes: true,
+		})
+		require.Nil(t, appErr)
+
+		// The following causes the original store to be wiped so from here on we are targeting the
+		// second instance where the import will be loaded.
+		th2 := Setup(t)
+
+		err = th2.App.Srv().Store().System().Save(&model.System{Name: model.MigrationKeyAdvancedPermissionsPhase2, Value: "true"})
+		require.NoError(t, err)
+
+		i, appErr := th2.App.BulkImport(th2.Context, &b, nil, false, 1)
+		require.Nil(t, appErr)
+		require.Equal(t, 0, i)
+
+		schemes, err = th2.App.Srv().Store().Scheme().GetAllPage(model.SchemeScopeChannel, 0, 1)
+		require.NoError(t, err)
+		require.Empty(t, schemes)
+
+		schemes, err = th2.App.Srv().Store().Scheme().GetAllPage(model.SchemeScopeTeam, 0, 1)
+		require.NoError(t, err)
+		require.Empty(t, schemes)
+	})
+
+	t.Run("skip export", func(t *testing.T) {
+		th1 := Setup(t).InitBasic(t)
+
+		// Need to set this or working with schemes won't work until the job is
+		// completed which is unnecessary for the purpose of this test.
+		err := th1.App.Srv().Store().System().Save(&model.System{Name: model.MigrationKeyAdvancedPermissionsPhase2, Value: "true"})
+		require.NoError(t, err)
+
+		customScheme, appErr := th1.App.CreateScheme(&model.Scheme{
+			Name:        "custom_scheme",
+			DisplayName: "Custom Scheme",
+			Scope:       model.SchemeScopeChannel,
+		})
+		require.Nil(t, appErr)
+
+		var b bytes.Buffer
+		appErr = th1.App.BulkExport(th1.Context, &b, "", nil, model.BulkExportOpts{})
+		require.Nil(t, appErr)
+
+		// The following causes the original store to be wiped so from here on we are targeting the
+		// second instance where the import will be loaded.
+		th2 := Setup(t)
+
+		err = th2.App.Srv().Store().System().Save(&model.System{Name: model.MigrationKeyAdvancedPermissionsPhase2, Value: "true"})
+		require.NoError(t, err)
+
+		i, appErr := th2.App.BulkImport(th2.Context, &b, nil, false, 1)
+		require.Nil(t, appErr)
+		require.Equal(t, 0, i)
+
+		// Verify the scheme doesn't exist which is the expectation as it wasn't exported.
+		_, appErr = th2.App.GetScheme(customScheme.Name)
+		require.NotNil(t, appErr)
+	})
+
+	t.Run("export channel scheme", func(t *testing.T) {
+		th1 := Setup(t).InitBasic(t)
+
+		// Need to set this or working with schemes won't work until the job is
+		// completed which is unnecessary for the purpose of this test.
+		err := th1.App.Srv().Store().System().Save(&model.System{Name: model.MigrationKeyAdvancedPermissionsPhase2, Value: "true"})
+		require.NoError(t, err)
+
+		builtInRoles := 24
+		defaultChannelSchemeRoles := 3
+
+		// Verify the roles count is expected prior to scheme creation.
+		roles, appErr := th1.App.GetAllRoles()
+		require.Nil(t, appErr)
+		require.Len(t, roles, builtInRoles)
+
+		customScheme, appErr := th1.App.CreateScheme(&model.Scheme{
+			Name:        "custom_channel_scheme",
+			DisplayName: "Custom Channel Scheme",
+			Scope:       model.SchemeScopeChannel,
+		})
+		require.Nil(t, appErr)
+
+		// Verify the roles count is expected after scheme creation.
+		roles, appErr = th1.App.GetAllRoles()
+		require.Nil(t, appErr)
+		require.Len(t, roles, builtInRoles+defaultChannelSchemeRoles)
+
+		// Fetch the scheme roles for later comparison
+		customChannelAdminRole, appErr := th1.App.GetRoleByName(th1.Context, customScheme.DefaultChannelAdminRole)
+		require.Nil(t, appErr)
+		customChannelUserRole, appErr := th1.App.GetRoleByName(th1.Context, customScheme.DefaultChannelUserRole)
+		require.Nil(t, appErr)
+		customChannelGuestRole, appErr := th1.App.GetRoleByName(th1.Context, customScheme.DefaultChannelGuestRole)
+		require.Nil(t, appErr)
+
+		var b bytes.Buffer
+		appErr = th1.App.BulkExport(th1.Context, &b, "", nil, model.BulkExportOpts{
+			IncludeRolesAndSchemes: true,
+		})
+		require.Nil(t, appErr)
+
+		// The following causes the original store to be wiped so from here on we are targeting the
+		// second instance where the import will be loaded.
+		th2 := Setup(t)
+
+		err = th2.App.Srv().Store().System().Save(&model.System{Name: model.MigrationKeyAdvancedPermissionsPhase2, Value: "true"})
+		require.NoError(t, err)
+
+		// Verify roles count before importing is as expected.
+		roles, appErr = th2.App.GetAllRoles()
+		require.Nil(t, appErr)
+		require.Len(t, roles, builtInRoles)
+
+		i, appErr := th2.App.BulkImport(th2.Context, &b, nil, false, 1)
+		require.Nil(t, appErr)
+		require.Equal(t, 0, i)
+
+		// Verify roles count after importing is as expected.
+		roles, appErr = th2.App.GetAllRoles()
+		require.Nil(t, appErr)
+		require.Len(t, roles, builtInRoles+defaultChannelSchemeRoles)
+
+		// Verify schemes match
+		importedScheme, appErr := th2.App.GetSchemeByName(customScheme.Name)
+		require.Nil(t, appErr)
+		require.Equal(t, customScheme.Name, importedScheme.Name)
+		require.Equal(t, customScheme.DisplayName, importedScheme.DisplayName)
+		require.Equal(t, customScheme.Description, importedScheme.Description)
+		require.Equal(t, customScheme.Scope, importedScheme.Scope)
+
+		// Verify scheme roles match
+		importedChannelAdminRole, appErr := th2.App.GetRoleByName(th2.Context, importedScheme.DefaultChannelAdminRole)
+		require.Nil(t, appErr)
+		require.Equal(t, customChannelAdminRole.DisplayName, importedChannelAdminRole.DisplayName)
+		require.Equal(t, customChannelAdminRole.Description, importedChannelAdminRole.Description)
+		require.Equal(t, customChannelAdminRole.Permissions, importedChannelAdminRole.Permissions)
+		require.Equal(t, customChannelAdminRole.SchemeManaged, importedChannelAdminRole.SchemeManaged)
+		require.Equal(t, customChannelAdminRole.BuiltIn, importedChannelAdminRole.BuiltIn)
+
+		importedChannelUserRole, appErr := th2.App.GetRoleByName(th2.Context, importedScheme.DefaultChannelUserRole)
+		require.Nil(t, appErr)
+		require.Equal(t, customChannelUserRole.DisplayName, importedChannelUserRole.DisplayName)
+		require.Equal(t, customChannelUserRole.Description, importedChannelUserRole.Description)
+		require.Equal(t, customChannelUserRole.Permissions, importedChannelUserRole.Permissions)
+		require.Equal(t, customChannelUserRole.SchemeManaged, importedChannelUserRole.SchemeManaged)
+		require.Equal(t, customChannelUserRole.BuiltIn, importedChannelUserRole.BuiltIn)
+
+		importedChannelGuestRole, appErr := th2.App.GetRoleByName(th2.Context, importedScheme.DefaultChannelGuestRole)
+		require.Nil(t, appErr)
+		require.Equal(t, customChannelGuestRole.DisplayName, importedChannelGuestRole.DisplayName)
+		require.Equal(t, customChannelGuestRole.Description, importedChannelGuestRole.Description)
+		require.Equal(t, customChannelGuestRole.Permissions, importedChannelGuestRole.Permissions)
+		require.Equal(t, customChannelGuestRole.SchemeManaged, importedChannelGuestRole.SchemeManaged)
+		require.Equal(t, customChannelGuestRole.BuiltIn, importedChannelGuestRole.BuiltIn)
+	})
+
+	t.Run("export team scheme", func(t *testing.T) {
+		th1 := Setup(t).InitBasic(t)
+
+		// Need to set this or working with schemes won't work until the job is
+		// completed which is unnecessary for the purpose of this test.
+		err := th1.App.Srv().Store().System().Save(&model.System{Name: model.MigrationKeyAdvancedPermissionsPhase2, Value: "true"})
+		require.NoError(t, err)
+
+		builtInRoles := 24
+		defaultTeamSchemeRoles := 10
+
+		// Verify the roles count is expected prior to scheme creation.
+		roles, appErr := th1.App.GetAllRoles()
+		require.Nil(t, appErr)
+		require.Len(t, roles, builtInRoles)
+
+		customScheme, appErr := th1.App.CreateScheme(&model.Scheme{
+			Name:        "custom_team_scheme",
+			DisplayName: "Custom Team Scheme",
+			Scope:       model.SchemeScopeTeam,
+		})
+		require.Nil(t, appErr)
+
+		// Verify the roles count is expected after scheme creation.
+		roles, appErr = th1.App.GetAllRoles()
+		require.Nil(t, appErr)
+		require.Len(t, roles, builtInRoles+defaultTeamSchemeRoles)
+
+		customChannelAdminRole, appErr := th1.App.GetRoleByName(th1.Context, customScheme.DefaultChannelAdminRole)
+		require.Nil(t, appErr)
+
+		customChannelUserRole, appErr := th1.App.GetRoleByName(th1.Context, customScheme.DefaultChannelUserRole)
+		require.Nil(t, appErr)
+
+		customChannelGuestRole, appErr := th1.App.GetRoleByName(th1.Context, customScheme.DefaultChannelGuestRole)
+		require.Nil(t, appErr)
+
+		customTeamAdminRole, appErr := th1.App.GetRoleByName(th1.Context, customScheme.DefaultTeamAdminRole)
+		require.Nil(t, appErr)
+
+		customTeamUserRole, appErr := th1.App.GetRoleByName(th1.Context, customScheme.DefaultTeamUserRole)
+		require.Nil(t, appErr)
+
+		customTeamGuestRole, appErr := th1.App.GetRoleByName(th1.Context, customScheme.DefaultTeamGuestRole)
+		require.Nil(t, appErr)
+
+		var b bytes.Buffer
+		appErr = th1.App.BulkExport(th1.Context, &b, "", nil, model.BulkExportOpts{
+			IncludeRolesAndSchemes: true,
+		})
+		require.Nil(t, appErr)
+
+		// The following causes the original store to be wiped so from here on we are targeting the
+		// second instance where the import will be loaded.
+		th2 := Setup(t)
+
+		err = th2.App.Srv().Store().System().Save(&model.System{Name: model.MigrationKeyAdvancedPermissionsPhase2, Value: "true"})
+		require.NoError(t, err)
+
+		// Verify roles count before importing is as expected.
+		roles, appErr = th2.App.GetAllRoles()
+		require.Nil(t, appErr)
+		require.Len(t, roles, builtInRoles)
+
+		i, appErr := th2.App.BulkImport(th2.Context, &b, nil, false, 1)
+		require.Nil(t, appErr)
+		require.Equal(t, 0, i)
+
+		// Verify roles count after importing is as expected.
+		roles, appErr = th2.App.GetAllRoles()
+		require.Nil(t, appErr)
+		require.Len(t, roles, builtInRoles+defaultTeamSchemeRoles)
+
+		// Verify schemes match
+		importedScheme, appErr := th2.App.GetSchemeByName(customScheme.Name)
+		require.Nil(t, appErr)
+		require.Equal(t, customScheme.Name, importedScheme.Name)
+		require.Equal(t, customScheme.DisplayName, importedScheme.DisplayName)
+		require.Equal(t, customScheme.Description, importedScheme.Description)
+		require.Equal(t, customScheme.Scope, importedScheme.Scope)
+
+		// Verify scheme roles match
+		importedChannelAdminRole, appErr := th2.App.GetRoleByName(th2.Context, importedScheme.DefaultChannelAdminRole)
+		require.Nil(t, appErr)
+		require.Equal(t, customChannelAdminRole.DisplayName, importedChannelAdminRole.DisplayName)
+		require.Equal(t, customChannelAdminRole.Description, importedChannelAdminRole.Description)
+		require.Equal(t, customChannelAdminRole.Permissions, importedChannelAdminRole.Permissions)
+		require.Equal(t, customChannelAdminRole.SchemeManaged, importedChannelAdminRole.SchemeManaged)
+		require.Equal(t, customChannelAdminRole.BuiltIn, importedChannelAdminRole.BuiltIn)
+
+		importedChannelUserRole, appErr := th2.App.GetRoleByName(th2.Context, importedScheme.DefaultChannelUserRole)
+		require.Nil(t, appErr)
+		require.Equal(t, customChannelUserRole.DisplayName, importedChannelUserRole.DisplayName)
+		require.Equal(t, customChannelUserRole.Description, importedChannelUserRole.Description)
+		require.Equal(t, customChannelUserRole.Permissions, importedChannelUserRole.Permissions)
+		require.Equal(t, customChannelUserRole.SchemeManaged, importedChannelUserRole.SchemeManaged)
+		require.Equal(t, customChannelUserRole.BuiltIn, importedChannelUserRole.BuiltIn)
+
+		importedChannelGuestRole, appErr := th2.App.GetRoleByName(th2.Context, importedScheme.DefaultChannelGuestRole)
+		require.Nil(t, appErr)
+		require.Equal(t, customChannelGuestRole.DisplayName, importedChannelGuestRole.DisplayName)
+		require.Equal(t, customChannelGuestRole.Description, importedChannelGuestRole.Description)
+		require.Equal(t, customChannelGuestRole.Permissions, importedChannelGuestRole.Permissions)
+		require.Equal(t, customChannelGuestRole.SchemeManaged, importedChannelGuestRole.SchemeManaged)
+		require.Equal(t, customChannelGuestRole.BuiltIn, importedChannelGuestRole.BuiltIn)
+
+		importedTeamAdminRole, appErr := th2.App.GetRoleByName(th2.Context, importedScheme.DefaultTeamAdminRole)
+		require.Nil(t, appErr)
+		require.Equal(t, customTeamAdminRole.DisplayName, importedTeamAdminRole.DisplayName)
+		require.Equal(t, customTeamAdminRole.Description, importedTeamAdminRole.Description)
+		require.Equal(t, customTeamAdminRole.Permissions, importedTeamAdminRole.Permissions)
+		require.Equal(t, customTeamAdminRole.SchemeManaged, importedTeamAdminRole.SchemeManaged)
+		require.Equal(t, customTeamAdminRole.BuiltIn, importedTeamAdminRole.BuiltIn)
+
+		importedTeamUserRole, appErr := th2.App.GetRoleByName(th2.Context, importedScheme.DefaultTeamUserRole)
+		require.Nil(t, appErr)
+		require.Equal(t, customTeamUserRole.DisplayName, importedTeamUserRole.DisplayName)
+		require.Equal(t, customTeamUserRole.Description, importedTeamUserRole.Description)
+		require.Equal(t, customTeamUserRole.Permissions, importedTeamUserRole.Permissions)
+		require.Equal(t, customTeamUserRole.SchemeManaged, importedTeamUserRole.SchemeManaged)
+		require.Equal(t, customTeamUserRole.BuiltIn, importedTeamUserRole.BuiltIn)
+
+		importedTeamGuestRole, appErr := th2.App.GetRoleByName(th2.Context, importedScheme.DefaultTeamGuestRole)
+		require.Nil(t, appErr)
+		require.Equal(t, customTeamGuestRole.DisplayName, importedTeamGuestRole.DisplayName)
+		require.Equal(t, customTeamGuestRole.Description, importedTeamGuestRole.Description)
+		require.Equal(t, customTeamGuestRole.Permissions, importedTeamGuestRole.Permissions)
+		require.Equal(t, customTeamGuestRole.SchemeManaged, importedTeamGuestRole.SchemeManaged)
+		require.Equal(t, customTeamGuestRole.BuiltIn, importedTeamGuestRole.BuiltIn)
+	})
+}
+
+// TestExportDeactivatedUserDMs specifically tests the MM-43598 bug
+// by validating that direct messages from deactivated users are exported correctly
+func TestExportDeactivatedUserDMs(t *testing.T) {
+	th1 := Setup(t).InitBasic(t)
+
+	// Create a DM Channel
+	user2 := th1.BasicUser2
+	dmChannel := th1.CreateDmChannel(t, user2)
+
+	// 1. First basic user (active) sends a message to user2 (who will later be deactivated)
+	initialMessage := "initial_message_from_basic_user"
+	initialPost := &model.Post{
+		ChannelId: dmChannel.Id,
+		Message:   initialMessage,
+		UserId:    th1.BasicUser.Id,
+	}
+	initialPostCreated, _, appErr := th1.App.CreatePost(th1.Context, initialPost, dmChannel, model.CreatePostFlags{SetOnline: true})
+	require.Nil(t, appErr)
+
+	// 2. Have user2 reply with TWO types of replies:
+
+	// 2a. User2 replies in a thread (to the initial message)
+	threadedReplyMessage := "threaded_reply_from_user2"
+	threadedReply := &model.Post{
+		ChannelId: dmChannel.Id,
+		Message:   threadedReplyMessage,
+		UserId:    user2.Id,
+		RootId:    initialPostCreated.Id, // This makes it a threaded reply
+	}
+	_, _, appErr = th1.App.CreatePost(th1.Context, threadedReply, dmChannel, model.CreatePostFlags{SetOnline: true})
+	require.Nil(t, appErr)
+
+	// 2b. User2 sends a standalone reply (NOT in a thread)
+	nonThreadedReplyMessage := "non_threaded_reply_from_user2"
+	nonThreadedReply := &model.Post{
+		ChannelId: dmChannel.Id,
+		Message:   nonThreadedReplyMessage,
+		UserId:    user2.Id,
+		// No RootId, making it a standalone message, not a thread reply
+	}
+	_, _, appErr = th1.App.CreatePost(th1.Context, nonThreadedReply, dmChannel, model.CreatePostFlags{SetOnline: true})
+	require.Nil(t, appErr)
+
+	// 3. Now deactivate user2
+	_, err := th1.App.UpdateActive(th1.Context, user2, false)
+	require.Nil(t, err)
+
+	// 4. Export data
+	var b bytes.Buffer
+	appErr = th1.App.BulkExport(th1.Context, &b, "somePath", nil, model.BulkExportOpts{})
+	require.Nil(t, appErr)
+
+	// 5. Make a copy of the buffer for export validation
+	var exportDataCopy bytes.Buffer
+	_, nErr := exportDataCopy.Write(b.Bytes())
+	require.NoError(t, nErr)
+
+	// 6. Validate export data directly to ensure both types of replies are present
+	scanner := bufio.NewScanner(&exportDataCopy)
+	foundThreadedReply := false
+	foundNonThreadedReply := false
+
+	for scanner.Scan() {
+		var line imports.LineImportData
+		err := json.Unmarshal(scanner.Bytes(), &line)
+		if err != nil {
+			continue
+		}
+
+		// Check for direct posts
+		if line.Type == "direct_post" && line.DirectPost != nil {
+			// Check for the non-threaded reply (the standalone message)
+			if line.DirectPost.Message != nil && *line.DirectPost.Message == nonThreadedReplyMessage {
+				foundNonThreadedReply = true
+				// Verify username is correctly preserved in export
+				require.Equal(t, user2.Username, *line.DirectPost.User,
+					"Deactivated user's username should be preserved in export for non-threaded reply")
+			}
+
+			// Check for the thread starter and its replies
+			if line.DirectPost.Message != nil && *line.DirectPost.Message == initialMessage {
+				// Check if the threaded reply is in the replies array
+				if line.DirectPost.Replies != nil {
+					for _, reply := range *line.DirectPost.Replies {
+						if reply.Message != nil && *reply.Message == threadedReplyMessage {
+							foundThreadedReply = true
+							require.Equal(t, user2.Username, *reply.User,
+								"Deactivated user's username should be preserved in export for threaded reply")
+						}
+					}
+				}
+			}
+		}
+	}
+
+	// This is key for testing MM-43598
+	require.True(t, foundNonThreadedReply,
+		"Non-threaded reply from deactivated user must be present in export data")
+	require.True(t, foundThreadedReply,
+		"Threaded reply from deactivated user must be present in export data")
+
+	// 7. Import data into a new instance
+	th2 := Setup(t)
+
+	i, appErr := th2.App.BulkImport(th2.Context, &b, nil, false, 5)
+	require.Nil(t, appErr)
+	require.Equal(t, 0, i)
+
+	// 8. Verify the DM channel was imported
+	channels, nErr := th2.App.Srv().Store().Channel().GetAllDirectChannelsForExportAfter(1000, "00000000", false)
+	require.NoError(t, nErr)
+	require.Equal(t, 1, len(channels), "Direct channel should be imported")
+
+	// 9. Verify all posts were imported
+	posts, nErr := th2.App.Srv().Store().Post().GetPosts(th2.Context,
+		model.GetPostsOptions{
+			ChannelId: channels[0].Id,
+			PerPage:   1000,
+		}, false, nil)
+	require.NoError(t, nErr)
+
+	// We should have exactly 3 posts
+	require.Equal(t, 3, len(posts.Posts), "Should have imported exactly 3 posts")
+
+	// 10. Specifically check that both types of replies are present
+	foundThreadedReplyInImport := false
+	foundNonThreadedReplyInImport := false
+
+	for _, post := range posts.Posts {
+		if post.Message == threadedReplyMessage {
+			foundThreadedReplyInImport = true
+			// Verify this is a reply in a thread
+			require.NotEmpty(t, post.RootId, "Threaded reply should have a RootId")
+		}
+		if post.Message == nonThreadedReplyMessage {
+			foundNonThreadedReplyInImport = true
+			// Verify this is NOT a reply in a thread
+			require.Empty(t, post.RootId, "Non-threaded reply should not have a RootId")
+		}
+	}
+
+	// This directly tests the issue in MM-43598
+	require.True(t, foundNonThreadedReplyInImport,
+		"Non-threaded reply from deactivated user should be imported")
+	require.True(t, foundThreadedReplyInImport,
+		"Threaded reply from deactivated user should be imported")
+}
+
+func TestGeneratePresignURLForExport(t *testing.T) {
+	mainHelper.Parallel(t)
+
+	t.Run("blocked when not running in Cloud", func(t *testing.T) {
+		th := Setup(t)
+		th.App.Srv().SetLicense(model.NewTestLicense())
+
+		resp, appErr := th.App.GeneratePresignURLForExport("export.zip")
+		assert.Nil(t, resp)
+		require.NotNil(t, appErr)
+		assert.Equal(t, "app.export.generate_presigned_url.direct_download.app_error", appErr.Id)
+	})
+
+	t.Run("blocked without a license", func(t *testing.T) {
+		th := Setup(t)
+		th.App.Srv().SetLicense(nil)
+
+		resp, appErr := th.App.GeneratePresignURLForExport("export.zip")
+		assert.Nil(t, resp)
+		require.NotNil(t, appErr)
+		assert.Equal(t, "app.export.generate_presigned_url.direct_download.app_error", appErr.Id)
+	})
+
+	t.Run("passes gate when Cloud, then requires a dedicated export store", func(t *testing.T) {
+		th := Setup(t)
+		// The Cloud gate is checked before the dedicated export store requirement,
+		// so a Cloud license advances past it and fails on the (disabled) dedicated
+		// export store instead.
+		th.App.Srv().SetLicense(model.NewTestLicense("cloud"))
+		th.App.UpdateConfig(func(cfg *model.Config) {
+			*cfg.FileSettings.DedicatedExportStore = false
+		})
+
+		resp, appErr := th.App.GeneratePresignURLForExport("export.zip")
+		assert.Nil(t, resp)
+		require.NotNil(t, appErr)
+		assert.Equal(t, "app.export.generate_presigned_url.config.app_error", appErr.Id)
+	})
+
+	// The full happy path against a real presign-capable (S3/minio) export store: a
+	// Cloud server with a dedicated export store returns a working presigned URL.
+	// Skipped when minio isn't reachable.
+	t.Run("succeeds against a presign-capable export store", func(t *testing.T) {
+		s3Host := os.Getenv("CI_MINIO_HOST")
+		if s3Host == "" {
+			s3Host = "localhost"
+		}
+		s3Port := os.Getenv("CI_MINIO_PORT")
+		if s3Port == "" {
+			s3Port = "9000"
+		}
+		s3Endpoint := net.JoinHostPort(s3Host, s3Port)
+
+		conn, err := net.DialTimeout("tcp", s3Endpoint, 2*time.Second)
+		if err != nil {
+			t.Skipf("minio not available at %s: %v", s3Endpoint, err)
+		}
+		conn.Close()
+
+		// Use a fresh bucket per run so MakeBucket is unambiguous.
+		bucket := model.NewId()
+
+		// The dedicated export filestore is built once at startup, so the export-store
+		// configuration must be applied before the server starts, not via UpdateConfig.
+		th := SetupConfig(t, func(cfg *model.Config) {
+			*cfg.FileSettings.DedicatedExportStore = true
+			*cfg.FileSettings.ExportDriverName = model.ImageDriverS3
+			*cfg.FileSettings.ExportAmazonS3AccessKeyId = model.MinioAccessKey
+			*cfg.FileSettings.ExportAmazonS3SecretAccessKey = model.MinioSecretKey
+			*cfg.FileSettings.ExportAmazonS3Bucket = bucket
+			*cfg.FileSettings.ExportAmazonS3Endpoint = s3Endpoint
+			*cfg.FileSettings.ExportAmazonS3Region = ""
+			*cfg.FileSettings.ExportAmazonS3SSL = false
+		})
+		th.App.Srv().SetLicense(model.NewTestLicense("cloud"))
+
+		backend, ok := th.App.ExportFileBackend().(*filestore.S3FileBackend)
+		require.True(t, ok, "expected a dedicated S3 export backend")
+		require.NoError(t, backend.MakeBucket())
+
+		exportName := "job_export.zip"
+		payload := []byte("export-payload")
+		_, appErr := th.App.WriteExportFile(bytes.NewReader(payload), filepath.Join(*th.App.Config().ExportSettings.Directory, exportName))
+		require.Nil(t, appErr)
+
+		resp, appErr := th.App.GeneratePresignURLForExport(exportName)
+		require.Nil(t, appErr)
+		require.NotNil(t, resp)
+		require.NotEmpty(t, resp.URL)
+
+		// The presigned URL should serve the exported file directly.
+		httpResp, err := (&http.Client{Timeout: 30 * time.Second}).Get(resp.URL)
+		require.NoError(t, err)
+		defer httpResp.Body.Close()
+		assert.Equal(t, http.StatusOK, httpResp.StatusCode)
+		body, err := io.ReadAll(httpResp.Body)
+		require.NoError(t, err)
+		assert.Equal(t, payload, body)
+	})
+}
+
+// parseExportLines reads a BulkExport output and returns all JSON lines grouped by type.
+func parseExportLines(t *testing.T, b *bytes.Buffer) map[string][]map[string]any {
+	t.Helper()
+	result := make(map[string][]map[string]any)
+	scanner := bufio.NewScanner(b)
+	for scanner.Scan() {
+		line := scanner.Text()
+		if line == "" {
+			continue
+		}
+		var obj map[string]any
+		require.NoError(t, json.Unmarshal([]byte(line), &obj))
+		lineType, _ := obj["type"].(string)
+		result[lineType] = append(result[lineType], obj)
+	}
+	require.NoError(t, scanner.Err())
+	return result
+}
+
+func TestSplitTrimNames(t *testing.T) {
+	assert.Nil(t, splitTrimNames(""))
+	assert.Equal(t, []string{"team-a"}, splitTrimNames("team-a"))
+	assert.Equal(t, []string{"team-a", "team-b"}, splitTrimNames("team-a,team-b"))
+	assert.Equal(t, []string{"team-a", "team-b"}, splitTrimNames("team-a, team-b"))
+	assert.Equal(t, []string{"team-a", "team-b"}, splitTrimNames(" team-a , team-b "))
+	assert.Equal(t, []string{"team-a", "team-b"}, splitTrimNames("team-a,,team-b"))
+}
+
+func TestBulkExportChannelRequiresTeam(t *testing.T) {
+	mainHelper.Parallel(t)
+	th := Setup(t)
+
+	var buf strings.Builder
+	appErr := th.App.BulkExport(th.Context, &buf, t.TempDir(), nil, model.BulkExportOpts{
+		ChannelName: "some-channel",
+		TeamName:    "",
+	})
+	require.NotNil(t, appErr)
+	require.Equal(t, http.StatusBadRequest, appErr.StatusCode)
+}
+
+func TestBulkExportSingleChannel(t *testing.T) {
+	mainHelper.Parallel(t)
+
+	t.Run("exports only posts from the target channel", func(t *testing.T) {
+		th := Setup(t).InitBasic(t)
+
+		// Create a second channel with its own post.
+		otherChannel := th.CreateChannel(t, th.BasicTeam)
+		otherPost := &model.Post{ChannelId: otherChannel.Id, Message: "other-channel-post", UserId: th.BasicUser.Id}
+		_, _, appErr := th.App.CreatePost(th.Context, otherPost, otherChannel, model.CreatePostFlags{SetOnline: true})
+		require.Nil(t, appErr)
+
+		targetPost := &model.Post{ChannelId: th.BasicChannel.Id, Message: "target-channel-post", UserId: th.BasicUser.Id}
+		_, _, appErr = th.App.CreatePost(th.Context, targetPost, th.BasicChannel, model.CreatePostFlags{SetOnline: true})
+		require.Nil(t, appErr)
+
+		var b bytes.Buffer
+		appErr = th.App.BulkExport(th.Context, &b, "somePath", nil, model.BulkExportOpts{
+			TeamName:    th.BasicTeam.Name,
+			ChannelName: th.BasicChannel.Name,
+		})
+		require.Nil(t, appErr)
+
+		lines := parseExportLines(t, &b)
+
+		for _, pl := range lines["post"] {
+			post := pl["post"].(map[string]any)
+			assert.Equal(t, th.BasicChannel.Name, post["channel"], "post from wrong channel included in export")
+		}
+		require.NotEmpty(t, lines["post"], "expected at least one post in export")
+	})
+
+	t.Run("exports only members of the target channel as users", func(t *testing.T) {
+		th := Setup(t).InitBasic(t)
+
+		// Create a user in the team but not in BasicChannel.
+		outsideUser := th.CreateUser(t)
+		th.LinkUserToTeam(t, outsideUser, th.BasicTeam)
+
+		var b bytes.Buffer
+		appErr := th.App.BulkExport(th.Context, &b, "somePath", nil, model.BulkExportOpts{
+			TeamName:    th.BasicTeam.Name,
+			ChannelName: th.BasicChannel.Name,
+		})
+		require.Nil(t, appErr)
+
+		lines := parseExportLines(t, &b)
+
+		exportedUsers := make(map[string]bool)
+		for _, ul := range lines["user"] {
+			user := ul["user"].(map[string]any)
+			exportedUsers[user["username"].(string)] = true
+		}
+
+		assert.False(t, exportedUsers[outsideUser.Username], "user not in channel should not be exported")
+		assert.True(t, exportedUsers[th.BasicUser.Username], "channel member should be exported")
+	})
+
+	t.Run("version line contains channel scope metadata", func(t *testing.T) {
+		th := Setup(t).InitBasic(t)
+
+		var b bytes.Buffer
+		appErr := th.App.BulkExport(th.Context, &b, "somePath", nil, model.BulkExportOpts{
+			TeamName:    th.BasicTeam.Name,
+			ChannelName: th.BasicChannel.Name,
+		})
+		require.Nil(t, appErr)
+
+		lines := parseExportLines(t, &b)
+
+		require.Len(t, lines["version"], 1)
+		info, ok := lines["version"][0]["info"].(map[string]any)
+		require.True(t, ok, "version line missing info field")
+
+		additionalRaw, ok := info["additional"]
+		require.True(t, ok, "version info missing additional field")
+
+		additionalBytes, err := json.Marshal(additionalRaw)
+		require.NoError(t, err)
+
+		var scope imports.ExportScopeAdditional
+		require.NoError(t, json.Unmarshal(additionalBytes, &scope))
+		assert.Equal(t, th.BasicTeam.Name, scope.TeamName)
+		assert.Equal(t, th.BasicChannel.Name, scope.ChannelName)
+	})
+
+	t.Run("DMs are excluded from channel-scoped export", func(t *testing.T) {
+		th := Setup(t).InitBasic(t)
+
+		// Create a DM between BasicUser and BasicUser2.
+		dm, appErr := th.App.GetOrCreateDirectChannel(th.Context, th.BasicUser.Id, th.BasicUser2.Id)
+		require.Nil(t, appErr)
+		dmPost := &model.Post{ChannelId: dm.Id, Message: "dm-post", UserId: th.BasicUser.Id}
+		_, _, appErr = th.App.CreatePost(th.Context, dmPost, dm, model.CreatePostFlags{SetOnline: true})
+		require.Nil(t, appErr)
+
+		var b bytes.Buffer
+		appErr = th.App.BulkExport(th.Context, &b, "somePath", nil, model.BulkExportOpts{
+			TeamName:    th.BasicTeam.Name,
+			ChannelName: th.BasicChannel.Name,
+		})
+		require.Nil(t, appErr)
+
+		lines := parseExportLines(t, &b)
+		assert.Empty(t, lines["direct_channel"], "DMs should not appear in channel-scoped export")
+		assert.Empty(t, lines["direct_post"], "DM posts should not appear in channel-scoped export")
+	})
+
+	t.Run("includes post authors who left the channel", func(t *testing.T) {
+		th := Setup(t).InitBasic(t)
+
+		// Create a user, add to channel, have them post, then remove from channel.
+		leavingUser := th.CreateUser(t)
+		th.LinkUserToTeam(t, leavingUser, th.BasicTeam)
+		_, appErr := th.App.AddUserToChannel(th.Context, leavingUser, th.BasicChannel, false)
+		require.Nil(t, appErr)
+
+		post := &model.Post{ChannelId: th.BasicChannel.Id, Message: "leaving-user-post", UserId: leavingUser.Id}
+		_, _, appErr = th.App.CreatePost(th.Context, post, th.BasicChannel, model.CreatePostFlags{SetOnline: true})
+		require.Nil(t, appErr)
+
+		appErr = th.App.LeaveChannel(th.Context, th.BasicChannel.Id, leavingUser.Id)
+		require.Nil(t, appErr)
+
+		var b bytes.Buffer
+		appErr = th.App.BulkExport(th.Context, &b, "somePath", nil, model.BulkExportOpts{
+			TeamName:    th.BasicTeam.Name,
+			ChannelName: th.BasicChannel.Name,
+		})
+		require.Nil(t, appErr)
+
+		lines := parseExportLines(t, &b)
+
+		exportedUsers := make(map[string]bool)
+		for _, ul := range lines["user"] {
+			user := ul["user"].(map[string]any)
+			exportedUsers[user["username"].(string)] = true
+		}
+		assert.True(t, exportedUsers[leavingUser.Username], "post author who left channel should still be exported")
+	})
+
+	t.Run("exported user has only target channel in their memberships", func(t *testing.T) {
+		th := Setup(t).InitBasic(t)
+
+		// Add BasicUser to a second channel in the same team.
+		otherChannel := th.CreateChannel(t, th.BasicTeam)
+		_, appErr := th.App.AddUserToChannel(th.Context, th.BasicUser, otherChannel, false)
+		require.Nil(t, appErr)
+
+		var b bytes.Buffer
+		appErr = th.App.BulkExport(th.Context, &b, "somePath", nil, model.BulkExportOpts{
+			TeamName:    th.BasicTeam.Name,
+			ChannelName: th.BasicChannel.Name,
+		})
+		require.Nil(t, appErr)
+
+		lines := parseExportLines(t, &b)
+
+		for _, ul := range lines["user"] {
+			user := ul["user"].(map[string]any)
+			if user["username"].(string) != th.BasicUser.Username {
+				continue
+			}
+			teams, ok := user["teams"].([]any)
+			require.True(t, ok, "user should have teams")
+			for _, ti := range teams {
+				team := ti.(map[string]any)
+				channels, ok := team["channels"].([]any)
+				if !ok {
+					continue
+				}
+				for _, ci := range channels {
+					ch := ci.(map[string]any)
+					assert.Equal(t, th.BasicChannel.Name, ch["name"], "user should only have target channel in memberships")
+				}
+			}
+		}
+	})
+
+	t.Run("empty channel export contains no posts", func(t *testing.T) {
+		th := Setup(t).InitBasic(t)
+
+		emptyChannel := th.CreateChannel(t, th.BasicTeam)
+
+		var b bytes.Buffer
+		appErr := th.App.BulkExport(th.Context, &b, "somePath", nil, model.BulkExportOpts{
+			TeamName:    th.BasicTeam.Name,
+			ChannelName: emptyChannel.Name,
+		})
+		require.Nil(t, appErr)
+
+		lines := parseExportLines(t, &b)
+		assert.Empty(t, lines["post"], "empty channel should produce no posts in export")
+	})
+
+	t.Run("invalid channel name returns error", func(t *testing.T) {
+		th := Setup(t).InitBasic(t)
+
+		var b bytes.Buffer
+		appErr := th.App.BulkExport(th.Context, &b, "somePath", nil, model.BulkExportOpts{
+			TeamName:    th.BasicTeam.Name,
+			ChannelName: "nonexistent-channel-xyz",
+		})
+		require.NotNil(t, appErr, "exporting a nonexistent channel should return an error")
+	})
+
+	t.Run("includes user who only reacted in the channel and never posted or joined", func(t *testing.T) {
+		th := Setup(t).InitBasic(t)
+
+		// reactionUser is in the team but never joined the channel and never posted.
+		reactionUser := th.CreateUser(t)
+		th.LinkUserToTeam(t, reactionUser, th.BasicTeam)
+
+		// Create a post in the target channel by the regular member.
+		post := &model.Post{ChannelId: th.BasicChannel.Id, Message: "post-to-react-to", UserId: th.BasicUser.Id}
+		post, _, appErr := th.App.CreatePost(th.Context, post, th.BasicChannel, model.CreatePostFlags{SetOnline: true})
+		require.Nil(t, appErr)
+
+		// reactionUser reacts to the post — their only connection to the channel.
+		_, err := th.App.SaveReactionForPost(th.Context, &model.Reaction{
+			UserId:    reactionUser.Id,
+			PostId:    post.Id,
+			EmojiName: "thumbsup",
+		})
+		require.Nil(t, err)
+
+		var b bytes.Buffer
+		appErr = th.App.BulkExport(th.Context, &b, "somePath", nil, model.BulkExportOpts{
+			TeamName:    th.BasicTeam.Name,
+			ChannelName: th.BasicChannel.Name,
+		})
+		require.Nil(t, appErr)
+
+		lines := parseExportLines(t, &b)
+
+		exportedUsers := make(map[string]bool)
+		for _, ul := range lines["user"] {
+			user := ul["user"].(map[string]any)
+			exportedUsers[user["username"].(string)] = true
+		}
+		assert.True(t, exportedUsers[reactionUser.Username],
+			"user who only reacted in the channel should be included in the export")
+	})
+
+	t.Run("includes user who only follows a thread in the channel and never posted or joined", func(t *testing.T) {
+		th := Setup(t).InitBasic(t)
+
+		// followerUser is in the team but never joined the channel and never posted.
+		followerUser := th.CreateUser(t)
+		th.LinkUserToTeam(t, followerUser, th.BasicTeam)
+
+		// Create a root post and a reply to make it a thread.
+		rootPost := &model.Post{ChannelId: th.BasicChannel.Id, Message: "thread-root", UserId: th.BasicUser.Id}
+		rootPost, _, appErr := th.App.CreatePost(th.Context, rootPost, th.BasicChannel, model.CreatePostFlags{SetOnline: true})
+		require.Nil(t, appErr)
+		reply := &model.Post{ChannelId: th.BasicChannel.Id, Message: "thread-reply", UserId: th.BasicUser.Id, RootId: rootPost.Id}
+		_, _, appErr = th.App.CreatePost(th.Context, reply, th.BasicChannel, model.CreatePostFlags{SetOnline: true})
+		require.Nil(t, appErr)
+
+		// followerUser follows the thread — their only connection to the channel.
+		appErr = th.App.UpdateThreadFollowForUser(followerUser.Id, th.BasicTeam.Id, rootPost.Id, true)
+		require.Nil(t, appErr)
+
+		var b bytes.Buffer
+		appErr = th.App.BulkExport(th.Context, &b, "somePath", nil, model.BulkExportOpts{
+			TeamName:    th.BasicTeam.Name,
+			ChannelName: th.BasicChannel.Name,
+		})
+		require.Nil(t, appErr)
+
+		lines := parseExportLines(t, &b)
+
+		exportedUsers := make(map[string]bool)
+		for _, ul := range lines["user"] {
+			user := ul["user"].(map[string]any)
+			exportedUsers[user["username"].(string)] = true
+		}
+		assert.True(t, exportedUsers[followerUser.Username],
+			"user who only follows a thread in the channel should be included in the export")
+	})
+}
+
+func TestBulkExportSingleTeam(t *testing.T) {
+	mainHelper.Parallel(t)
+
+	t.Run("exports only the specified team", func(t *testing.T) {
+		th := Setup(t).InitBasic(t)
+
+		// Create a second team with its own user, channel, and post.
+		otherTeam := th.CreateTeam(t)
+		otherUser := th.CreateUser(t)
+		th.LinkUserToTeam(t, otherUser, otherTeam)
+		otherChannel := th.CreateChannel(t, otherTeam)
+		otherPost := &model.Post{ChannelId: otherChannel.Id, Message: "other-team-post", UserId: otherUser.Id}
+		_, _, appErr := th.App.CreatePost(th.Context, otherPost, otherChannel, model.CreatePostFlags{SetOnline: true})
+		require.Nil(t, appErr)
+
+		// Export only the basic team.
+		var b bytes.Buffer
+		appErr = th.App.BulkExport(th.Context, &b, "somePath", nil, model.BulkExportOpts{
+			TeamName: th.BasicTeam.Name,
+		})
+		require.Nil(t, appErr)
+
+		lines := parseExportLines(t, &b)
+
+		// Exactly one team should appear and it must be the target.
+		require.Len(t, lines["team"], 1)
+		teamData := lines["team"][0]["team"].(map[string]any)
+		assert.Equal(t, th.BasicTeam.Name, teamData["name"])
+
+		// No channels from the other team should appear.
+		for _, cl := range lines["channel"] {
+			ch := cl["channel"].(map[string]any)
+			assert.Equal(t, th.BasicTeam.Name, ch["team"], "channel belongs to wrong team")
+		}
+
+		// No posts from the other team should appear.
+		for _, pl := range lines["post"] {
+			post := pl["post"].(map[string]any)
+			assert.Equal(t, th.BasicTeam.Name, post["team"], "post belongs to wrong team")
+		}
+	})
+
+	t.Run("excludes users not in the target team", func(t *testing.T) {
+		th := Setup(t).InitBasic(t)
+
+		// Create a user that belongs only to a second team, not the basic team.
+		otherTeam := th.CreateTeam(t)
+		outsideUser := th.CreateUser(t)
+		th.LinkUserToTeam(t, outsideUser, otherTeam)
+
+		var b bytes.Buffer
+		appErr := th.App.BulkExport(th.Context, &b, "somePath", nil, model.BulkExportOpts{
+			TeamName: th.BasicTeam.Name,
+		})
+		require.Nil(t, appErr)
+
+		lines := parseExportLines(t, &b)
+
+		exportedUsernames := make(map[string]bool)
+		for _, ul := range lines["user"] {
+			u := ul["user"].(map[string]any)
+			exportedUsernames[u["username"].(string)] = true
+		}
+
+		assert.False(t, exportedUsernames[outsideUser.Username],
+			"user from another team should not appear in export")
+		assert.True(t, exportedUsernames[th.BasicUser.Username],
+			"basic user should appear in export")
+	})
+
+	t.Run("user in multiple teams is exported with only target team membership", func(t *testing.T) {
+		th := Setup(t).InitBasic(t)
+
+		// Link the basic user to a second team as well.
+		otherTeam := th.CreateTeam(t)
+		th.LinkUserToTeam(t, th.BasicUser, otherTeam)
+
+		var b bytes.Buffer
+		appErr := th.App.BulkExport(th.Context, &b, "somePath", nil, model.BulkExportOpts{
+			TeamName: th.BasicTeam.Name,
+		})
+		require.Nil(t, appErr)
+
+		lines := parseExportLines(t, &b)
+
+		var basicUserLine map[string]any
+		for _, ul := range lines["user"] {
+			u := ul["user"].(map[string]any)
+			if u["username"].(string) == th.BasicUser.Username {
+				basicUserLine = u
+				break
+			}
+		}
+		require.NotNil(t, basicUserLine, "basic user should be present in export")
+
+		teams, ok := basicUserLine["teams"].([]any)
+		require.True(t, ok, "user should have teams field")
+		require.Len(t, teams, 1, "user should only have one team membership in export")
+
+		membership := teams[0].(map[string]any)
+		assert.Equal(t, th.BasicTeam.Name, membership["name"],
+			"exported membership should be for the target team only")
+	})
+
+	t.Run("direct messages are excluded", func(t *testing.T) {
+		th := Setup(t).InitBasic(t)
+		th.CreateDmChannel(t, th.BasicUser2)
+
+		var b bytes.Buffer
+		appErr := th.App.BulkExport(th.Context, &b, "somePath", nil, model.BulkExportOpts{
+			TeamName: th.BasicTeam.Name,
+		})
+		require.Nil(t, appErr)
+
+		lines := parseExportLines(t, &b)
+		assert.Empty(t, lines["direct_channel"], "direct channels should be excluded in single-team export")
+		assert.Empty(t, lines["direct_post"], "direct posts should be excluded in single-team export")
+	})
+
+	t.Run("bots are excluded", func(t *testing.T) {
+		th := Setup(t).InitBasic(t)
+		_, appErr := th.App.CreateBot(th.Context, &model.Bot{
+			Username:    "testbot_" + model.NewId()[:8],
+			DisplayName: "Test Bot",
+			OwnerId:     th.BasicUser.Id,
+		})
+		require.Nil(t, appErr)
+
+		var b bytes.Buffer
+		appErr = th.App.BulkExport(th.Context, &b, "somePath", nil, model.BulkExportOpts{
+			TeamName: th.BasicTeam.Name,
+		})
+		require.Nil(t, appErr)
+
+		lines := parseExportLines(t, &b)
+		assert.Empty(t, lines["bot"], "bots should be excluded in single-team export")
+	})
+
+	t.Run("bot that posted in team is included", func(t *testing.T) {
+		th := Setup(t).InitBasic(t)
+		bot, appErr := th.App.CreateBot(th.Context, &model.Bot{
+			Username:    "postingbot_" + model.NewId()[:8],
+			DisplayName: "Posting Bot",
+			OwnerId:     th.BasicUser.Id,
+		})
+		require.Nil(t, appErr)
+
+		botUser, appErr := th.App.GetUser(th.Context, bot.UserId)
+		require.Nil(t, appErr)
+		th.LinkUserToTeam(t, botUser, th.BasicTeam)
+		th.AddUserToChannel(t, botUser, th.BasicChannel)
+
+		_, _, appErr = th.App.CreatePost(th.Context, &model.Post{
+			UserId:    bot.UserId,
+			ChannelId: th.BasicChannel.Id,
+			Message:   "bot post",
+		}, th.BasicChannel, model.CreatePostFlags{SetOnline: false})
+		require.Nil(t, appErr)
+
+		var b bytes.Buffer
+		appErr = th.App.BulkExport(th.Context, &b, "somePath", nil, model.BulkExportOpts{
+			TeamName: th.BasicTeam.Name,
+		})
+		require.Nil(t, appErr)
+
+		lines := parseExportLines(t, &b)
+		var botUsernames []string
+		for _, bl := range lines["bot"] {
+			if bm, ok := bl["bot"].(map[string]any); ok {
+				botUsernames = append(botUsernames, bm["username"].(string))
+			}
+		}
+		assert.Contains(t, botUsernames, bot.Username, "bot that posted in team should be included in export")
+	})
+
+	t.Run("returns error for nonexistent team", func(t *testing.T) {
+		th := Setup(t)
+
+		var b bytes.Buffer
+		appErr := th.App.BulkExport(th.Context, &b, "somePath", nil, model.BulkExportOpts{
+			TeamName: "this-team-does-not-exist",
+		})
+		require.NotNil(t, appErr, "should return an error for a nonexistent team")
+	})
+
+	t.Run("full export still includes all teams", func(t *testing.T) {
+		th := Setup(t).InitBasic(t)
+		otherTeam := th.CreateTeam(t)
+
+		var b bytes.Buffer
+		appErr := th.App.BulkExport(th.Context, &b, "somePath", nil, model.BulkExportOpts{})
+		require.Nil(t, appErr)
+
+		lines := parseExportLines(t, &b)
+
+		exportedTeams := make(map[string]bool)
+		for _, tl := range lines["team"] {
+			team := tl["team"].(map[string]any)
+			exportedTeams[team["name"].(string)] = true
+		}
+
+		assert.True(t, exportedTeams[th.BasicTeam.Name], "basic team should appear in full export")
+		assert.True(t, exportedTeams[otherTeam.Name], "other team should appear in full export")
+	})
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// Multi-team export tests
+// ────────────────────────────────────────────────────────────────────────────
+
+func TestBulkExportMultipleTeams(t *testing.T) {
+	mainHelper.Parallel(t)
+
+	t.Run("exports posts from all specified teams", func(t *testing.T) {
+		th := Setup(t).InitBasic(t)
+
+		teamB := th.CreateTeam(t)
+		userB := th.CreateUser(t)
+		th.LinkUserToTeam(t, userB, teamB)
+		chB := th.CreateChannel(t, teamB)
+		_, _, appErr := th.App.CreatePost(th.Context, &model.Post{
+			ChannelId: chB.Id, Message: "team-b-post", UserId: userB.Id,
+		}, chB, model.CreatePostFlags{SetOnline: true})
+		require.Nil(t, appErr)
+
+		teamC := th.CreateTeam(t)
+		userC := th.CreateUser(t)
+		th.LinkUserToTeam(t, userC, teamC)
+		chC := th.CreateChannel(t, teamC)
+		_, _, appErr = th.App.CreatePost(th.Context, &model.Post{
+			ChannelId: chC.Id, Message: "team-c-post", UserId: userC.Id,
+		}, chC, model.CreatePostFlags{SetOnline: true})
+		require.Nil(t, appErr)
+
+		// Export team-b and team-c; NOT the basic team.
+		var b bytes.Buffer
+		appErr = th.App.BulkExport(th.Context, &b, "somePath", nil, model.BulkExportOpts{
+			TeamName: teamB.Name + "," + teamC.Name,
+		})
+		require.Nil(t, appErr)
+
+		lines := parseExportLines(t, &b)
+
+		exportedTeams := make(map[string]bool)
+		for _, tl := range lines["team"] {
+			exportedTeams[tl["team"].(map[string]any)["name"].(string)] = true
+		}
+		assert.True(t, exportedTeams[teamB.Name], "team-b should be in export")
+		assert.True(t, exportedTeams[teamC.Name], "team-c should be in export")
+		assert.False(t, exportedTeams[th.BasicTeam.Name], "basic team should NOT be in export")
+
+		postTeams := make(map[string]bool)
+		for _, pl := range lines["post"] {
+			postTeams[pl["post"].(map[string]any)["team"].(string)] = true
+		}
+		assert.True(t, postTeams[teamB.Name], "posts from team-b should be present")
+		assert.True(t, postTeams[teamC.Name], "posts from team-c should be present")
+		assert.False(t, postTeams[th.BasicTeam.Name], "posts from basic team must not leak into export")
+	})
+
+	t.Run("exports users from all specified teams and excludes outsiders", func(t *testing.T) {
+		th := Setup(t).InitBasic(t)
+
+		teamB := th.CreateTeam(t)
+		userB := th.CreateUser(t)
+		th.LinkUserToTeam(t, userB, teamB)
+
+		teamC := th.CreateTeam(t)
+		userC := th.CreateUser(t)
+		th.LinkUserToTeam(t, userC, teamC)
+
+		outsider := th.CreateUser(t) // not in teamB or teamC
+
+		var b bytes.Buffer
+		appErr := th.App.BulkExport(th.Context, &b, "somePath", nil, model.BulkExportOpts{
+			TeamName: teamB.Name + "," + teamC.Name,
+		})
+		require.Nil(t, appErr)
+
+		lines := parseExportLines(t, &b)
+
+		exported := make(map[string]bool)
+		for _, ul := range lines["user"] {
+			exported[ul["user"].(map[string]any)["username"].(string)] = true
+		}
+		assert.True(t, exported[userB.Username], "user from team-b should be exported")
+		assert.True(t, exported[userC.Username], "user from team-c should be exported")
+		assert.False(t, exported[outsider.Username], "user in neither team should not be exported")
+		assert.False(t, exported[th.BasicUser.Username], "user only in basic team should not be exported")
+	})
+
+	t.Run("user in multiple target teams has both memberships in export", func(t *testing.T) {
+		th := Setup(t)
+
+		teamA := th.CreateTeam(t)
+		teamB := th.CreateTeam(t)
+		sharedUser := th.CreateUser(t)
+		th.LinkUserToTeam(t, sharedUser, teamA)
+		th.LinkUserToTeam(t, sharedUser, teamB)
+
+		var b bytes.Buffer
+		appErr := th.App.BulkExport(th.Context, &b, "somePath", nil, model.BulkExportOpts{
+			TeamName: teamA.Name + "," + teamB.Name,
+		})
+		require.Nil(t, appErr)
+
+		lines := parseExportLines(t, &b)
+
+		var userLine map[string]any
+		for _, ul := range lines["user"] {
+			u := ul["user"].(map[string]any)
+			if u["username"].(string) == sharedUser.Username {
+				userLine = u
+				break
+			}
+		}
+		require.NotNil(t, userLine, "shared user should be in export")
+
+		teams, ok := userLine["teams"].([]any)
+		require.True(t, ok, "user should have teams field")
+		exportedTeamNames := make(map[string]bool)
+		for _, ti := range teams {
+			exportedTeamNames[ti.(map[string]any)["name"].(string)] = true
+		}
+		assert.True(t, exportedTeamNames[teamA.Name], "user should have team-a membership in export")
+		assert.True(t, exportedTeamNames[teamB.Name], "user should have team-b membership in export")
+	})
+
+	t.Run("version line contains comma-separated team names", func(t *testing.T) {
+		th := Setup(t)
+
+		teamA := th.CreateTeam(t)
+		teamB := th.CreateTeam(t)
+
+		var b bytes.Buffer
+		appErr := th.App.BulkExport(th.Context, &b, "somePath", nil, model.BulkExportOpts{
+			TeamName: teamA.Name + "," + teamB.Name,
+		})
+		require.Nil(t, appErr)
+
+		lines := parseExportLines(t, &b)
+
+		require.Len(t, lines["version"], 1)
+		info := lines["version"][0]["info"].(map[string]any)
+		additionalBytes, err := json.Marshal(info["additional"])
+		require.NoError(t, err)
+		var scope imports.ExportScopeAdditional
+		require.NoError(t, json.Unmarshal(additionalBytes, &scope))
+
+		assert.Contains(t, scope.TeamName, teamA.Name, "team-a should be in scope additional")
+		assert.Contains(t, scope.TeamName, teamB.Name, "team-b should be in scope additional")
+	})
+
+	t.Run("DMs are excluded from multi-team export", func(t *testing.T) {
+		th := Setup(t).InitBasic(t)
+
+		teamB := th.CreateTeam(t)
+		userB := th.CreateUser(t)
+		th.LinkUserToTeam(t, userB, teamB)
+
+		dm, appErr := th.App.GetOrCreateDirectChannel(th.Context, th.BasicUser.Id, userB.Id)
+		require.Nil(t, appErr)
+		_, _, appErr = th.App.CreatePost(th.Context, &model.Post{
+			ChannelId: dm.Id, Message: "dm-post", UserId: th.BasicUser.Id,
+		}, dm, model.CreatePostFlags{SetOnline: true})
+		require.Nil(t, appErr)
+
+		var b bytes.Buffer
+		appErr = th.App.BulkExport(th.Context, &b, "somePath", nil, model.BulkExportOpts{
+			TeamName: th.BasicTeam.Name + "," + teamB.Name,
+		})
+		require.Nil(t, appErr)
+
+		lines := parseExportLines(t, &b)
+		assert.Empty(t, lines["direct_channel"], "DMs should not appear in multi-team export")
+		assert.Empty(t, lines["direct_post"], "DM posts should not appear in multi-team export")
+	})
+
+	t.Run("returns error for any nonexistent team in the list", func(t *testing.T) {
+		th := Setup(t).InitBasic(t)
+
+		var b bytes.Buffer
+		appErr := th.App.BulkExport(th.Context, &b, "somePath", nil, model.BulkExportOpts{
+			TeamName: th.BasicTeam.Name + ",this-team-does-not-exist",
+		})
+		require.NotNil(t, appErr, "should error when any team in the list does not exist")
+	})
+
+	t.Run("whitespace around commas is trimmed", func(t *testing.T) {
+		th := Setup(t)
+
+		teamA := th.CreateTeam(t)
+		teamB := th.CreateTeam(t)
+
+		var b bytes.Buffer
+		appErr := th.App.BulkExport(th.Context, &b, "somePath", nil, model.BulkExportOpts{
+			TeamName: "  " + teamA.Name + " ,  " + teamB.Name + "  ",
+		})
+		require.Nil(t, appErr)
+
+		lines := parseExportLines(t, &b)
+		exportedTeams := make(map[string]bool)
+		for _, tl := range lines["team"] {
+			exportedTeams[tl["team"].(map[string]any)["name"].(string)] = true
+		}
+		assert.True(t, exportedTeams[teamA.Name], "team-a should be exported despite extra whitespace")
+		assert.True(t, exportedTeams[teamB.Name], "team-b should be exported despite extra whitespace")
+	})
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// Multi-channel export tests
+// ────────────────────────────────────────────────────────────────────────────
+
+func TestBulkExportMultipleChannels(t *testing.T) {
+	mainHelper.Parallel(t)
+
+	t.Run("exports posts from all specified channels only", func(t *testing.T) {
+		th := Setup(t).InitBasic(t)
+
+		chA := th.CreateChannel(t, th.BasicTeam)
+		chB := th.CreateChannel(t, th.BasicTeam)
+		chOther := th.CreateChannel(t, th.BasicTeam)
+
+		for _, args := range []struct {
+			ch  *model.Channel
+			msg string
+		}{
+			{chA, "post-in-a"},
+			{chB, "post-in-b"},
+			{chOther, "post-in-other"},
+		} {
+			_, _, appErr := th.App.CreatePost(th.Context, &model.Post{
+				ChannelId: args.ch.Id, Message: args.msg, UserId: th.BasicUser.Id,
+			}, args.ch, model.CreatePostFlags{SetOnline: true})
+			require.Nil(t, appErr)
+		}
+
+		var b bytes.Buffer
+		appErr := th.App.BulkExport(th.Context, &b, "somePath", nil, model.BulkExportOpts{
+			TeamName:    th.BasicTeam.Name,
+			ChannelName: chA.Name + "," + chB.Name,
+		})
+		require.Nil(t, appErr)
+
+		lines := parseExportLines(t, &b)
+		for _, pl := range lines["post"] {
+			ch := pl["post"].(map[string]any)["channel"].(string)
+			assert.NotEqual(t, chOther.Name, ch, "post from non-target channel must not appear")
+			assert.True(t, ch == chA.Name || ch == chB.Name, "post channel should be one of the target channels")
+		}
+		require.NotEmpty(t, lines["post"], "expected posts in export")
+	})
+
+	t.Run("exports only users who are members or post-authors of target channels", func(t *testing.T) {
+		th := Setup(t).InitBasic(t)
+
+		chA := th.CreateChannel(t, th.BasicTeam)
+		chB := th.CreateChannel(t, th.BasicTeam)
+
+		userA := th.CreateUser(t)
+		th.LinkUserToTeam(t, userA, th.BasicTeam)
+		_, appErr := th.App.AddUserToChannel(th.Context, userA, chA, false)
+		require.Nil(t, appErr)
+
+		userB := th.CreateUser(t)
+		th.LinkUserToTeam(t, userB, th.BasicTeam)
+		_, appErr = th.App.AddUserToChannel(th.Context, userB, chB, false)
+		require.Nil(t, appErr)
+
+		outsider := th.CreateUser(t)
+		th.LinkUserToTeam(t, outsider, th.BasicTeam)
+		// outsider is in the team but in neither chA nor chB
+
+		var b bytes.Buffer
+		appErr = th.App.BulkExport(th.Context, &b, "somePath", nil, model.BulkExportOpts{
+			TeamName:    th.BasicTeam.Name,
+			ChannelName: chA.Name + "," + chB.Name,
+		})
+		require.Nil(t, appErr)
+
+		lines := parseExportLines(t, &b)
+		exported := make(map[string]bool)
+		for _, ul := range lines["user"] {
+			exported[ul["user"].(map[string]any)["username"].(string)] = true
+		}
+		assert.True(t, exported[userA.Username], "member of chA should be exported")
+		assert.True(t, exported[userB.Username], "member of chB should be exported")
+		assert.False(t, exported[outsider.Username], "user in neither target channel should not be exported")
+	})
+
+	t.Run("user in both target channels has both channel memberships in export", func(t *testing.T) {
+		th := Setup(t).InitBasic(t)
+
+		chA := th.CreateChannel(t, th.BasicTeam)
+		chB := th.CreateChannel(t, th.BasicTeam)
+
+		_, appErr := th.App.AddUserToChannel(th.Context, th.BasicUser, chA, false)
+		require.Nil(t, appErr)
+		_, appErr = th.App.AddUserToChannel(th.Context, th.BasicUser, chB, false)
+		require.Nil(t, appErr)
+
+		var b bytes.Buffer
+		appErr = th.App.BulkExport(th.Context, &b, "somePath", nil, model.BulkExportOpts{
+			TeamName:    th.BasicTeam.Name,
+			ChannelName: chA.Name + "," + chB.Name,
+		})
+		require.Nil(t, appErr)
+
+		lines := parseExportLines(t, &b)
+
+		var userLine map[string]any
+		for _, ul := range lines["user"] {
+			u := ul["user"].(map[string]any)
+			if u["username"].(string) == th.BasicUser.Username {
+				userLine = u
+				break
+			}
+		}
+		require.NotNil(t, userLine, "basic user should be in export")
+
+		exportedChannelNames := make(map[string]bool)
+		for _, ti := range userLine["teams"].([]any) {
+			team := ti.(map[string]any)
+			chList, ok := team["channels"].([]any)
+			if !ok {
+				continue
+			}
+			for _, ci := range chList {
+				exportedChannelNames[ci.(map[string]any)["name"].(string)] = true
+			}
+		}
+		assert.True(t, exportedChannelNames[chA.Name], "chA should appear in user memberships")
+		assert.True(t, exportedChannelNames[chB.Name], "chB should appear in user memberships")
+	})
+
+	t.Run("version line contains comma-separated channel names", func(t *testing.T) {
+		th := Setup(t).InitBasic(t)
+
+		chA := th.CreateChannel(t, th.BasicTeam)
+		chB := th.CreateChannel(t, th.BasicTeam)
+
+		var b bytes.Buffer
+		appErr := th.App.BulkExport(th.Context, &b, "somePath", nil, model.BulkExportOpts{
+			TeamName:    th.BasicTeam.Name,
+			ChannelName: chA.Name + "," + chB.Name,
+		})
+		require.Nil(t, appErr)
+
+		lines := parseExportLines(t, &b)
+
+		require.Len(t, lines["version"], 1)
+		info := lines["version"][0]["info"].(map[string]any)
+		additionalBytes, err := json.Marshal(info["additional"])
+		require.NoError(t, err)
+		var scope imports.ExportScopeAdditional
+		require.NoError(t, json.Unmarshal(additionalBytes, &scope))
+
+		assert.Equal(t, th.BasicTeam.Name, scope.TeamName)
+		assert.Contains(t, scope.ChannelName, chA.Name, "chA should be in scope additional")
+		assert.Contains(t, scope.ChannelName, chB.Name, "chB should be in scope additional")
+	})
+
+	t.Run("returns error if any channel does not exist in the team", func(t *testing.T) {
+		th := Setup(t).InitBasic(t)
+
+		chA := th.CreateChannel(t, th.BasicTeam)
+
+		var b bytes.Buffer
+		appErr := th.App.BulkExport(th.Context, &b, "somePath", nil, model.BulkExportOpts{
+			TeamName:    th.BasicTeam.Name,
+			ChannelName: chA.Name + ",channel-that-does-not-exist-" + model.NewId(),
+		})
+		require.NotNil(t, appErr, "should error when any channel in the list does not exist")
+	})
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// Multi-team + multi-channel export tests
+// ────────────────────────────────────────────────────────────────────────────
+
+func TestBulkExportMultipleTeamsAndChannels(t *testing.T) {
+	mainHelper.Parallel(t)
+
+	t.Run("exports same-named channel from multiple teams", func(t *testing.T) {
+		th := Setup(t).InitBasic(t)
+
+		teamA := th.CreateTeam(t)
+		teamB := th.CreateTeam(t)
+
+		userA := th.CreateUser(t)
+		th.LinkUserToTeam(t, userA, teamA)
+		userB := th.CreateUser(t)
+		th.LinkUserToTeam(t, userB, teamB)
+
+		// Create a channel with the same name in each team.
+		chA := th.CreateChannel(t, teamA)
+		chB, appErr := th.App.CreateChannel(th.Context, &model.Channel{
+			TeamId:      teamB.Id,
+			Name:        chA.Name,
+			DisplayName: chA.DisplayName,
+			Type:        model.ChannelTypeOpen,
+		}, false)
+		require.Nil(t, appErr)
+
+		_, appErr = th.App.AddUserToChannel(th.Context, userA, chA, false)
+		require.Nil(t, appErr)
+		_, appErr = th.App.AddUserToChannel(th.Context, userB, chB, false)
+		require.Nil(t, appErr)
+
+		_, _, appErr = th.App.CreatePost(th.Context, &model.Post{
+			ChannelId: chA.Id, Message: "post-in-team-a", UserId: userA.Id,
+		}, chA, model.CreatePostFlags{SetOnline: true})
+		require.Nil(t, appErr)
+
+		_, _, appErr = th.App.CreatePost(th.Context, &model.Post{
+			ChannelId: chB.Id, Message: "post-in-team-b", UserId: userB.Id,
+		}, chB, model.CreatePostFlags{SetOnline: true})
+		require.Nil(t, appErr)
+
+		var b bytes.Buffer
+		appErr = th.App.BulkExport(th.Context, &b, "somePath", nil, model.BulkExportOpts{
+			TeamName:    teamA.Name + "," + teamB.Name,
+			ChannelName: chA.Name,
+		})
+		require.Nil(t, appErr)
+
+		lines := parseExportLines(t, &b)
+
+		// Both teams should be in the export.
+		exportedTeams := make(map[string]bool)
+		for _, tl := range lines["team"] {
+			exportedTeams[tl["team"].(map[string]any)["name"].(string)] = true
+		}
+		assert.True(t, exportedTeams[teamA.Name], "team-a should be in export")
+		assert.True(t, exportedTeams[teamB.Name], "team-b should be in export")
+
+		// Posts from both instances of the channel should be present.
+		postMessages := make(map[string]bool)
+		for _, pl := range lines["post"] {
+			postMessages[pl["post"].(map[string]any)["message"].(string)] = true
+		}
+		assert.True(t, postMessages["post-in-team-a"], "post from team-a channel should be exported")
+		assert.True(t, postMessages["post-in-team-b"], "post from team-b channel should be exported")
+
+		// Users from both teams should be present.
+		exported := make(map[string]bool)
+		for _, ul := range lines["user"] {
+			exported[ul["user"].(map[string]any)["username"].(string)] = true
+		}
+		assert.True(t, exported[userA.Username], "userA should be in export")
+		assert.True(t, exported[userB.Username], "userB should be in export")
+	})
+
+	t.Run("exports distinct channels from different teams", func(t *testing.T) {
+		th := Setup(t).InitBasic(t)
+
+		teamA := th.CreateTeam(t)
+		teamB := th.CreateTeam(t)
+
+		userA := th.CreateUser(t)
+		th.LinkUserToTeam(t, userA, teamA)
+		userB := th.CreateUser(t)
+		th.LinkUserToTeam(t, userB, teamB)
+
+		chA := th.CreateChannel(t, teamA)
+		chB := th.CreateChannel(t, teamB)
+		chOtherA := th.CreateChannel(t, teamA) // not in the filter
+
+		_, appErr := th.App.AddUserToChannel(th.Context, userA, chA, false)
+		require.Nil(t, appErr)
+		_, appErr = th.App.AddUserToChannel(th.Context, userB, chB, false)
+		require.Nil(t, appErr)
+
+		_, _, appErr = th.App.CreatePost(th.Context, &model.Post{
+			ChannelId: chA.Id, Message: "post-chA", UserId: userA.Id,
+		}, chA, model.CreatePostFlags{SetOnline: true})
+		require.Nil(t, appErr)
+		_, _, appErr = th.App.CreatePost(th.Context, &model.Post{
+			ChannelId: chB.Id, Message: "post-chB", UserId: userB.Id,
+		}, chB, model.CreatePostFlags{SetOnline: true})
+		require.Nil(t, appErr)
+		_, _, appErr = th.App.CreatePost(th.Context, &model.Post{
+			ChannelId: chOtherA.Id, Message: "post-other", UserId: userA.Id,
+		}, chOtherA, model.CreatePostFlags{SetOnline: true})
+		require.Nil(t, appErr)
+
+		var b bytes.Buffer
+		appErr = th.App.BulkExport(th.Context, &b, "somePath", nil, model.BulkExportOpts{
+			TeamName:    teamA.Name + "," + teamB.Name,
+			ChannelName: chA.Name + "," + chB.Name,
+		})
+		require.Nil(t, appErr)
+
+		lines := parseExportLines(t, &b)
+
+		postMessages := make(map[string]bool)
+		for _, pl := range lines["post"] {
+			postMessages[pl["post"].(map[string]any)["message"].(string)] = true
+		}
+		assert.True(t, postMessages["post-chA"], "post from chA should be exported")
+		assert.True(t, postMessages["post-chB"], "post from chB should be exported")
+		assert.False(t, postMessages["post-other"], "post from non-target channel must not be exported")
+	})
+
+	t.Run("error when channel does not exist in any of the specified teams", func(t *testing.T) {
+		th := Setup(t)
+
+		teamA := th.CreateTeam(t)
+		teamB := th.CreateTeam(t)
+
+		var b bytes.Buffer
+		appErr := th.App.BulkExport(th.Context, &b, "somePath", nil, model.BulkExportOpts{
+			TeamName:    teamA.Name + "," + teamB.Name,
+			ChannelName: "channel-that-exists-in-neither-" + model.NewId(),
+		})
+		require.NotNil(t, appErr, "should error when channel does not exist in any specified team")
+	})
+
+	t.Run("channel missing from one team but present in another succeeds", func(t *testing.T) {
+		th := Setup(t).InitBasic(t)
+
+		teamA := th.CreateTeam(t)
+		teamB := th.CreateTeam(t)
+
+		// Create the channel only in teamA.
+		ch := th.CreateChannel(t, teamA)
+
+		var b bytes.Buffer
+		appErr := th.App.BulkExport(th.Context, &b, "somePath", nil, model.BulkExportOpts{
+			TeamName:    teamA.Name + "," + teamB.Name,
+			ChannelName: ch.Name,
+		})
+		// Should succeed: channel exists in at least one of the specified teams.
+		require.Nil(t, appErr)
+
+		lines := parseExportLines(t, &b)
+		exportedChannels := make(map[string]bool)
+		for _, cl := range lines["channel"] {
+			exportedChannels[cl["channel"].(map[string]any)["name"].(string)] = true
+		}
+		assert.True(t, exportedChannels[ch.Name], "channel should be exported from team-a")
+	})
+}
+
+func TestImportLineFromUserMagicLinkSuppression(t *testing.T) {
+	t.Run("magic-link user exported with nil auth_service and nil auth_data", func(t *testing.T) {
+		magicLinkData := model.NewId()
+		user := &model.User{
+			Username:    "ml-user",
+			Email:       "ml@example.com",
+			AuthService: model.UserAuthServiceMagicLink,
+			AuthData:    &magicLinkData,
+		}
+		line := importLineFromUser(user, map[string]*string{})
+		require.NotNil(t, line.User)
+		assert.Nil(t, line.User.AuthService, "magic-link AuthService must be suppressed on export")
+		assert.Nil(t, line.User.AuthData, "magic-link AuthData must be suppressed on export")
+	})
+
+	t.Run("LDAP user exported with auth_service and auth_data set", func(t *testing.T) {
+		ldapData := model.NewId()
+		user := &model.User{
+			Username:    "ldap-user",
+			Email:       "ldap@example.com",
+			AuthService: model.UserAuthServiceLdap,
+			AuthData:    &ldapData,
+		}
+		line := importLineFromUser(user, map[string]*string{})
+		require.NotNil(t, line.User)
+		require.NotNil(t, line.User.AuthService, "LDAP AuthService must be set on export")
+		assert.Equal(t, model.UserAuthServiceLdap, *line.User.AuthService)
+		require.NotNil(t, line.User.AuthData, "LDAP AuthData must be set on export")
+		assert.Equal(t, ldapData, *line.User.AuthData)
+	})
+
+	t.Run("email user exported with nil auth_service", func(t *testing.T) {
+		user := &model.User{
+			Username:    "email-user",
+			Email:       "email@example.com",
+			AuthService: "",
+			AuthData:    nil,
+		}
+		line := importLineFromUser(user, map[string]*string{})
+		require.NotNil(t, line.User)
+		assert.Nil(t, line.User.AuthService, "email user must have nil AuthService on export")
+	})
+}
+
+// The scope blob on the version line is the contract the entire scoped import
+// keys off: its absence means "full instance", where every user missing from the
+// destination is fatal and none of the scoped behavior applies. These assertions
+// pin the shape of that blob, including that an unscoped export carries none.
+func TestExportVersionScopeMetadata(t *testing.T) {
+	mainHelper.Parallel(t)
+	th := Setup(t)
+
+	scopeOf := func(t *testing.T, teamNames, channelNames []string) *imports.VersionInfoImportData {
+		t.Helper()
+		var buf bytes.Buffer
+		appErr := th.App.exportVersion(&buf, teamNames, channelNames)
+		require.Nil(t, appErr)
+
+		var line imports.LineImportData
+		require.NoError(t, json.Unmarshal(buf.Bytes(), &line))
+		require.Equal(t, "version", line.Type)
+		require.NotNil(t, line.Info)
+		return line.Info
+	}
+
+	t.Run("unscoped export carries no scope metadata", func(t *testing.T) {
+		info := scopeOf(t, nil, nil)
+		assert.Empty(t, info.Additional, "a full-instance export must not claim a scope")
+	})
+
+	t.Run("team scope is recorded", func(t *testing.T) {
+		info := scopeOf(t, []string{"engineering"}, nil)
+		require.NotEmpty(t, info.Additional)
+
+		var scope imports.ExportScopeAdditional
+		require.NoError(t, json.Unmarshal(info.Additional, &scope))
+		assert.Equal(t, "engineering", scope.TeamName)
+		assert.Empty(t, scope.ChannelName)
+	})
+
+	t.Run("multi-team and multi-channel scopes are comma-separated", func(t *testing.T) {
+		info := scopeOf(t, []string{"engineering", "design"}, []string{"town-square", "off-topic"})
+		require.NotEmpty(t, info.Additional)
+
+		var scope imports.ExportScopeAdditional
+		require.NoError(t, json.Unmarshal(info.Additional, &scope))
+		assert.Equal(t, "engineering,design", scope.TeamName)
+		assert.Equal(t, "town-square,off-topic", scope.ChannelName)
+
+		// splitTrimNames on the import side has to round-trip this back to the
+		// same sets, since the remap guards count them to detect ambiguity.
+		assert.Equal(t, []string{"engineering", "design"}, splitTrimNames(scope.TeamName))
+		assert.Equal(t, []string{"town-square", "off-topic"}, splitTrimNames(scope.ChannelName))
+	})
+
+	t.Run("channel scope without a team scope is not representable", func(t *testing.T) {
+		// BulkExport rejects this combination up front; exportVersion mirrors that
+		// by keying the blob off the team filter, so a channel-only call emits no
+		// scope rather than a scope the importer could not act on.
+		info := scopeOf(t, nil, []string{"town-square"})
+		assert.Empty(t, info.Additional)
+	})
+}

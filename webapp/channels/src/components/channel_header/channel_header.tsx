@@ -1,0 +1,455 @@
+// Copyright (c) 2015-present Mattermost, Inc. All Rights Reserved.
+// See LICENSE.txt for license information.
+
+import React from 'react';
+import type {MouseEvent, ReactNode, RefObject} from 'react';
+import {defineMessage, defineMessages, FormattedMessage, injectIntl} from 'react-intl';
+import type {WrappedComponentProps} from 'react-intl';
+
+import {
+    AccountOutlineIcon,
+    BellOffOutlineIcon,
+    FileTextOutlineIcon,
+    PinOutlineIcon,
+} from '@mattermost/compass-icons/components';
+import {Icon} from '@mattermost/compass-ui/components/icon';
+import {IconButton} from '@mattermost/compass-ui/components/icon-button';
+import {WithTooltip} from '@mattermost/shared/components/tooltip';
+
+import ChannelAttributeLabels from 'components/channel_attributes/channel_attribute_labels';
+import {ChannelLabelSurface} from 'components/common/hooks/useChannelLabels';
+import CustomStatusEmoji from 'components/custom_status/custom_status_emoji';
+import CustomStatusText from 'components/custom_status/custom_status_text';
+import PopoutButton from 'components/popout_button';
+import Timestamp from 'components/timestamp';
+import Tag from 'components/widgets/tag/tag';
+
+import CallButton from 'plugins/call_button';
+import ChannelHeaderPlug from 'plugins/channel_header_plug';
+import Pluggable from 'plugins/pluggable';
+import type {KindMessages} from 'utils/channel_kind';
+import {getChannelRoutePathAndIdentifier} from 'utils/channel_utils';
+import {
+    Constants,
+    NotificationLevels,
+    RHSStates,
+} from 'utils/constants';
+import {canPopout, getPopoutChannelTitle, isChannelPopoutWindow, popoutChannel} from 'utils/popouts/popout_windows';
+import {isEmptyObject} from 'utils/utils';
+
+import ChannelHeaderText from './channel_header_text';
+import ChannelHeaderTitle from './channel_header_title';
+import ChannelInfoButton from './channel_info_button';
+import ChannelJoinRequestCountSync from './channel_join_request_count_sync';
+import HeaderIconWrapper from './components/header_icon_wrapper';
+
+import type {PropsFromRedux} from './index';
+
+const membersTooltipMessages = defineMessages({
+    members: {id: 'channel_header.channelMembers', defaultMessage: 'Members'},
+    membersPendingRequests: {id: 'channel_header.channelMembersPendingRequests', defaultMessage: 'Members — pending join requests'},
+});
+
+const messages = {
+    headerRegion: {
+        channel: defineMessage({id: 'accessibility.sections.channelHeader', defaultMessage: 'channel header region'}),
+        board: defineMessage({id: 'accessibility.sections.channelHeader.board', defaultMessage: 'board header region'}),
+    },
+    hasGuests: {
+        channel: defineMessage({id: 'channel_header.channelHasGuests', defaultMessage: 'Channel has guests'}),
+        board: defineMessage({id: 'channel_header.channelHasGuests.board', defaultMessage: 'Board has guests'}),
+    },
+    autotranslationHint: {
+        channel: defineMessage({id: 'channel_header.autotranslationMessage.tooltip.hint', defaultMessage: 'This channel is being automatically translated to your language'}),
+        board: defineMessage({id: 'channel_header.autotranslationMessage.tooltip.hint.board', defaultMessage: 'This board is being automatically translated to your language'}),
+    },
+    files: {
+        channel: defineMessage({id: 'channel_header.channelFiles', defaultMessage: 'Channel files'}),
+        board: defineMessage({id: 'channel_header.channelFiles.board', defaultMessage: 'Board files'}),
+    },
+} satisfies Record<string, KindMessages>;
+
+export type Props = WrappedComponentProps & PropsFromRedux;
+
+class ChannelHeader extends React.PureComponent<Props> {
+    toggleFavoriteRef: RefObject<HTMLButtonElement | null>;
+
+    constructor(props: Props) {
+        super(props);
+        this.toggleFavoriteRef = React.createRef();
+    }
+
+    componentDidMount() {
+        this.props.actions.getCustomEmojisInText(this.props.channel ? this.props.channel.header : '');
+
+        // Fetch remote names for shared channels on initial mount
+        if (this.props.channel?.shared) {
+            // Don't force refresh on initial load, use cached data if available
+            this.props.actions.fetchChannelRemotes(this.props.channel.id);
+        }
+    }
+
+    componentDidUpdate(prevProps: Props) {
+        const header = this.props.channel ? this.props.channel.header : '';
+        const prevHeader = prevProps.channel ? prevProps.channel.header : '';
+        if (header !== prevHeader) {
+            this.props.actions.getCustomEmojisInText(header);
+        }
+
+        // Fetch remote names when channel changes or when a channel becomes shared
+        if (this.props.channel?.shared) {
+            if (this.props.channel.id !== prevProps.channel?.id) {
+                // For regular channel changes, use cached data if available
+                this.props.actions.fetchChannelRemotes(this.props.channel.id);
+            } else if (this.props.channel.shared !== prevProps.channel?.shared) {
+                // Only force refresh when a channel's shared status changes
+                this.props.actions.fetchChannelRemotes(this.props.channel.id, true);
+            }
+        }
+    }
+
+    unmute = () => {
+        const {actions, channel, channelMember, currentUser} = this.props;
+
+        if (!channelMember || !currentUser || !channel) {
+            return;
+        }
+
+        const options = {mark_unread: NotificationLevels.ALL};
+        actions.updateChannelNotifyProps(currentUser.id, channel.id, options);
+    };
+
+    showPinnedPosts = (e: MouseEvent<HTMLButtonElement>) => {
+        e.preventDefault();
+        if (this.props.rhsState === RHSStates.PIN) {
+            this.props.actions.closeRightHandSide();
+        } else {
+            this.props.actions.showPinnedPosts();
+        }
+    };
+
+    showChannelFiles = () => {
+        if (this.props.rhsState === RHSStates.CHANNEL_FILES) {
+            this.props.actions.closeRightHandSide();
+        } else if (this.props.channel) {
+            this.props.actions.showChannelFiles(this.props.channel.id);
+        }
+    };
+
+    popoutChannelView = () => {
+        const {channel, team, dmUser, intl} = this.props;
+        if (channel && team) {
+            const {path, identifier} = getChannelRoutePathAndIdentifier(channel, dmUser?.username);
+            popoutChannel(intl.formatMessage(getPopoutChannelTitle(channel.type)), team.name, path, identifier);
+        }
+    };
+
+    toggleChannelMembersRHS = () => {
+        if (this.props.rhsState === RHSStates.CHANNEL_MEMBERS) {
+            this.props.actions.closeRightHandSide();
+        } else if (this.props.channel) {
+            this.props.actions.showChannelMembers(this.props.channel.id);
+        }
+    };
+
+    renderCustomStatus = () => {
+        const {customStatus, isCustomStatusEnabled, isCustomStatusExpired} = this.props;
+        const isStatusSet = !isCustomStatusExpired && (customStatus?.text || customStatus?.emoji);
+        if (!(isCustomStatusEnabled && isStatusSet)) {
+            return null;
+        }
+
+        return (
+            <div className='custom-emoji__wrapper'>
+                <CustomStatusEmoji
+                    userID={this.props.dmUser?.id}
+                    showTooltip={true}
+                    emojiStyle={{
+                        verticalAlign: 'top',
+                        margin: '0 4px 1px',
+                    }}
+                />
+                <CustomStatusText
+                    text={customStatus?.text}
+                    className='custom-emoji__text'
+                />
+            </div>
+        );
+    };
+
+    render() {
+        const {
+            team,
+            currentUser,
+            gmMembers,
+            channel,
+            channelMember,
+            isChannelMuted,
+            dmUser,
+            rhsState,
+            hasGuests,
+            hideGuestTags,
+            channelKind,
+        } = this.props;
+        if (!channel) {
+            return null;
+        }
+
+        const ariaLabelChannelHeader = this.props.intl.formatMessage(messages.headerRegion[channelKind]);
+
+        let hasGuestsText: ReactNode = '';
+        if (hasGuests && !hideGuestTags) {
+            hasGuestsText = (
+                <span className='has-guest-header'>
+                    <span tabIndex={0}>
+                        <FormattedMessage {...messages.hasGuests[channelKind]}/>
+                    </span>
+                </span>
+            );
+        }
+
+        let autotranslationMessage: ReactNode = '';
+        if (this.props.isChannelAutotranslated) {
+            autotranslationMessage = (
+                <WithTooltip
+                    title={this.props.intl.formatMessage({id: 'channel_header.autotranslationMessage.tooltip.title', defaultMessage: 'Auto-translation is enabled'})}
+                    hint={this.props.intl.formatMessage(messages.autotranslationHint[channelKind])}
+                >
+                    <div
+                        className='autotranslation-header'
+                        data-testid='autotranslation-badge'
+                    >
+                        <Tag
+                            text={this.props.intl.formatMessage({id: 'channel_header.autotranslationMessage', defaultMessage: 'Auto-translated'})}
+                            icon={'translate'}
+                            size='xs'
+                            variant='default'
+                        />
+                    </div>
+                </WithTooltip>
+            );
+        }
+
+        if (isEmptyObject(channel) ||
+            isEmptyObject(channelMember) ||
+            isEmptyObject(currentUser) ||
+            (!dmUser && channel.type === Constants.DM_CHANNEL)
+        ) {
+            // Use an empty div to make sure the header's height stays constant
+            return (
+                <div className='channel-header'/>
+            );
+        }
+
+        const isDirect = (channel.type === Constants.DM_CHANNEL);
+        const isGroup = (channel.type === Constants.GM_CHANNEL);
+
+        if (isGroup) {
+            if (hasGuests && !hideGuestTags) {
+                hasGuestsText = (
+                    <span className='has-guest-header'>
+                        <FormattedMessage
+                            id='channel_header.groupMessageHasGuests'
+                            defaultMessage='This group message has guests'
+                        />
+                    </span>
+                );
+            }
+        }
+
+        let dmHeaderTextStatus: ReactNode;
+        if (isDirect && !dmUser?.delete_at && !dmUser?.is_bot) {
+            dmHeaderTextStatus = (
+                <span className='header-status__text'>
+                    {this.renderCustomStatus()}
+                </span>
+            );
+
+            if (this.props.isLastActiveEnabled && this.props.lastActivityTimestamp && this.props.timestampUnits) {
+                dmHeaderTextStatus = (
+                    <span className='header-status__text'>
+                        <span className='last-active__text'>
+                            <FormattedMessage
+                                id='channel_header.lastActive'
+                                defaultMessage='Last online {timestamp}'
+                                values={{
+                                    timestamp: (
+                                        <Timestamp
+                                            value={this.props.lastActivityTimestamp}
+                                            units={this.props.timestampUnits}
+                                            useTime={false}
+                                            style={'short'}
+                                        />
+                                    ),
+                                }}
+                            />
+                        </span>
+                        {this.renderCustomStatus()}
+                    </span>
+                );
+            }
+        }
+
+        const channelFilesIcon = <Icon glyph={<FileTextOutlineIcon/>}/>;
+        const pinnedIcon = <Icon glyph={<PinOutlineIcon/>}/>;
+
+        const pinnedButton = this.props.pinnedPostsCount ? (
+            <HeaderIconWrapper
+                active={rhsState === RHSStates.PIN}
+                buttonClass='channel-header__icon channel-header__icon--wide'
+                buttonId={'channelHeaderPinButton'}
+                count={this.props.pinnedPostsCount}
+                countId='channelPinnedPostCountText'
+                onClick={this.showPinnedPosts}
+                tooltip={this.props.intl.formatMessage({id: 'channel_header.pinnedPosts', defaultMessage: 'Pinned messages'})}
+            >
+                {pinnedIcon}
+            </HeaderIconWrapper>
+        ) : (
+            null
+        );
+
+        let memberListButton = null;
+        if (!isDirect) {
+            const membersIcon = (
+                <span className='channel-header__members-icon-wrapper'>
+                    <Icon glyph={<AccountOutlineIcon/>}/>
+                    {this.props.hasPendingJoinRequests && (
+                        <span
+                            className='channel-header__join-request-badge'
+                            aria-hidden='true'
+                            data-testid='channelHeaderJoinRequestBadge'
+                        />
+                    )}
+                </span>
+            );
+
+            memberListButton = (
+                <HeaderIconWrapper
+                    active={rhsState === RHSStates.CHANNEL_MEMBERS}
+                    tooltip={this.props.intl.formatMessage(
+                        this.props.hasPendingJoinRequests ? membersTooltipMessages.membersPendingRequests : membersTooltipMessages.members,
+                    )}
+                    buttonClass='member-rhs__trigger channel-header__icon channel-header__icon--wide'
+                    buttonId={'member_rhs'}
+                    count={this.props.memberCount}
+                    countId='channelMemberCountText'
+                    onClick={this.toggleChannelMembersRHS}
+                >
+                    {membersIcon}
+                </HeaderIconWrapper>
+            );
+        }
+
+        let muteTrigger;
+        if (isChannelMuted) {
+            muteTrigger = (
+                <WithTooltip
+                    title={
+                        <FormattedMessage
+                            id='channelHeader.unmute'
+                            defaultMessage='Unmute'
+                        />
+                    }
+                >
+                    <IconButton
+                        id='toggleMute'
+                        size='x-small'
+                        className='channel-header__mute channel-header__icon'
+                        icon={<Icon glyph={<BellOffOutlineIcon/>}/>}
+                        onClick={this.unmute}
+                        aria-label={this.props.intl.formatMessage({id: 'channelHeader.unmute', defaultMessage: 'Unmute'})}
+                    />
+                </WithTooltip>
+            );
+        }
+
+        return (
+            <div
+                id='channel-header'
+                aria-label={ariaLabelChannelHeader}
+                role='banner'
+                tabIndex={-1}
+                data-channelid={`${channel.id}`}
+                className='channel-header alt a11y__region'
+                data-a11y-sort-order='8'
+            >
+                <ChannelJoinRequestCountSync/>
+                <div className='flex-parent'>
+                    <div className='flex-child'>
+                        <div
+                            id='channelHeaderInfo'
+                            className='channel-header__info'
+                        >
+                            <div
+                                className='channel-header__title dropdown'
+                            >
+                                <ChannelHeaderTitle
+                                    dmUser={dmUser}
+                                    gmMembers={gmMembers}
+                                    remoteNames={this.props.remoteNames}
+                                />
+                                <div
+                                    className='channel-header__icons'
+                                >
+                                    {muteTrigger}
+                                    {memberListButton}
+                                    {pinnedButton}
+                                    {this.props.canSearchFiles &&
+                                        <HeaderIconWrapper
+                                            active={rhsState === RHSStates.CHANNEL_FILES}
+                                            buttonClass='channel-header__icon'
+                                            buttonId={'channelHeaderFilesButton'}
+                                            onClick={this.showChannelFiles}
+                                            tooltip={this.props.intl.formatMessage(messages.files[channelKind])}
+                                        >
+                                            {channelFilesIcon}
+                                        </HeaderIconWrapper>
+                                    }
+                                    <Pluggable
+                                        pluggableName='ChannelHeaderIcon'
+                                        channel={channel}
+                                        channelMember={channelMember!}
+                                    />
+                                    {!isDirect && !isGroup && (
+                                        <ChannelAttributeLabels
+                                            channelId={channel.id}
+                                            surface={[ChannelLabelSurface.INFO, ChannelLabelSurface.HEADER]}
+                                        />
+                                    )}
+                                </div>
+                                <div
+                                    id='channelHeaderDescription'
+                                    className='channel-header__description'
+                                >
+                                    {dmHeaderTextStatus}
+                                    {hasGuestsText}
+                                    {autotranslationMessage}
+                                    <ChannelHeaderText
+                                        teamId={team?.id}
+                                        channel={channel}
+                                        dmUser={dmUser}
+                                    />
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                    <ChannelHeaderPlug
+                        channel={channel}
+                        channelMember={channelMember}
+                    />
+                    <CallButton/>
+                    {canPopout() && !isChannelPopoutWindow() && (
+                        <PopoutButton
+                            className='channel-header__icon channel-header__icon--small'
+                            onClick={this.popoutChannelView}
+                        />
+                    )}
+                    <ChannelInfoButton channel={channel}/>
+                </div>
+            </div>
+        );
+    }
+}
+
+export default injectIntl(ChannelHeader);

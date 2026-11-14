@@ -1,0 +1,1090 @@
+ROOT := $(dir $(abspath $(lastword $(MAKEFILE_LIST))))
+
+# Must be read before parse-time Enterprise detection so BUILD_ENTERPRISE_DIR applies.
+-include $(ROOT)config.override.mk
+
+ifeq ($(OS),Windows_NT)
+	PLATFORM := Windows
+else
+	PLATFORM := $(shell uname)
+endif
+
+
+define LICENSE_HEADER
+// Copyright (c) 2015-present Mattermost, Inc. All Rights Reserved.
+// See LICENSE.txt for license information.
+
+endef
+
+IS_CI ?= false
+# Build Flags
+BUILD_NUMBER ?= $(BUILD_NUMBER:)
+BUILD_DATE = $(shell date -u)
+BUILD_HASH = $(shell git rev-parse HEAD)
+BUILD_TAGS =
+
+
+# Docker
+export COMPOSE_PROJECT_NAME=mattermost-server
+
+# If we don't set the build number it defaults to dev
+ifeq ($(BUILD_NUMBER),)
+	BUILD_DATE := n/a
+	BUILD_NUMBER := dev
+endif
+
+# Go test sum configuration
+GOTESTSUM_FORMAT ?= testname
+GOTESTSUM_JUNITFILE ?= report.xml
+GOTESTSUM_JSONFILE ?= gotestsum.json
+
+# Go test coverage
+ENABLE_COVERAGE ?= false
+ifeq ($(ENABLE_COVERAGE),true)
+COVERAGE_FLAG = -coverprofile=cover.out -covermode=atomic
+endif
+
+# mmctl
+MMCTL_BUILD_TAGS =
+MMCTL_TESTFLAGS ?= -timeout 30m
+MMCTL_PKG = github.com/mattermost/mattermost/server/v8/cmd/mmctl/commands
+MMCTL_BUILD_DATE = $(shell date -u +'%Y-%m-%dT%H:%M:%SZ')
+MMCTL_GIT_COMMIT = $(shell git rev-parse HEAD)
+MMCTL_GIT_TREE_STATE = $(shell if [ -n "$$(git status --porcelain 2>/dev/null)" ]; then echo "dirty"; else echo "clean"; fi)
+MMCTL_COMMIT_DATE = $(shell TZ=UTC git log -1 --date=format-local:'%Y-%m-%dT%H:%M:%SZ' --format='%cd' 2>/dev/null || echo "dev")
+MMCTL_LDFLAGS += -X "$(MMCTL_PKG).buildDate=$(MMCTL_BUILD_DATE)"
+MMCTL_LDFLAGS += -X "$(MMCTL_PKG).gitCommit=$(MMCTL_GIT_COMMIT)"
+MMCTL_LDFLAGS += -X "$(MMCTL_PKG).gitTreeState=$(MMCTL_GIT_TREE_STATE)"
+MMCTL_LDFLAGS += -X "$(MMCTL_PKG).commitDate=$(MMCTL_COMMIT_DATE)"
+
+# Enterprise
+BUILD_ENTERPRISE_DIR ?= ../../enterprise
+BUILD_ENTERPRISE ?= true
+BUILD_ENTERPRISE_READY = false
+BUILD_TYPE_NAME = team
+BUILD_HASH_ENTERPRISE = none
+ifneq ($(wildcard $(BUILD_ENTERPRISE_DIR)/.),)
+	MMCTL_TESTFLAGS += -ldflags '-X "$(MMCTL_PKG).EnableEnterpriseTests=true" -X "github.com/mattermost/mattermost/server/public/model.BuildEnterpriseReady=true"'
+	MMCTL_BUILD_TAGS += enterprise
+
+  ifeq ($(BUILD_ENTERPRISE),true)
+	BUILD_ENTERPRISE_READY = true
+	BUILD_TYPE_NAME = enterprise
+	BUILD_HASH_ENTERPRISE = $(shell cd $(BUILD_ENTERPRISE_DIR) && git rev-parse HEAD)
+	BUILD_TAGS += enterprise
+  else
+	BUILD_ENTERPRISE_READY = false
+	BUILD_TYPE_NAME = team
+  endif
+else
+	BUILD_ENTERPRISE_READY = false
+	BUILD_TYPE_NAME = team
+endif
+
+FIPS_ENABLED ?= false
+ifeq ($(FIPS_ENABLED),true)
+	BUILD_TYPE_NAME := $(BUILD_TYPE_NAME)-fips
+endif
+
+# Clean up the old means of importing enterprise source, if it exists
+ifneq ($(wildcard channels/imports/imports.go),)
+	IGNORE := $(shell rm -f channels/imports/imports.go)
+endif
+
+# Source available, already included with enterprise but also available during development.
+ifeq ($(BUILD_NUMBER),dev)
+	BUILD_TAGS += sourceavailable
+endif
+
+# Webapp
+BUILD_WEBAPP_DIR ?= ../webapp
+
+# We need current user's UID for `run-haserver` so docker compose does not run server
+# as root and mess up file permissions for devs. When running like this HOME will be blank
+# and docker will add '/', so we need to set the go-build cache location or we'll get
+# permission errors on build as it tries to create a cache in filesystem root.
+export CURRENT_UID = $(shell id -u):$(shell id -g)
+ifeq ($(HOME),/)
+	export XDG_CACHE_HOME = /tmp/go-cache/
+endif
+
+# Go Flags
+# Use -buildvcs=false to avoid embedding VCS info which can cause false positives in container scanning tools
+export GOFLAGS ?= -buildvcs=false
+# We need to export GOBIN to allow it to be set
+# for processes spawned from the Makefile
+export GOBIN ?= $(PWD)/bin
+GO ?= go
+
+ifeq ($(FIPS_ENABLED),true)
+	BUILD_TAGS += requirefips
+	MMCTL_BUILD_TAGS += requirefips
+endif
+
+DELVE ?= dlv
+LDFLAGS += -X "github.com/mattermost/mattermost/server/public/model.BuildNumber=$(BUILD_NUMBER)"
+LDFLAGS += -X "github.com/mattermost/mattermost/server/public/model.BuildDate=$(BUILD_DATE)"
+LDFLAGS += -X "github.com/mattermost/mattermost/server/public/model.BuildHash=$(BUILD_HASH)"
+LDFLAGS += -X "github.com/mattermost/mattermost/server/public/model.BuildHashEnterprise=$(BUILD_HASH_ENTERPRISE)"
+LDFLAGS += -X "github.com/mattermost/mattermost/server/public/model.BuildEnterpriseReady=$(BUILD_ENTERPRISE_READY)"
+
+GO_MAJOR_VERSION = $(shell $(GO) version | cut -c 14- | cut -d' ' -f1 | cut -d'.' -f1)
+GO_MINOR_VERSION = $(shell $(GO) version | cut -c 14- | cut -d' ' -f1 | cut -d'.' -f2)
+MINIMUM_SUPPORTED_GO_MAJOR_VERSION = 1
+MINIMUM_SUPPORTED_GO_MINOR_VERSION = 15
+GO_VERSION_VALIDATION_ERR_MSG = Golang version is not supported, please update to at least $(MINIMUM_SUPPORTED_GO_MAJOR_VERSION).$(MINIMUM_SUPPORTED_GO_MINOR_VERSION)
+GO_COMPATIBILITY_TEST_VERSIONS := 1.22.7 1.23.6
+
+# GOOS/GOARCH of the build host, used to determine whether we're cross-compiling or not
+BUILDER_GOOS_GOARCH="$(shell $(GO) env GOOS)_$(shell $(GO) env GOARCH)"
+
+PLATFORM_FILES="./cmd/mattermost"
+
+# Output paths
+DIST_ROOT=dist
+DIST_PATH=$(DIST_ROOT)/mattermost
+DIST_PATH_LIN_AMD64=$(DIST_ROOT)/linux_amd64/mattermost
+DIST_PATH_LIN_ARM64=$(DIST_ROOT)/linux_arm64/mattermost
+DIST_PATH_OSX_AMD64=$(DIST_ROOT)/darwin_amd64/mattermost
+DIST_PATH_OSX_ARM64=$(DIST_ROOT)/darwin_arm64/mattermost
+DIST_PATH_FREEBSD_AMD64=$(DIST_ROOT)/freebsd_amd64/mattermost
+DIST_PATH_FREEBSD_ARM64=$(DIST_ROOT)/freebsd_arm64/mattermost
+DIST_PATH_WIN=$(DIST_ROOT)/windows/mattermost
+
+# Packages lists
+TE_PACKAGES=$(shell $(GO) list ./public/...) $(shell $(GO) list ./... | grep -vE 'server/v8/cmd/mmctl')
+MMCTL_PACKAGES=$(shell $(GO) list ./... | grep -E 'server/v8/cmd/mmctl')
+
+TEMPLATES_DIR=templates
+
+# Plugins Packages
+PLUGIN_PACKAGES ?= $(PLUGIN_PACKAGES:)
+PLUGIN_PACKAGES += mattermost-plugin-calls-v1.12.6
+PLUGIN_PACKAGES += mattermost-plugin-github-v3.0.0
+PLUGIN_PACKAGES += mattermost-plugin-gitlab-v2.0.0
+PLUGIN_PACKAGES += mattermost-plugin-jira-v5.1.0
+PLUGIN_PACKAGES += mattermost-plugin-playbooks-v2.12.1
+PLUGIN_PACKAGES += mattermost-plugin-zoom-v2.0.0
+PLUGIN_PACKAGES += mattermost-plugin-agents-v2.9.0
+PLUGIN_PACKAGES += mattermost-plugin-boards-v10.1.0
+PLUGIN_PACKAGES += mattermost-plugin-user-survey-v1.1.1
+PLUGIN_PACKAGES += mattermost-plugin-mscalendar-v2.0.0
+PLUGIN_PACKAGES += mattermost-plugin-msteams-meetings-v3.0.0
+PLUGIN_PACKAGES += mattermost-plugin-metrics-v0.7.0
+PLUGIN_PACKAGES += mattermost-plugin-channel-export-v1.3.0
+PLUGIN_PACKAGES += mattermost-plugin-dataminr-v3.0.0
+PLUGIN_PACKAGES += mattermost-plugin-legal-hold-v1.1.6
+
+# Overwrite the definition of PLUGIN_PACKAGES with the list of FIPS-ready plugins
+# Note that the '+' in the file name is encoded as %2B for the URL we use to
+# download the package from to work. This will no longer be needed when we unify
+# the way we pre-package FIPS and non-FIPS plugins.
+ifeq ($(FIPS_ENABLED),true)
+	PLUGIN_PACKAGES  = mattermost-plugin-playbooks-v2.12.1%2Bf370c05-fips
+	PLUGIN_PACKAGES += mattermost-plugin-agents-v2.9.0%2Bc234d17-fips
+	PLUGIN_PACKAGES += mattermost-plugin-boards-v10.1.0%2B23ece5d-fips
+endif
+
+EE_PACKAGES=$(shell $(GO) list $(BUILD_ENTERPRISE_DIR)/...)
+
+ifeq ($(BUILD_ENTERPRISE_READY),true)
+  ALL_PACKAGES=$(TE_PACKAGES) $(EE_PACKAGES)
+else
+  ALL_PACKAGES=$(TE_PACKAGES)
+endif
+
+CONFIG_FILE_PATH ?= ./config/config.json
+
+.PHONY: all
+all: run ## Alias for 'run'.
+
+# Make sure not to modify an overridden ENABLED_DOCKER_SERVICES variable
+DOCKER_SERVICES_OVERRIDE=false
+ifneq (,$(ENABLED_DOCKER_SERVICES))
+  $(info ENABLED_DOCKER_SERVICES has been overridden)
+  DOCKER_SERVICES_OVERRIDE=true
+endif
+
+include config.mk
+include build/*.mk
+include public/Makefile
+
+LDFLAGS += -X "github.com/mattermost/mattermost/server/public/model.MockCWS=$(MM_ENABLE_CWS_MOCK)"
+LDFLAGS += -X "github.com/mattermost/mattermost/server/public/model.MattermostGiphySdkKey=$(MM_GIPHY_SDK_KEY)"
+
+RUN_IN_BACKGROUND ?=
+ifeq ($(RUN_SERVER_IN_BACKGROUND),true)
+	RUN_IN_BACKGROUND := &
+endif
+
+DOCKER_COMPOSE_OVERRIDE=
+ifneq ("$(wildcard ./docker-compose.override.yaml)","")
+  DOCKER_COMPOSE_OVERRIDE=-f docker-compose.override.yaml
+endif
+
+
+# Support for pgvector postgres image
+MM_USE_PGVECTOR ?= false
+ifeq ($(MM_USE_PGVECTOR),true)
+  $(info Using pgvector/pgvector image for PostgreSQL)
+  DOCKER_COMPOSE_OVERRIDE := -f docker-compose.pgvector.yml $(DOCKER_COMPOSE_OVERRIDE)
+endif
+
+ifneq ($(DOCKER_SERVICES_OVERRIDE),true)
+  ifeq (,$(findstring minio,$(ENABLED_DOCKER_SERVICES)))
+    TEMP_DOCKER_SERVICES:=$(TEMP_DOCKER_SERVICES) minio
+  endif
+  ifeq (,$(findstring azurite,$(ENABLED_DOCKER_SERVICES)))
+    TEMP_DOCKER_SERVICES:=$(TEMP_DOCKER_SERVICES) azurite
+  endif
+  ifeq ($(BUILD_ENTERPRISE_READY),true)
+    ifeq (,$(findstring openldap,$(ENABLED_DOCKER_SERVICES)))
+      TEMP_DOCKER_SERVICES:=$(TEMP_DOCKER_SERVICES) openldap
+    endif
+  endif
+  ENABLED_DOCKER_SERVICES:=$(ENABLED_DOCKER_SERVICES) $(TEMP_DOCKER_SERVICES)
+endif
+
+.PHONY: start-docker
+start-docker: setup-go-work ## Starts the docker containers for local development.
+ifneq ($(IS_CI),false)
+	@echo CI Build: skipping docker start
+else ifeq ($(MM_NO_DOCKER),true)
+	@echo No Docker Enabled: skipping docker start
+else
+	@echo Starting docker containers
+ifeq ($(MM_USE_PGVECTOR),true)
+	@echo Using pgvector PostgreSQL image
+endif
+
+	mkdir -p logs
+	docker compose rm start_dependencies
+	$(GO) run ./build/docker-compose-generator/main.go $(ENABLED_DOCKER_SERVICES) | docker compose -f docker-compose.makefile.yml -f /dev/stdin $(DOCKER_COMPOSE_OVERRIDE) run -T --rm start_dependencies
+  ifneq (,$(findstring openldap,$(ENABLED_DOCKER_SERVICES)))
+	cat tests/custom-schema-objectID.ldif | docker compose -f docker-compose.makefile.yml $(DOCKER_COMPOSE_OVERRIDE) exec -T openldap bash -c 'ldapadd -Y EXTERNAL -H ldapi:/// -w mostest_password || true';
+	cat tests/custom-schema-cpa.ldif | docker compose -f docker-compose.makefile.yml ${DOCKER_COMPOSE_OVERRIDE} exec -T openldap bash -c 'ldapadd -Y EXTERNAL -H ldapi:/// -w mostest_password || true';
+	cat tests/${LDAP_DATA}-data.ldif | docker compose -f docker-compose.makefile.yml ${DOCKER_COMPOSE_OVERRIDE} exec -T openldap bash -c 'ldapadd -x -D "cn=admin,dc=mm,dc=test,dc=com" -w mostest_password || true';
+  endif
+endif
+
+.PHONY: update-docker
+update-docker: setup-go-work stop-docker ## Updates the docker containers for local development.
+	@echo Updating docker containers
+
+	$(GO) run ./build/docker-compose-generator/main.go $(ENABLED_DOCKER_SERVICES) | docker compose -f docker-compose.makefile.yml -f /dev/stdin $(DOCKER_COMPOSE_OVERRIDE) up --no-start
+
+.PHONY: run-haserver
+run-haserver:
+ifeq ($(BUILD_ENTERPRISE_READY),true)
+	@echo Starting mattermost in an HA topology '(3 node cluster)'
+
+	docker compose -f docker-compose.yaml $(DOCKER_COMPOSE_OVERRIDE) up --remove-orphans haproxy
+endif
+
+.PHONY: stop-haserver
+stop-haserver:
+	@echo Stopping docker containers for HA topology
+	docker compose stop
+
+.PHONY: stop-docker
+stop-docker: ## Stops the docker containers for local development.
+ifeq ($(MM_NO_DOCKER),true)
+	@echo No Docker Enabled: skipping docker stop
+else
+	@echo Stopping docker containers
+
+	docker compose stop
+endif
+
+.PHONY: clean-docker
+clean-docker: ## Deletes the docker containers for local development.
+ifeq ($(MM_NO_DOCKER),true)
+	@echo No Docker Enabled: skipping docker clean
+else
+	@echo Removing docker containers
+
+	docker compose down -v
+	docker compose rm -v
+
+	docker volume rm mattermost-server_postgres-15-data || true
+endif
+
+.PHONY: plugin-checker
+plugin-checker: setup-go-work
+	$(GO) run $(GOFLAGS) ./public/plugin/checker
+
+.PHONY: prepackaged-plugins
+prepackaged-plugins: ## Populate the prepackaged-plugins directory.
+	@echo Downloading prepackaged plugins: $(PLUGIN_PACKAGES)
+	mkdir -p prepackaged_plugins
+	@cd prepackaged_plugins && for plugin_package in $(PLUGIN_PACKAGES) ; do \
+		curl -f -O -L https://plugins.releases.mattermost.com/release/$$plugin_package.tar.gz; \
+		curl -f -O -L https://plugins.releases.mattermost.com/release/$$plugin_package.tar.gz.sig; \
+	done
+
+.PHONY: prepackaged-binaries
+prepackaged-binaries: ## Populate the prepackaged-binaries to the bin directory
+ifeq ($(shell test -f bin/mmctl && printf "yes"),yes)
+	@echo "MMCTL already exists in bin/mmctl, not compiling."
+else
+	$(MAKE) mmctl-build
+endif
+
+.PHONY: golang-versions
+golang-versions: ## Install Golang versions used for compatibility testing (e.g. plugins)
+	@for version in $(GO_COMPATIBILITY_TEST_VERSIONS); do \
+		$(GO) install golang.org/dl/go$$version@latest && \
+		$(GOBIN)/go$$version download; \
+	done
+	export GO_COMPATIBILITY_TEST_VERSIONS="${GO_COMPATIBILITY_TEST_VERSIONS}"
+
+.PHONY: install-golangci-lint
+install-golangci-lint:
+	$(GO) install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.15.0
+
+.PHONY: golangci-lint
+golangci-lint: setup-go-work install-golangci-lint ## Run golangci-lint on codebase
+ifeq ($(BUILD_ENTERPRISE_READY),true)
+	$(GOBIN)/golangci-lint run ./... ./public/... $(BUILD_ENTERPRISE_DIR)/...
+else
+	$(GOBIN)/golangci-lint run ./... ./public/...
+endif
+
+.PHONY: i18n-extract
+i18n-extract: ## Extract strings for translation from the source code
+	cd ../tools/mmgotool && $(GO) install .
+	$(GOBIN)/mmgotool i18n extract --portal-dir=""
+
+.PHONY: i18n-verify
+i18n-verify: ## Verify the non-English translation files against en.json
+	cd ../tools/mmgotool && $(GO) install .
+	$(GOBIN)/mmgotool i18n verify --warn-missing-ids
+
+.PHONY: i18n-verify-all
+i18n-verify-all: i18n-verify ## Run every translation check: both surfaces' catalogs, the glossary and the translation pipeline
+	cd ../tools/mmgotool && $(GO) test ./commands/ -run TestServerPluralTableMatchesGoI18n
+	@test -d $(BUILD_WEBAPP_DIR)/node_modules || { echo "$(BUILD_WEBAPP_DIR)/node_modules is missing; run make -C $(BUILD_WEBAPP_DIR) node_modules"; exit 1; }
+	cd $(BUILD_WEBAPP_DIR)/channels && npm run i18n-verify-translations -- --warn-missing-keys
+	cd .. && node --test i18n/scripts/*.test.mjs
+	cd .. && node i18n/scripts/check_glossary.mjs
+
+.PHONY: i18n-check
+i18n-check: ## Exit on empty translation strings and translation source strings
+	cd ../tools/mmgotool && $(GO) install .
+	$(GOBIN)/mmgotool i18n clean-empty --portal-dir="" --check
+	$(GOBIN)/mmgotool i18n check-empty-src --portal-dir=""
+
+.PHONY: install-mockery
+install-mockery:
+	$(GO) install github.com/vektra/mockery/v2/...@v2.53.4
+
+.PHONY: store-mocks
+store-mocks: setup-go-work install-mockery ## Creates mock files.
+	$(GOBIN)/mockery --config channels/store/.mockery.yaml
+
+.PHONY: cache-mocks
+cache-mocks: setup-go-work install-mockery
+	$(GOBIN)/mockery --config platform/services/cache/.mockery.yaml
+
+
+.PHONY: store-layers
+store-layers: setup-go-work ## Generate layers for the store
+	$(GO) generate $(GOFLAGS) ./channels/store
+
+.PHONY: install-morph
+install-morph:
+	$(GO) install github.com/mattermost/morph/cmd/morph@1e0640c
+
+.PHONY: new-migration
+new-migration: install-morph ## Creates a new migration. Run with make new-migration name=<>
+	@echo "Generating new migration for postgres"
+	$(GOBIN)/morph new script $(name) --driver postgres --dir channels/db/migrations --sequence
+
+.PHONY: filestore-mocks
+filestore-mocks: setup-go-work install-mockery ## Creates mock files.
+	$(GOBIN)/mockery --config platform/shared/filestore/.mockery.yaml
+
+.PHONY: ldap-mocks
+ldap-mocks: setup-go-work install-mockery ## Creates mock files for ldap.
+	$(GOBIN)/mockery --dir $(BUILD_ENTERPRISE_DIR)/ldap --all --inpackage --note 'Regenerate this file using `make ldap-mocks`.'
+
+.PHONY: plugin-mocks
+plugin-mocks: setup-go-work install-mockery ## Creates mock files for plugins.
+	$(GOBIN)/mockery --config public/plugin/.mockery.yaml
+
+.PHONY: einterfaces-mocks
+einterfaces-mocks: setup-go-work install-mockery ## Creates mock files for einterfaces.
+	$(GOBIN)/mockery --config einterfaces/.mockery.yaml
+
+.PHONY: searchengine-mocks
+searchengine-mocks: setup-go-work install-mockery ## Creates mock files for searchengines.
+	$(GOBIN)/mockery --config platform/services/searchengine/.mockery.yaml
+
+.PHONY: sharedchannel-mocks
+sharedchannel-mocks: setup-go-work install-mockery ## Creates mock files for shared channels.
+	$(GOBIN)/mockery --config platform/services/sharedchannel/.mockery.yaml
+
+.PHONY: misc-mocks
+misc-mocks: setup-go-work install-mockery ## Creates mocks for misc interfaces.
+	$(GOBIN)/mockery --config channels/utils/.mockery.yaml
+
+.PHONY: email-mocks
+email-mocks: setup-go-work install-mockery ## Creates mocks for misc interfaces.
+	$(GOBIN)/mockery --config channels/app/email/.mockery.yaml
+
+.PHONY: platform-mocks
+platform-mocks: setup-go-work install-mockery ## Creates mocks for platform interfaces.
+	$(GOBIN)/mockery --config channels/app/platform/.mockery.yaml
+
+.PHONY: install-mockgen
+install-mockgen:
+	$(GO) install go.uber.org/mock/mockgen@v0.6.0
+
+.PHONY: mmctl-mocks
+mmctl-mocks: setup-go-work install-mockgen ## Creates mocks for mmctl
+	$(GOBIN)/mockgen -destination=cmd/mmctl/mocks/client_mock.go -copyright_file=cmd/mmctl/mocks/copyright.txt -package=mocks github.com/mattermost/mattermost/server/v8/cmd/mmctl/client Client
+
+.PHONY: pluginapi
+pluginapi: setup-go-work ## Generates api and hooks glue code for plugins
+	cd ./public && $(GO) generate $(GOFLAGS) ./plugin
+
+.PHONY: default-roles-permissions
+default-roles-permissions: setup-go-work start-docker ## Generates the Cypress and Playwright default_roles_permissions files from a live database.
+	$(GO) run $(GOFLAGS) ./scripts/default_permissions_generator \
+		-out ../e2e-tests/cypress/tests/support/api/default_roles_permissions.js \
+		-out ../e2e-tests/playwright/lib/src/server/default_roles_permissions.ts
+
+.PHONY: default-feature-flags
+default-feature-flags: setup-go-work ## Generates the Playwright default_feature_flags file from the model defaults.
+	$(GO) run $(GOFLAGS) ./scripts/default_feature_flags_generator \
+		-out ../e2e-tests/playwright/lib/src/server/default_feature_flags.ts
+
+.PHONY: mocks
+mocks: store-mocks filestore-mocks ldap-mocks plugin-mocks einterfaces-mocks searchengine-mocks sharedchannel-mocks misc-mocks email-mocks platform-mocks mmctl-mocks mocks-public cache-mocks
+
+.PHONY: layers
+layers: store-layers pluginapi
+
+.PHONY: generated
+generated: mocks layers gen-serialized migrations-extract build-templates mmctl-docs modules-tidy default-roles-permissions default-feature-flags ## Regenerate every committed generated asset checked by the check-generated CI job.
+
+.PHONY: check-prereqs-enterprise
+check-prereqs-enterprise: setup-go-work ## Checks prerequisite software status for enterprise.
+ifeq ($(BUILD_ENTERPRISE_READY),true)
+	./scripts/prereq-check-enterprise.sh
+endif
+
+.PHONY: setup-go-work
+setup-go-work: export BUILD_ENTERPRISE_READY := $(BUILD_ENTERPRISE_READY)
+setup-go-work: ## Sets up your go.work file
+ifneq ($(SKIP_SETUP_GO_WORK),true)
+	@set -e; \
+	if [ -f go.work ]; then cp -p go.work go.work.bak; fi; \
+	rm -f go.work; \
+	$(GO) work init; \
+	$(GO) work use .; \
+	$(GO) work use ./public; \
+	if [ "$(BUILD_ENTERPRISE_READY)" = "true" ]; then \
+		$(GO) work use $(BUILD_ENTERPRISE_DIR); \
+	fi; \
+	if [ -f go.work.bak ] && cmp -s go.work go.work.bak; then \
+		mv go.work.bak go.work; \
+	else \
+		rm -f go.work.bak; \
+		echo "Created go.work file"; \
+	fi
+endif
+
+.PHONY: check-go-fix
+check-go-fix: setup-go-work ## Check if go fix would modify any files.
+	$(GO) fix -diff ./...
+
+.PHONY: check-style
+check-style: plugin-checker vet golangci-lint check-go-fix ## Runs style/lint checks
+
+.PHONY: gotestsum
+gotestsum:
+	$(GO) install gotest.tools/gotestsum@v1.13.0
+
+.PHONY: install-ci-tools
+install-ci-tools: gotestsum install-golangci-lint install-govet install-mockery install-mockgen install-morph install-msgp ## Install all tools required by CI
+
+.PHONY: go-cache
+go-cache: setup-go-work install-ci-tools ## Pre-warm Go module and build cache for CI
+	$(GO) mod download all
+	@(cd public && $(GO) mod download all)
+	$(GO) build ./...
+	@(cd public && $(GO) build ./...)
+	$(GO) test -run=^$$ -count=1 -short ./...
+	@(cd public && $(GO) test -run=^$$ -count=1 -short ./...)
+
+.PHONY: test-compile
+test-compile: setup-go-work gotestsum ## Compile tests.
+	@echo COMPILE TESTS
+
+	for package in $(TE_PACKAGES) $(EE_PACKAGES); do \
+		$(GO) test $(GOFLAGS) -c $$package; \
+	done
+
+.PHONY: modules-tidy
+modules-tidy: setup-go-work ## Tidy Go modules
+	mv enterprise/external_imports.go enterprise/external_imports.go.orig
+	-$(GO) mod tidy
+	-cd public && $(GO) mod tidy
+	mv enterprise/external_imports.go.orig enterprise/external_imports.go
+
+.PHONY: test-server-pre
+test-server-pre: check-prereqs-enterprise start-docker gotestsum golang-versions ## Runs tests.
+ifeq ($(BUILD_ENTERPRISE_READY),true)
+	@echo Running all tests
+else
+	@echo Running only TE tests
+endif
+
+.PHONY: test-server-race
+test-server-race: export GOTESTSUM_FORMAT := $(GOTESTSUM_FORMAT)
+test-server-race: export GOTESTSUM_JUNITFILE := $(GOTESTSUM_JUNITFILE)
+test-server-race: export GOTESTSUM_JSONFILE := $(GOTESTSUM_JSONFILE)
+test-server-race: test-server-pre
+ifeq ($(IS_CI),true)
+	GOMAXPROCS=4 $(GOBIN)/gotestsum --rerun-fails=3 --packages="$(TE_PACKAGES) $(EE_PACKAGES)" -- -race $(GOFLAGS) -timeout=3h
+else
+	$(GOBIN)/gotestsum --rerun-fails=3 --packages="$(TE_PACKAGES) $(EE_PACKAGES)" -- -race $(GOFLAGS) -timeout=3h
+endif
+ifneq ($(IS_CI),true)
+  ifneq ($(MM_NO_DOCKER),true)
+    ifneq ($(TEMP_DOCKER_SERVICES),)
+	  @echo Stopping temporary docker services
+	  docker compose stop $(TEMP_DOCKER_SERVICES)
+    endif
+  endif
+endif
+
+.PHONY: test-server
+test-server: export GOTESTSUM_FORMAT := $(GOTESTSUM_FORMAT)
+test-server: export GOTESTSUM_JUNITFILE := $(GOTESTSUM_JUNITFILE)
+test-server: export GOTESTSUM_JSONFILE := $(GOTESTSUM_JSONFILE)
+test-server: test-server-pre
+	$(GOBIN)/gotestsum --rerun-fails=3 --packages="$(TE_PACKAGES) $(EE_PACKAGES)" -- $(GOFLAGS) -timeout=90m $(COVERAGE_FLAG)
+ifneq ($(IS_CI),true)
+  ifneq ($(MM_NO_DOCKER),true)
+    ifneq ($(TEMP_DOCKER_SERVICES),)
+	  @echo Stopping temporary docker services
+	  docker compose stop $(TEMP_DOCKER_SERVICES)
+    endif
+  endif
+endif
+
+.PHONY: test-server-ee
+test-server-ee: export GOTESTSUM_FORMAT := $(GOTESTSUM_FORMAT)
+test-server-ee: export GOTESTSUM_JUNITFILE := $(GOTESTSUM_JUNITFILE)
+test-server-ee: export GOTESTSUM_JSONFILE := $(GOTESTSUM_JSONFILE)
+test-server-ee: check-prereqs-enterprise start-docker gotestsum ## Runs EE tests.
+	@echo Running only EE tests
+	$(GOBIN)/gotestsum --packages="$(EE_PACKAGES)" -- $(GOFLAGS) -timeout=20m
+
+ES_PACKAGES=$(shell $(GO) list ./enterprise/elasticsearch/...)
+
+.PHONY: test-server-elasticsearch
+test-server-elasticsearch: export GOTESTSUM_FORMAT := $(GOTESTSUM_FORMAT)
+test-server-elasticsearch: export GOTESTSUM_JUNITFILE := $(GOTESTSUM_JUNITFILE)
+test-server-elasticsearch: export GOTESTSUM_JSONFILE := $(GOTESTSUM_JSONFILE)
+test-server-elasticsearch: check-prereqs-enterprise start-docker gotestsum ## Runs Elasticsearch tests.
+	@echo Running only Elasticsearch tests
+	$(GOBIN)/gotestsum --rerun-fails=3 --packages="$(ES_PACKAGES)" -- $(GOFLAGS) -timeout=20m
+
+OS_PACKAGES=$(shell $(GO) list ./enterprise/elasticsearch/opensearch/...)
+
+.PHONY: test-server-opensearch
+test-server-opensearch: export GOTESTSUM_FORMAT := $(GOTESTSUM_FORMAT)
+test-server-opensearch: export GOTESTSUM_JUNITFILE := $(GOTESTSUM_JUNITFILE)
+test-server-opensearch: export GOTESTSUM_JSONFILE := $(GOTESTSUM_JSONFILE)
+test-server-opensearch: check-prereqs-enterprise start-docker gotestsum ## Runs OpenSearch tests.
+	@echo Running only OpenSearch tests
+	$(GOBIN)/gotestsum --rerun-fails=3 --packages="$(OS_PACKAGES)" -- $(GOFLAGS) -timeout=20m
+
+.PHONY: test-server-quick
+test-server-quick: export GOTESTSUM_FORMAT := $(GOTESTSUM_FORMAT)
+test-server-quick: export GOTESTSUM_JUNITFILE := $(GOTESTSUM_JUNITFILE)
+test-server-quick: export GOTESTSUM_JSONFILE := $(GOTESTSUM_JSONFILE)
+test-server-quick: check-prereqs-enterprise ## Runs only quick tests.
+ifeq ($(BUILD_ENTERPRISE_READY),true)
+	@echo Running all tests
+	$(GOBIN)/gotestsum --packages="$(TE_PACKAGES) $(EE_PACKAGES)" -- $(GOFLAGS) -short
+else
+	@echo Running only TE tests
+	$(GOBIN)/gotestsum --packages="$(TE_PACKAGES)" -- $(GOFLAGS) -short
+endif
+
+.PHONY: internal-test-web-client
+internal-test-web-client: setup-go-work ## Runs web client tests.
+	$(GO) run $(GOFLAGS) $(PLATFORM_FILES) test web_client_tests
+
+.PHONY: run-server-for-web-client-tests
+run-server-for-web-client-tests: setup-go-work ## Tests the server for web client.
+	$(GO) run $(GOFLAGS) $(PLATFORM_FILES) test web_client_tests_server
+
+.PHONY: test-client
+test-client: ## Test client app.
+	@echo Running client tests
+
+	cd $(BUILD_WEBAPP_DIR) && $(MAKE) test
+
+.PHONY: test
+test: test-server test-client ## Runs all checks and tests below (except race detection and postgres).
+
+.PHONY: cover
+cover: ## Runs the golang coverage tool. You must run the unit tests first.
+	@echo Opening coverage info in browser. If this failed run make test first
+
+	$(GO) tool cover -html=cover.out
+	$(GO) tool cover -html=ecover.out
+
+.PHONY: test-data
+test-data: export MM_SERVICESETTINGS_ENABLELOCALMODE := true
+test-data: run-server inject-test-data stop-server ## start a local instance and add test data to it.
+
+.PHONY: inject-test-data
+inject-test-data: # add test data to the local instance.
+	@if ! ./scripts/wait-for-system-start.sh; then \
+		make stop-server; \
+	fi
+
+	bin/mmctl config set TeamSettings.MaxUsersPerTeam 100 --local
+	bin/mmctl sampledata -u 60 --local
+
+	@echo You may need to restart the Mattermost server before using the following
+	@echo ========================================================================
+	@echo Login with a system admin account username=sysadmin password=Sys@dmin-sample1
+	@echo Login with a regular account username=user-1 password=SampleUs@r-001
+	@echo ========================================================================
+
+.PHONY: test-mmctl-unit
+test-mmctl-unit: export GOTESTSUM_FORMAT := $(GOTESTSUM_FORMAT)
+test-mmctl-unit: export GOTESTSUM_JUNITFILE := $(GOTESTSUM_JUNITFILE)
+test-mmctl-unit: export GOTESTSUM_JSONFILE := $(GOTESTSUM_JSONFILE)
+test-mmctl-unit: check-prereqs-enterprise gotestsum
+	@echo Running mmctl unit tests
+	$(GOBIN)/gotestsum --packages="$(MMCTL_PACKAGES)" -- -tags 'unit $(MMCTL_BUILD_TAGS)' $(MMCTL_TESTFLAGS)
+
+.PHONY: test-mmctl-e2e
+test-mmctl-e2e: export GOTESTSUM_FORMAT := $(GOTESTSUM_FORMAT)
+test-mmctl-e2e: export GOTESTSUM_JUNITFILE := $(GOTESTSUM_JUNITFILE)
+test-mmctl-e2e: export GOTESTSUM_JSONFILE := $(GOTESTSUM_JSONFILE)
+test-mmctl-e2e: check-prereqs-enterprise gotestsum start-docker
+	@echo Running mmctl e2e tests
+	$(GOBIN)/gotestsum --packages="$(MMCTL_PACKAGES)" -- -tags 'e2e $(MMCTL_BUILD_TAGS)' $(MMCTL_TESTFLAGS)
+
+.PHONY: test-mmctl
+test-mmctl: export GOTESTSUM_FORMAT := $(GOTESTSUM_FORMAT)
+test-mmctl: export GOTESTSUM_JUNITFILE := $(GOTESTSUM_JUNITFILE)
+test-mmctl: export GOTESTSUM_JSONFILE := $(GOTESTSUM_JSONFILE)
+test-mmctl: check-prereqs-enterprise gotestsum start-docker
+	@echo Running all mmctl tests
+	$(GOBIN)/gotestsum --packages="$(MMCTL_PACKAGES)" -- -tags 'unit e2e $(MMCTL_BUILD_TAGS)' $(MMCTL_TESTFLAGS)
+
+.PHONY: test-mmctl-coverage
+test-mmctl-coverage: export GOTESTSUM_FORMAT := $(GOTESTSUM_FORMAT)
+test-mmctl-coverage: export GOTESTSUM_JUNITFILE := $(GOTESTSUM_JUNITFILE)
+test-mmctl-coverage: export GOTESTSUM_JSONFILE := $(GOTESTSUM_JSONFILE)
+test-mmctl-coverage: check-prereqs-enterprise gotestsum start-docker
+	@echo Running all mmctl tests with coverage
+	$(GOBIN)/gotestsum --packages="$(MMCTL_PACKAGES)" -- -tags 'unit e2e $(MMCTL_BUILD_TAGS)' -coverprofile=mmctlcover.out $(MMCTL_TESTFLAGS)
+	$(GO) tool cover -html=mmctlcover.out
+
+.PHONY: validate-go-version
+validate-go-version: ## Validates the installed version of go against Mattermost's minimum requirement.
+	@if [ $(GO_MAJOR_VERSION) -gt $(MINIMUM_SUPPORTED_GO_MAJOR_VERSION) ]; then \
+		exit 0 ;\
+	elif [ $(GO_MAJOR_VERSION) -lt $(MINIMUM_SUPPORTED_GO_MAJOR_VERSION) ]; then \
+		echo '$(GO_VERSION_VALIDATION_ERR_MSG)';\
+		exit 1; \
+	elif [ $(GO_MINOR_VERSION) -lt $(MINIMUM_SUPPORTED_GO_MINOR_VERSION) ] ; then \
+		echo '$(GO_VERSION_VALIDATION_ERR_MSG)';\
+		exit 1; \
+	fi
+
+.PHONY: build-templates
+build-templates: ## Compile all mjml email templates
+	cd $(TEMPLATES_DIR) && $(MAKE) build
+
+.PHONY: run-server
+run-server: setup-go-work prepackaged-binaries validate-go-version start-docker client ## Starts the server.
+	@echo Running mattermost for development
+ifeq ($(MM_USE_PGVECTOR),true)
+	@echo With pgvector PostgreSQL support enabled
+endif
+
+	mkdir -p $(BUILD_WEBAPP_DIR)/channels/dist/files
+	$(GO) run $(GOFLAGS) -ldflags '$(LDFLAGS)' -tags '$(BUILD_TAGS)' $(PLATFORM_FILES) $(RUN_IN_BACKGROUND)
+
+.PHONY: run-server-faketime
+run-server-faketime: setup-go-work prepackaged-binaries validate-go-version start-docker client ## Starts the server with FAKETIME.
+ifndef FAKETIME
+	$(error FAKETIME is not set. Usage: make run-server-faketime FAKETIME="+30d")
+endif
+	@if [ "$$(uname)" = "Darwin" ]; then \
+		LIBFAKETIME="$$(brew --prefix libfaketime 2>/dev/null)/lib/faketime/libfaketime.1.dylib"; \
+	else \
+		for p in /usr/lib/x86_64-linux-gnu/faketime /usr/lib/aarch64-linux-gnu/faketime /usr/lib/faketime /usr/lib64/faketime; do \
+			if [ -f "$$p/libfaketime.so.1" ]; then LIBFAKETIME="$$p/libfaketime.so.1"; break; fi; \
+		done; \
+	fi; \
+	[ -f "$$LIBFAKETIME" ] || { echo "Error: libfaketime not found. Install it with your package manager."; exit 1; }; \
+	echo "Building mattermost..."; \
+	$(GO) build $(GOFLAGS) -ldflags '$(LDFLAGS)' -tags '$(BUILD_TAGS)' -o $(GOBIN)/mattermost-faketime $(PLATFORM_FILES); \
+	echo "Running mattermost with FAKETIME=$(FAKETIME) (libfaketime: $$LIBFAKETIME)"; \
+	mkdir -p $(BUILD_WEBAPP_DIR)/channels/dist/files; \
+	if [ "$$(uname)" = "Darwin" ]; then \
+		DYLD_INSERT_LIBRARIES="$$LIBFAKETIME" DYLD_FORCE_FLAT_NAMESPACE=1 FAKETIME="$(FAKETIME)" FAKETIME_NO_CACHE=1 \
+			$(GOBIN)/mattermost-faketime $(RUN_IN_BACKGROUND) \
+	else \
+		LD_PRELOAD="$$LIBFAKETIME" FAKETIME="$(FAKETIME)" FAKETIME_NO_CACHE=1 \
+			$(GOBIN)/mattermost-faketime $(RUN_IN_BACKGROUND) \
+	fi
+
+.PHONY: run-server-pgvector
+run-server-pgvector: ## Starts the server with pgvector PostgreSQL image.
+	@MM_USE_PGVECTOR=true $(MAKE) run-server
+
+.PHONY: debug-server
+debug-server: setup-go-work start-docker ## Compile and start server using delve.
+	mkdir -p $(BUILD_WEBAPP_DIR)/channels/dist/files
+	$(DELVE) debug $(PLATFORM_FILES) --build-flags="-ldflags '\
+		-X github.com/mattermost/mattermost/server/public/model.BuildNumber=$(BUILD_NUMBER)\
+		-X \"github.com/mattermost/mattermost/server/public/model.BuildDate=$(BUILD_DATE)\"\
+		-X github.com/mattermost/mattermost/server/public/model.BuildHash=$(BUILD_HASH)\
+		-X github.com/mattermost/mattermost/server/public/model.BuildHashEnterprise=$(BUILD_HASH_ENTERPRISE)\
+		-X github.com/mattermost/mattermost/server/public/model.BuildEnterpriseReady=$(BUILD_ENTERPRISE_READY)'\
+		-tags '$(BUILD_TAGS)'"
+
+.PHONY: debug-server-headless
+debug-server-headless: setup-go-work start-docker ## Debug server from within an IDE like VSCode or IntelliJ.
+	mkdir -p $(BUILD_WEBAPP_DIR)/channels/dist/files
+	$(DELVE) debug --headless --listen=:2345 --api-version=2 --accept-multiclient $(PLATFORM_FILES) --build-flags="-ldflags '\
+		-X github.com/mattermost/mattermost/server/public/model.BuildNumber=$(BUILD_NUMBER)\
+		-X \"github.com/mattermost/mattermost/server/public/model.BuildDate=$(BUILD_DATE)\"\
+		-X github.com/mattermost/mattermost/server/public/model.BuildHash=$(BUILD_HASH)\
+		-X github.com/mattermost/mattermost/server/public/model.BuildHashEnterprise=$(BUILD_HASH_ENTERPRISE)\
+		-X github.com/mattermost/mattermost/server/public/model.BuildEnterpriseReady=$(BUILD_ENTERPRISE_READY)'\
+		-tags '$(BUILD_TAGS)'"
+
+.PHONY: run-node
+run-node: export MM_SERVICESETTINGS_SITEURL=http://localhost:8066
+run-node: export MM_SERVICESETTINGS_LISTENADDRESS=:8066
+run-node: export MM_SERVICESETTINGS_ENABLELOCALMODE=true
+run-node: export MM_SERVICESETTINGS_LOCALMODESOCKETLOCATION=/var/tmp/mattermost_local_node.socket
+run-node: export MM_SQLSETTINGS_DRIVERNAME=postgres
+run-node: export MM_SQLSETTINGS_DATASOURCE=postgres://mmuser:mostest_password@localhost/mattermost_node_test?sslmode=disable&sslmode=disable&connect_timeout=10&binary_parameters=yes
+
+run-node: setup-go-work start-docker ## Runs a shared channel node.
+	@echo Running mattermost node
+
+	$(GO) run $(GOFLAGS) -ldflags '$(LDFLAGS)' -tags '$(BUILD_TAGS)' $(PLATFORM_FILES) $(RUN_IN_BACKGROUND)
+
+.PHONY: run-cli
+run-cli: setup-go-work start-docker ## Runs CLI.
+	@echo Running mattermost for development
+	@echo Example should be like 'make ARGS="-version" run-cli'
+
+	$(GO) run $(GOFLAGS) -ldflags '$(LDFLAGS)' -tags '$(BUILD_TAGS)' $(PLATFORM_FILES) ${ARGS}
+
+.PHONY: run-client
+run-client: client ## Runs the webapp.
+	@echo Running mattermost client for development
+
+	cd $(BUILD_WEBAPP_DIR) && $(MAKE) run
+
+client: ## Sets up a symlink to the compiled files generated by the web app
+	@echo Setting up symlink to client directory
+	ln -nfs $(BUILD_WEBAPP_DIR)/channels/dist client
+
+.PHONY: run-client-fullmap
+run-client-fullmap: client ## Legacy alias to run-client
+	@echo Running mattermost client for development
+
+	cd $(BUILD_WEBAPP_DIR) && $(MAKE) run
+
+.PHONY: run
+run: run-server run-client ## Runs the server and webapp.
+
+.PHONY: run-pgvector
+run-pgvector: ## Runs the server and webapp with pgvector PostgreSQL image.
+	@MM_USE_PGVECTOR=true $(MAKE) run
+
+.PHONY: run-fullmap
+run-fullmap: run-server run-client ## Legacy alias to run
+
+.PHONY: stop-server
+stop-server: ## Stops the server.
+	@echo Stopping mattermost
+
+ifeq ($(BUILDER_GOOS_GOARCH),"windows_amd64")
+	wmic process where "Caption='go.exe' and CommandLine like '%go.exe run%'" call terminate
+	wmic process where "Caption='mattermost.exe' and CommandLine like '%go-build%'" call terminate
+else
+	@for PID in $$(ps -ef | grep "[g]o run" | grep "mattermost" | awk '{ print $$2 }'); do \
+		echo stopping go $$PID; \
+		kill $$PID; \
+	done
+	@for PID in $$(ps -ef | grep "[g]o-build" | grep "mattermost" | awk '{ print $$2 }'); do \
+		echo stopping mattermost $$PID; \
+		kill $$PID; \
+	done
+endif
+
+.PHONY: stop-client
+stop-client: ## Stops the webapp.
+	@echo Stopping mattermost client
+
+	cd $(BUILD_WEBAPP_DIR) && $(MAKE) stop
+
+.PHONY: stop
+stop: stop-server stop-client stop-docker ## Stops server, client and the docker compose.
+
+.PHONY: restart
+restart: restart-server restart-client ## Restarts the server and webapp.
+
+.PHONY: restart-server
+restart-server: | stop-server run-server ## Restarts the mattermost server to pick up development change.
+
+.PHONY: restart-server-pgvector
+restart-server-pgvector: ## Restarts the server with pgvector PostgreSQL image.
+	@MM_USE_PGVECTOR=true $(MAKE) restart-server
+
+.PHONY: restart-haserver
+restart-haserver:
+	@echo Restarting mattermost in an HA topology
+
+	docker compose restart follower2
+	docker compose restart follower
+	docker compose restart leader
+	docker compose restart haproxy
+
+.PHONY: restart-client
+restart-client: | stop-client run-client ## Restarts the webapp.
+
+.PHONY: run-job-server
+run-job-server: setup-go-work ## Runs the background job server.
+	@echo Running job server for development
+	$(GO) run $(GOFLAGS) -ldflags '$(LDFLAGS)' -tags '$(BUILD_TAGS)' $(PLATFORM_FILES) jobserver &
+
+.PHONY: config-ldap
+config-ldap: ## Configures LDAP.
+	@echo Setting up configuration for local LDAP
+
+	# Check if jq is installed
+	@jq --version > /dev/null 2>&1 || (echo "jq is not installed. Please install jq to continue." && exit 1)
+
+	$(eval TMPDIR := $(shell mktemp -d))
+	jq --slurp '.[0] * .[1]' ${CONFIG_FILE_PATH} build/docker/keycloak/ldap.mmsettings.json > ${TMPDIR}/config.json
+	cp ${TMPDIR}/config.json ${CONFIG_FILE_PATH}
+	rm ${TMPDIR}/config.json
+
+.PHONY: config-saml
+config-saml: ## Configures SAML.
+	@echo Setting up configuration for local SAML with keycloak, please ensure your keycloak is running on http://localhost:8484
+
+	# Check if jq is installed
+	@jq --version > /dev/null 2>&1 || (echo "jq is not installed. Please install jq to continue." && exit 1)
+
+	@cp build/docker/keycloak/keycloak.crt ./config/saml-idp.crt
+
+	$(eval TMPDIR := $(shell mktemp -d))
+	jq --slurp '.[0] * .[1]' ${CONFIG_FILE_PATH} build/docker/keycloak/saml.mmsettings.json > ${TMPDIR}/config.json
+	cp ${TMPDIR}/config.json ${CONFIG_FILE_PATH}
+	rm ${TMPDIR}/config.json
+
+.PHONY: config-openid
+config-openid: ## Configures OpenID.
+	@echo Setting up configuration for local OpenID with keycloak, please ensure your keycloak is running on http://localhost:8484
+
+	# Check if jq is installed
+	@jq --version > /dev/null 2>&1 || (echo "jq is not installed. Please install jq to continue." && exit 1)
+
+	$(eval TMPDIR := $(shell mktemp -d))
+	jq --slurp '.[0] * .[1]' ${CONFIG_FILE_PATH} build/docker/keycloak/openid.mmsettings.json > ${TMPDIR}/config.json
+	cp ${TMPDIR}/config.json ${CONFIG_FILE_PATH}
+	rm ${TMPDIR}/config.json
+
+	@echo Finished setting up configuration for local OpenID with keycloak
+
+.PHONY: config-reset
+config-reset: setup-go-work ## Resets the config/config.json file to the default production values.
+	@echo Resetting configuration to production default
+	rm -f config/config.json
+	OUTPUT_CONFIG=$(PWD)/config/config.json $(GO) run $(GOFLAGS) -tags production ./scripts/config_generator
+
+.PHONY: diff-config
+diff-config: ## Compares default configuration between two mattermost versions
+	@./scripts/diff-config.sh
+
+.PHONY: clean
+clean: setup-go-work stop-docker ## Clean up everything except persistent server data.
+	@echo Cleaning
+
+	rm -Rf $(DIST_ROOT)
+	$(GO) clean $(GOFLAGS) -i ./...
+
+	cd $(BUILD_WEBAPP_DIR) && $(MAKE) clean
+
+	find . -type d -name data | xargs rm -rf
+	rm -rf logs
+
+	rm -f mattermost.log
+	rm -f mattermost.log.jsonl
+	rm -f npm-debug.log
+	rm -f .prepare-go
+	rm -f cover.out
+	rm -f ecover.out
+	rm -f *.out
+	rm -f *.test
+	rm -f channels/imports/imports.go
+	rm -f cmd/mattermost/cprofile*.out
+
+.PHONY: nuke
+nuke: clean clean-docker ## Clean plus removes persistent server data.
+	@echo BOOM
+
+	rm -rf data
+	rm -f go.work go.work.sum
+
+.PHONY: setup-mac
+setup-mac: ## Adds macOS hosts entries for Docker.
+	echo $$(boot2docker ip 2> /dev/null) dockerhost | sudo tee -a /etc/hosts
+
+.PHONY: update-dependencies
+update-dependencies: ## Uses go get -u to update all the dependencies while holding back any that require it.
+	@echo Updating Dependencies
+
+ifeq ($(BUILD_ENTERPRISE_READY),true)
+	@echo Enterprise repository detected, temporarily removing external_imports.go
+	mv enterprise/external_imports.go enterprise/external_imports.go.orig
+endif
+
+	# Update all dependencies (does not update across major versions)
+	$(GO) get -u ./...
+
+	# Tidy up
+	$(GO) mod tidy
+
+ifeq ($(BUILD_ENTERPRISE_READY),true)
+	mv enterprise/external_imports.go.orig enterprise/external_imports.go
+endif
+
+.PHONY: install-govet
+install-govet:
+	cd ../tools/mattermost-govet && $(GO) install .
+
+.PHONY: vet
+vet: setup-go-work install-govet ## Run mattermost go vet specific checks
+	$(GO) vet -vettool=$(GOBIN)/mattermost-govet \
+		-structuredLogging \
+		-mlogFieldNaming \
+		-inconsistentReceiverName \
+		-emptyStrCmp \
+		-tFatal \
+		-configtelemetry \
+		-errorAssertions \
+		-requestCtxNaming \
+		-license \
+		-inconsistentReceiverName.ignore=session_serial_gen.go,team_member_serial_gen.go,user_serial_gen.go,utils_serial_gen.go \
+		-noSelectStar \
+		-concurrentIndex \
+		-concurrentIndex.path=./channels/db/migrations/ \
+		-concurrentIndex.minMigration=166 \
+		-sortSlices \
+		./...
+ifeq ($(BUILD_ENTERPRISE_READY),true)
+  ifneq ($(MM_NO_ENTERPRISE_LINT),true)
+	$(GO) vet -vettool=$(GOBIN)/mattermost-govet -structuredLogging -mlogFieldNaming -inconsistentReceiverName -emptyStrCmp -tFatal -configtelemetry -errorAssertions -requestCtxNaming -sortSlices -enterpriseLicense $(BUILD_ENTERPRISE_DIR)/...
+  endif
+endif
+
+.PHONY: vet-fix
+vet-fix: setup-go-work ## Apply the suggested fixes from mattermost go vet checks
+	cd ../tools/mattermost-govet && $(GO) install .
+	$(GO) fix -fixtool=$(GOBIN)/mattermost-govet -mlogFieldNaming ./...
+ifeq ($(BUILD_ENTERPRISE_READY),true)
+  ifneq ($(MM_NO_ENTERPRISE_LINT),true)
+	$(GO) fix -fixtool=$(GOBIN)/mattermost-govet -mlogFieldNaming $(BUILD_ENTERPRISE_DIR)/...
+  endif
+endif
+
+.PHONY: vet-api
+vet-api: export GO := $(GO)
+vet-api: export GOBIN := $(GOBIN)
+vet-api: export ROOT := $(ROOT)
+vet-api: setup-go-work install-govet ## Run mattermost go vet to verify api4 documentation
+	make -C ../api build
+	./scripts/vet-api-check.sh
+
+.PHONY: install-msgp
+install-msgp:
+	$(GO) install github.com/tinylib/msgp@v1.1.6
+
+.PHONY: gen-serialized
+gen-serialized:	export LICENSE_HEADER:=$(LICENSE_HEADER)
+gen-serialized: setup-go-work install-msgp ## Generates serialization methods for hot structs
+	# This tool only works at a file level, not at a package level.
+	# There will be some warnings about "unresolved identifiers",
+	# but that is because of the above problem. Since we are generating
+	# methods for all the relevant files at a package level, all
+	# identifiers will be resolved. An alternative to remove the warnings
+	# would be to temporarily move all the structs to the same file,
+	# but that involves a lot of manual work.
+	$(GOBIN)/msgp -file=./public/model/utils.go -tests=false -o=./public/model/utils_serial_gen.go
+	@echo "$$LICENSE_HEADER" > tmp.go
+	@cat ./public/model/utils_serial_gen.go >> tmp.go
+	@mv tmp.go ./public/model/utils_serial_gen.go
+	$(GOBIN)/msgp -file=./public/model/session.go -tests=false -o=./public/model/session_serial_gen.go
+	@echo "$$LICENSE_HEADER" > tmp.go
+	@cat ./public/model/session_serial_gen.go >> tmp.go
+	@mv tmp.go ./public/model/session_serial_gen.go
+	$(GOBIN)/msgp -file=./public/model/user.go -tests=false -o=./public/model/user_serial_gen.go
+	@echo "$$LICENSE_HEADER" > tmp.go
+	@cat ./public/model/user_serial_gen.go >> tmp.go
+	@mv tmp.go ./public/model/user_serial_gen.go
+	$(GOBIN)/msgp -file=./public/model/team_member.go -tests=false -o=./public/model/team_member_serial_gen.go
+	@echo "$$LICENSE_HEADER" > tmp.go
+	@cat ./public/model/team_member_serial_gen.go >> tmp.go
+	@mv tmp.go ./public/model/team_member_serial_gen.go
+
+.PHONY: todo
+todo: ## Display TODO and FIXME items in the source code.
+	@! ag --ignore Makefile --ignore-dir runtime '(TODO|XXX|FIXME|"FIX ME")[: ]+'
+ifeq ($(BUILD_ENTERPRISE_READY),true)
+	@! ag --ignore Makefile --ignore-dir runtime '(TODO|XXX|FIXME|"FIX ME")[: ]+' $(BUILD_ENTERPRISE_DIR)/
+endif
+
+.PHONY: mmctl-build
+mmctl-build: setup-go-work ## Compiles and generates the mmctl binary
+	$(GO) build $(GOFLAGS) -trimpath -ldflags '$(MMCTL_LDFLAGS)' -o bin/mmctl ./cmd/mmctl
+
+.PHONY: mmctl-docs
+mmctl-docs: setup-go-work ## Generate the mmctl docs
+	rm -rf ./cmd/mmctl/docs
+	cd ./cmd/mmctl && $(GO) run mmctl.go docs
+
+## Help documentation à la https://marmelab.com/blog/2016/02/29/auto-documented-makefile.html
+.PHONY: help
+help:
+	@grep -E '^[0-9a-zA-Z_-]+:.*?## .*$$' ./Makefile | sort | awk 'BEGIN {FS = ":.*?## "}; {printf "\033[36m%-30s\033[0m %s\n", $$1, $$2}'
+	@echo
+	@echo You can modify the default settings for this Makefile creating a file config.mk based on the default-config.mk
+	@echo
+
+.PHONY: migrations-extract
+migrations-extract:
+	@echo Listing migration files
+	@echo "# Autogenerated file to synchronize migrations sequence in the PR workflow, please do not edit." > channels/db/migrations/migrations.list
+	find channels/db/migrations -maxdepth 2 -mindepth 2 | sort >> channels/db/migrations/migrations.list
+
+.PHONY: check-backport-migrations
+check-backport-migrations: ## Fails if a Postgres migration added on top of the base branch was renumbered or renamed relative to master.
+	@echo "Checking for renumbered or renamed migrations"
+	./scripts/check_backport_migrations.sh
+
+.PHONY: test-local-filestore
+test-local-filestore: setup-go-work # Run tests for local filestore
+	$(GO) test ./platform/shared/filestore -run '^TestLocalFileBackend' -v

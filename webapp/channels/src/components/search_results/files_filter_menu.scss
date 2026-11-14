@@ -1,0 +1,18 @@
+.FilesFilterMenu {
+    .MenuWrapper {
+        z-index: 100;
+        align-self: end;
+
+        .action-icon {
+            z-index: 5;
+        }
+    }
+
+    .MenuItem {
+        span.icon {
+            position: absolute;
+            right: 13px;
+            color: var(--button-bg);
+        }
+    }
+}

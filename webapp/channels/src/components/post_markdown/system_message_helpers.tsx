@@ -1,0 +1,732 @@
+// Copyright (c) 2015-present Mattermost, Inc. All Rights Reserved.
+// See LICENSE.txt for license information.
+
+import React from 'react';
+import type {ReactNode} from 'react';
+import {FormattedDate, FormattedMessage, FormattedTime, defineMessage, defineMessages} from 'react-intl';
+
+import type {Channel} from '@mattermost/types/channels';
+import type {Post} from '@mattermost/types/posts';
+import type {Team} from '@mattermost/types/teams';
+import {isStringArray} from '@mattermost/types/utilities';
+
+import {General, Posts} from 'mattermost-redux/constants';
+import {isUserActivityProp} from 'mattermost-redux/utils/post_list';
+import {ensureNumber, ensureString, isPostEphemeral} from 'mattermost-redux/utils/post_utils';
+
+import Markdown from 'components/markdown';
+import CombinedSystemMessage from 'components/post_view/combined_system_message';
+import GMConversionMessage from 'components/post_view/gm_conversion_message/gm_conversion_message';
+import PostAddChannelMember from 'components/post_view/post_add_channel_member';
+
+import type {KindMessages} from 'utils/channel_kind';
+import {isChannelNamesMap, type TextFormattingOptions} from 'utils/text_formatting';
+import {getSiteURL} from 'utils/url';
+
+import type {ChannelKind} from 'types/store/plugins';
+
+export function renderUsername(value: unknown): ReactNode {
+    const verifiedValue = ensureString(value);
+    const username = (verifiedValue[0] === '@') ? verifiedValue : `@${verifiedValue}`;
+
+    const options = {
+        markdown: false,
+    };
+
+    return renderFormattedText(username, options);
+}
+
+function renderFormattedText(value: unknown, options?: Partial<TextFormattingOptions>, post?: Post): ReactNode {
+    const verifiedValue = ensureString(value);
+    return (
+        <Markdown
+            message={verifiedValue}
+            options={options}
+            postId={post && post.id}
+            postType={post && post.type}
+        />
+    );
+}
+
+function renderJoinChannelMessage(post: Post, kind: ChannelKind): ReactNode {
+    const username = renderUsername(post.props.username);
+
+    return (
+        <FormattedMessage
+            {...messages.joined[kind]}
+            values={{username}}
+        />
+    );
+}
+
+function renderGuestJoinChannelMessage(post: Post, hideGuestTags: boolean, kind: ChannelKind): ReactNode {
+    if (hideGuestTags) {
+        return renderJoinChannelMessage(post, kind);
+    }
+    const username = renderUsername(post.props.username);
+
+    return (
+        <FormattedMessage
+            {...messages.guestJoined[kind]}
+            values={{username}}
+        />
+    );
+}
+
+function renderLeaveChannelMessage(post: Post, kind: ChannelKind): ReactNode {
+    const username = renderUsername(post.props.username);
+
+    return (
+        <FormattedMessage
+            {...messages.left[kind]}
+            values={{username}}
+        />
+    );
+}
+
+function renderAddToChannelMessage(post: Post, kind: ChannelKind): ReactNode {
+    const username = renderUsername(post.props.username);
+    const addedUsername = renderUsername(post.props.addedUsername);
+
+    return (
+        <FormattedMessage
+            {...messages.added[kind]}
+            values={{
+                username,
+                addedUsername,
+            }}
+        />
+    );
+}
+
+function renderAddGuestToChannelMessage(post: Post, hideGuestTags: boolean, kind: ChannelKind): ReactNode {
+    if (hideGuestTags) {
+        return renderAddToChannelMessage(post, kind);
+    }
+    const username = renderUsername(post.props.username);
+    const addedUsername = renderUsername(post.props.addedUsername);
+
+    return (
+        <FormattedMessage
+            {...messages.guestAdded[kind]}
+            values={{
+                username,
+                addedUsername,
+            }}
+        />
+    );
+}
+
+function renderRemoveFromChannelMessage(post: Post, kind: ChannelKind): ReactNode {
+    const removedUsername = renderUsername(post.props.removedUsername);
+
+    return (
+        <FormattedMessage
+            {...messages.removed[kind]}
+            values={{
+                removedUsername,
+            }}
+        />
+    );
+}
+
+function renderJoinTeamMessage(post: Post): ReactNode {
+    const username = renderUsername(post.props.username);
+
+    return (
+        <FormattedMessage
+            id='api.team.join_team.post_and_forget'
+            defaultMessage='{username} joined the team.'
+            values={{username}}
+        />
+    );
+}
+
+function renderLeaveTeamMessage(post: Post): ReactNode {
+    const username = renderUsername(post.props.username);
+
+    return (
+        <FormattedMessage
+            id='api.team.leave.left'
+            defaultMessage='{username} left the team.'
+            values={{username}}
+        />
+    );
+}
+
+function renderAddToTeamMessage(post: Post): ReactNode {
+    const username = renderUsername(post.props.username);
+    const addedUsername = renderUsername(post.props.addedUsername);
+
+    return (
+        <FormattedMessage
+            id='api.team.add_member.added'
+            defaultMessage='{addedUsername} added to the team by {username}'
+            values={{
+                username,
+                addedUsername,
+            }}
+        />
+    );
+}
+
+function renderRemoveFromTeamMessage(post: Post): ReactNode {
+    const removedUsername = renderUsername(post.props.username);
+
+    return (
+        <FormattedMessage
+            id='api.team.remove_user_from_team.removed'
+            defaultMessage='{removedUsername} was removed from the team.'
+            values={{
+                removedUsername,
+            }}
+        />
+    );
+}
+
+function renderTeamAccessControlRemovalMessage(post: Post): ReactNode {
+    const teamName = ensureString(post.props?.team_name);
+
+    return (
+        <span className='post--system__access-control'>
+            <i
+                className='icon icon-shield-outline'
+                aria-hidden='true'
+            />
+            <FormattedMessage
+                id='post_body.team_access_control.removed'
+                defaultMessage='You have been removed from {teamName} because you no longer meet the membership requirements.'
+                values={{teamName}}
+            />
+        </span>
+    );
+}
+
+function renderTeamAccessControlAdditionMessage(post: Post): ReactNode {
+    const teamName = ensureString(post.props?.team_name);
+
+    return (
+        <span className='post--system__access-control'>
+            <i
+                className='icon icon-account-plus-outline'
+                aria-hidden='true'
+            />
+            <FormattedMessage
+                id='post_body.team_access_control.added'
+                defaultMessage='You have been added to {teamName} because you now meet the membership requirements.'
+                values={{teamName}}
+            />
+        </span>
+    );
+}
+
+function renderHeaderChangeMessage(post: Post, kind: ChannelKind): ReactNode {
+    if (!post.props.username) {
+        return null;
+    }
+
+    const headerOptions = {
+        channelNamesMap: isChannelNamesMap(post.props?.channel_mentions) ? post.props.channel_mentions : undefined,
+        mentionHighlight: true,
+    };
+
+    const username = renderUsername(post.props.username);
+    const oldHeader = post.props.old_header ? renderFormattedText(post.props.old_header, headerOptions, post) : null;
+    const newHeader = post.props.new_header ? renderFormattedText(post.props.new_header, headerOptions, post) : null;
+
+    if (post.props.new_header) {
+        if (post.props.old_header) {
+            return (
+                <FormattedMessage
+                    {...messages.headerUpdatedFrom[kind]}
+                    values={{
+                        username,
+                        old: oldHeader,
+                        new: newHeader,
+                        strong: (chunks: React.ReactNode) => (<strong>{chunks}</strong>),
+                        br: (x: React.ReactNode) => (<><br/>{x}</>),
+                    }}
+                />
+            );
+        }
+
+        return (
+            <FormattedMessage
+                {...messages.headerUpdatedTo[kind]}
+                values={{
+                    username,
+                    new: newHeader,
+                }}
+            />
+        );
+    } else if (post.props.old_header) {
+        return (
+            <FormattedMessage
+                {...messages.headerRemoved[kind]}
+                values={{
+                    username,
+                    old: oldHeader,
+                }}
+            />
+        );
+    }
+
+    return null;
+}
+
+function renderDisplayNameChangeMessage(post: Post, kind: ChannelKind): ReactNode {
+    if (!(post.props.username && post.props.old_displayname && post.props.new_displayname)) {
+        return null;
+    }
+
+    const username = renderUsername(post.props.username);
+    const oldDisplayName = ensureString(post.props.old_displayname);
+    const newDisplayName = ensureString(post.props.new_displayname);
+
+    return (
+        <FormattedMessage
+            {...messages.displayNameUpdated[kind]}
+            values={{
+                username,
+                old: oldDisplayName,
+                new: newDisplayName,
+            }}
+        />
+    );
+}
+
+function renderConvertChannelToPrivateMessage(post: Post, kind: ChannelKind): ReactNode {
+    if (!(post.props.username)) {
+        return null;
+    }
+
+    const username = renderUsername(post.props.username);
+
+    return (
+        <FormattedMessage
+            {...messages.convertedToPrivate[kind]}
+            values={{
+                username,
+            }}
+        />
+    );
+}
+
+function renderPurposeChangeMessage(post: Post, kind: ChannelKind): ReactNode {
+    if (!post.props.username) {
+        return null;
+    }
+
+    const username = renderUsername(post.props.username);
+    const oldPurpose = ensureString(post.props.old_purpose);
+    const newPurpose = ensureString(post.props.new_purpose);
+
+    if (post.props.new_purpose) {
+        if (post.props.old_purpose) {
+            return (
+                <FormattedMessage
+                    {...messages.purposeUpdatedFrom[kind]}
+                    values={{
+                        username,
+                        old: oldPurpose,
+                        new: newPurpose,
+                    }}
+                />
+            );
+        }
+
+        return (
+            <FormattedMessage
+                {...messages.purposeUpdatedTo[kind]}
+                values={{
+                    username,
+                    new: newPurpose,
+                }}
+            />
+        );
+    } else if (post.props.old_purpose) {
+        return (
+            <FormattedMessage
+                {...messages.purposeRemoved[kind]}
+                values={{
+                    username,
+                    old: oldPurpose,
+                }}
+            />
+        );
+    }
+
+    return null;
+}
+
+function renderChannelDeletedMessage(post: Post, kind: ChannelKind): ReactNode {
+    if (!post.props.username) {
+        return null;
+    }
+
+    const username = renderUsername(post.props.username);
+
+    return (
+        <FormattedMessage
+            {...messages.archived[kind]}
+            values={{username}}
+        />
+    );
+}
+
+function renderChannelUnarchivedMessage(post: Post, kind: ChannelKind): ReactNode {
+    if (!post.props.username) {
+        return null;
+    }
+
+    const username = renderUsername(post.props.username);
+
+    return (
+        <FormattedMessage
+            {...messages.unarchived[kind]}
+            values={{username}}
+        />
+    );
+}
+
+function renderAutoTranslationChangeMessage(post: Post, kind: ChannelKind): ReactNode {
+    if (!post.props.username) {
+        return null;
+    }
+
+    const username = renderUsername(post.props.username);
+    const enabled = post.props.enabled;
+    return (
+        <FormattedMessage
+            {...(enabled ? messages.autoTranslationEnabled[kind] : messages.autoTranslationDisabled[kind])}
+            values={{username}}
+        />
+    );
+}
+
+function renderSharedChannelStateMessage(post: Post, kind: ChannelKind): ReactNode {
+    const state = ensureString(post.props?.shared_channel_state);
+    const workspaceName = ensureString(post.props?.workspace_name);
+
+    if (state === 'shared') {
+        return (
+            <FormattedMessage
+                {...messages.nowShared[kind]}
+                values={{workspaceName}}
+            />
+        );
+    }
+    if (state === 'unshared') {
+        if (workspaceName === '') {
+            return <FormattedMessage {...messages.noLongerSharedUnknown[kind]}/>;
+        }
+        return (
+            <FormattedMessage
+                {...messages.noLongerShared[kind]}
+                values={{workspaceName}}
+            />
+        );
+    }
+    return null;
+}
+
+function renderMeMessage(post: Post): ReactNode {
+    // Trim off the leading and trailing asterisk added to /me messages
+    const message = post.message.replace(/^\*|\*$/g, '');
+
+    return renderFormattedText(message);
+}
+
+const systemMessageRenderers: Record<string, (post: Post, kind: ChannelKind) => ReactNode> = {
+    [Posts.POST_TYPES.JOIN_CHANNEL]: renderJoinChannelMessage,
+    [Posts.POST_TYPES.LEAVE_CHANNEL]: renderLeaveChannelMessage,
+    [Posts.POST_TYPES.ADD_TO_CHANNEL]: renderAddToChannelMessage,
+    [Posts.POST_TYPES.EPHEMERAL_ADD_TO_CHANNEL]: renderAddToChannelMessage,
+    [Posts.POST_TYPES.REMOVE_FROM_CHANNEL]: renderRemoveFromChannelMessage,
+    [Posts.POST_TYPES.JOIN_TEAM]: renderJoinTeamMessage,
+    [Posts.POST_TYPES.LEAVE_TEAM]: renderLeaveTeamMessage,
+    [Posts.POST_TYPES.ADD_TO_TEAM]: renderAddToTeamMessage,
+    [Posts.POST_TYPES.REMOVE_FROM_TEAM]: renderRemoveFromTeamMessage,
+    [Posts.POST_TYPES.ACCESS_CONTROL_TEAM_REMOVAL]: renderTeamAccessControlRemovalMessage,
+    [Posts.POST_TYPES.ACCESS_CONTROL_TEAM_ADDITION]: renderTeamAccessControlAdditionMessage,
+    [Posts.POST_TYPES.HEADER_CHANGE]: renderHeaderChangeMessage,
+    [Posts.POST_TYPES.DISPLAYNAME_CHANGE]: renderDisplayNameChangeMessage,
+    [Posts.POST_TYPES.CONVERT_CHANNEL]: renderConvertChannelToPrivateMessage,
+    [Posts.POST_TYPES.PURPOSE_CHANGE]: renderPurposeChangeMessage,
+    [Posts.POST_TYPES.CHANNEL_DELETED]: renderChannelDeletedMessage,
+    [Posts.POST_TYPES.CHANNEL_UNARCHIVED]: renderChannelUnarchivedMessage,
+    [Posts.POST_TYPES.ME]: renderMeMessage,
+    [Posts.POST_TYPES.AUTO_TRANSLATION_CHANGE]: renderAutoTranslationChangeMessage,
+    [Posts.POST_TYPES.SHARED_CHANNEL_STATE]: renderSharedChannelStateMessage,
+};
+
+export type AddMemberProps = {
+    post_id: string;
+    not_in_channel_user_ids: string[];
+    not_in_groups_usernames: string[];
+    not_in_channel_usernames: string[];
+};
+
+export function isAddMemberProps(v: unknown): v is AddMemberProps {
+    if (typeof v !== 'object' || !v) {
+        return false;
+    }
+
+    if (!('post_id' in v) || typeof v.post_id !== 'string') {
+        return false;
+    }
+
+    if (!('not_in_channel_user_ids' in v) || !isStringArray(v.not_in_channel_user_ids)) {
+        return false;
+    }
+
+    if (!('not_in_groups_usernames' in v) || !isStringArray(v.not_in_groups_usernames)) {
+        return false;
+    }
+
+    if (!('not_in_channel_usernames' in v) || !isStringArray(v.not_in_channel_usernames)) {
+        return false;
+    }
+
+    return true;
+}
+
+export function renderSystemMessage(post: Post, currentTeamName: string, channel: Channel, hideGuestTags: boolean, isUserCanManageMembers?: boolean, isMilitaryTime?: boolean, timezone?: string, kind: ChannelKind = 'channel'): ReactNode {
+    const isEphemeral = isPostEphemeral(post);
+    if (isEphemeral && post.props?.type === Posts.POST_TYPES.REMINDER) {
+        return renderReminderACKMessage(post, currentTeamName, Boolean(isMilitaryTime), timezone);
+    }
+    if (isAddMemberProps(post.props?.add_channel_member)) {
+        if (channel && (channel.type === General.PRIVATE_CHANNEL || channel.type === General.OPEN_CHANNEL) &&
+            isUserCanManageMembers &&
+            isEphemeral
+        ) {
+            const addMemberProps = post.props.add_channel_member;
+            return (
+                <PostAddChannelMember
+                    postId={addMemberProps.post_id}
+                    userIds={addMemberProps.not_in_channel_user_ids}
+                    noGroupsUsernames={addMemberProps.not_in_groups_usernames}
+                    usernames={addMemberProps.not_in_channel_usernames}
+                />
+            );
+        }
+
+        return null;
+    } else if (systemMessageRenderers[post.type]) {
+        return systemMessageRenderers[post.type](post, kind);
+    } else if (post.type === Posts.POST_TYPES.GUEST_JOIN_CHANNEL) {
+        return renderGuestJoinChannelMessage(post, hideGuestTags, kind);
+    } else if (post.type === Posts.POST_TYPES.ADD_GUEST_TO_CHANNEL) {
+        return renderAddGuestToChannelMessage(post, hideGuestTags, kind);
+    } else if (post.type === Posts.POST_TYPES.COMBINED_USER_ACTIVITY && isUserActivityProp(post.props.user_activity)) {
+        const {allUserIds, allUsernames, messageData} = post.props.user_activity;
+
+        return (
+            <CombinedSystemMessage
+                allUserIds={allUserIds}
+                allUsernames={allUsernames}
+                messageData={messageData}
+                channelKind={kind}
+            />
+        );
+    } else if (post.type === Posts.POST_TYPES.GM_CONVERTED_TO_CHANNEL) {
+        // This is rendered via a separate component instead of registering in
+        // systemMessageRenderers because we need to format a list with keeping i18n support
+        // which cannot be done outside a react component.
+        return (
+            <GMConversionMessage post={post}/>
+        );
+    }
+
+    return null;
+}
+
+function renderReminderACKMessage(post: Post, currentTeamName: string, isMilitaryTime: boolean, timezone?: string): ReactNode {
+    const username = renderUsername(post.props.username);
+    const teamUrl = `${getSiteURL()}/${post.props.team_name || currentTeamName}`;
+    const link = `${teamUrl}/pl/${post.props.post_id}`;
+    const permaLink = renderFormattedText(`[${link}](${link})`);
+    const targetTime = ensureNumber(post.props.target_time);
+    const localTime = new Date(targetTime * 1000);
+
+    const reminderTime = (
+        <FormattedTime
+            value={localTime}
+            hour12={!isMilitaryTime}
+            timeZone={timezone}
+        />);
+    const reminderDate = (
+        <FormattedDate
+            value={localTime}
+            day='2-digit'
+            month='short'
+            year='numeric'
+            timeZone={timezone}
+        />);
+    return (
+        <FormattedMessage
+            id={'post.reminder.acknowledgement'}
+            defaultMessage='You will be reminded at {reminderTime}, {reminderDate} about this message from {username}: {permaLink}'
+            values={{
+                reminderTime,
+                reminderDate,
+                username,
+                permaLink,
+            }}
+        />
+    );
+}
+
+export function renderReminderSystemBotMessage(post: Post, currentTeam: Team): ReactNode {
+    const username = post.props.username ? renderUsername(post.props.username) : '';
+    const teamUrl = `${getSiteURL()}/${post.props.team_name || currentTeam.name}`;
+    const link = `${teamUrl}/pl/${post.props.post_id}`;
+    const permaLink = renderFormattedText(`[${link}](${link})`);
+    return (
+        <FormattedMessage
+            id={'post.reminder.systemBot'}
+            defaultMessage="Hi there, here's your reminder about this message from {username}: {permaLink}"
+            values={{
+                username,
+                permaLink,
+            }}
+        />
+    );
+}
+
+// These messages are used by app.MoveThread on the server
+defineMessages({
+    channelMultipleMessages: {
+        id: 'app.post.move_thread_command.channel.multiple_messages',
+        defaultMessage: 'A thread with {numMessages, number} messages has been moved: {link}\n',
+    },
+    channelOneMessage: {
+        id: 'app.post.move_thread_command.channel.one_message',
+        defaultMessage: 'A message has been moved: {link}\n',
+    },
+    dmMultipleMessages: {
+        id: 'app.post.move_thread_command.direct_or_group.multiple_messages',
+        defaultMessage: 'A thread with {numMessages, number} messages has been moved to a Direct/Group Message\n',
+    },
+    dmOneMessage: {
+        id: 'app.post.move_thread_command.direct_or_group.one_message',
+        defaultMessage: 'A message has been moved to a Direct/Group Message\n',
+    },
+    fromAnotherChannel: {
+        id: 'app.post.move_thread.from_another_channel',
+        defaultMessage: 'This thread was moved from another channel',
+    },
+});
+
+export function renderWranglerSystemMessage(post: Post): ReactNode {
+    let values: React.ComponentProps<typeof FormattedMessage>['values'] = {};
+    const id = ensureString(post.props?.TranslationID);
+    const movedThreadPermalink = ensureString(post.props?.MovedThreadPermalink);
+    if (movedThreadPermalink) {
+        values = {
+            link: movedThreadPermalink,
+        };
+        const numMessages = ensureNumber(post.props.NumMessages);
+        if (numMessages > 1) {
+            values.number = numMessages;
+        }
+    }
+    return (
+        <FormattedMessage
+            id={id}
+            defaultMessage={post.message}
+            values={values}
+        />
+    );
+}
+
+// System messages about a channel, named by its kind.
+/* eslint-disable formatjs/enforce-placeholders -- values are passed where each message is rendered */
+const messages = {
+    joined: {
+        channel: defineMessage({id: 'api.channel.join_channel.post_and_forget', defaultMessage: '{username} joined the channel.'}),
+        board: defineMessage({id: 'api.channel.join_channel.post_and_forget.board', defaultMessage: '{username} joined the board.'}),
+    },
+    guestJoined: {
+        channel: defineMessage({id: 'api.channel.guest_join_channel.post_and_forget', defaultMessage: '{username} joined the channel as a guest.'}),
+        board: defineMessage({id: 'api.channel.guest_join_channel.post_and_forget.board', defaultMessage: '{username} joined the board as a guest.'}),
+    },
+    left: {
+        channel: defineMessage({id: 'api.channel.leave.left', defaultMessage: '{username} left the channel.'}),
+        board: defineMessage({id: 'api.channel.leave.left.board', defaultMessage: '{username} left the board.'}),
+    },
+    added: {
+        channel: defineMessage({id: 'api.channel.add_member.added', defaultMessage: '{addedUsername} added to the channel by {username}.'}),
+        board: defineMessage({id: 'api.channel.add_member.added.board', defaultMessage: '{addedUsername} added to the board by {username}.'}),
+    },
+    guestAdded: {
+        channel: defineMessage({id: 'api.channel.add_guest.added', defaultMessage: '{addedUsername} added to the channel as a guest by {username}.'}),
+        board: defineMessage({id: 'api.channel.add_guest.added.board', defaultMessage: '{addedUsername} added to the board as a guest by {username}.'}),
+    },
+    removed: {
+        channel: defineMessage({id: 'api.channel.remove_member.removed', defaultMessage: '{removedUsername} was removed from the channel'}),
+        board: defineMessage({id: 'api.channel.remove_member.removed.board', defaultMessage: '{removedUsername} was removed from the board'}),
+    },
+    headerUpdatedFrom: {
+        channel: defineMessage({id: 'api.channel.post_update_channel_header_message_and_forget.updated_from', defaultMessage: '{username} updated the channel header <br></br><strong>From:</strong> {old} <br></br><strong>To:</strong> {new}'}),
+        board: defineMessage({id: 'api.channel.post_update_channel_header_message_and_forget.updated_from.board', defaultMessage: '{username} updated the board header <br></br><strong>From:</strong> {old} <br></br><strong>To:</strong> {new}'}),
+    },
+    headerUpdatedTo: {
+        channel: defineMessage({id: 'api.channel.post_update_channel_header_message_and_forget.updated_to', defaultMessage: '{username} updated the channel header to: {new}'}),
+        board: defineMessage({id: 'api.channel.post_update_channel_header_message_and_forget.updated_to.board', defaultMessage: '{username} updated the board header to: {new}'}),
+    },
+    headerRemoved: {
+        channel: defineMessage({id: 'api.channel.post_update_channel_header_message_and_forget.removed', defaultMessage: '{username} removed the channel header (was: {old})'}),
+        board: defineMessage({id: 'api.channel.post_update_channel_header_message_and_forget.removed.board', defaultMessage: '{username} removed the board header (was: {old})'}),
+    },
+    displayNameUpdated: {
+        channel: defineMessage({id: 'api.channel.post_update_channel_displayname_message_and_forget.updated_from', defaultMessage: '{username} updated the channel display name from: {old} to: {new}'}),
+        board: defineMessage({id: 'api.channel.post_update_channel_displayname_message_and_forget.updated_from.board', defaultMessage: '{username} updated the board display name from: {old} to: {new}'}),
+    },
+    convertedToPrivate: {
+        channel: defineMessage({id: 'api.channel.post_convert_channel_to_private.updated_from', defaultMessage: '{username} converted the channel from public to private'}),
+        board: defineMessage({id: 'api.channel.post_convert_channel_to_private.updated_from.board', defaultMessage: '{username} converted the board from public to private'}),
+    },
+    purposeUpdatedFrom: {
+        channel: defineMessage({id: 'app.channel.post_update_channel_purpose_message.updated_from', defaultMessage: '{username} updated the channel purpose from: {old} to: {new}'}),
+        board: defineMessage({id: 'app.channel.post_update_channel_purpose_message.updated_from.board', defaultMessage: '{username} updated the board purpose from: {old} to: {new}'}),
+    },
+    purposeUpdatedTo: {
+        channel: defineMessage({id: 'app.channel.post_update_channel_purpose_message.updated_to', defaultMessage: '{username} updated the channel purpose to: {new}'}),
+        board: defineMessage({id: 'app.channel.post_update_channel_purpose_message.updated_to.board', defaultMessage: '{username} updated the board purpose to: {new}'}),
+    },
+    purposeRemoved: {
+        channel: defineMessage({id: 'app.channel.post_update_channel_purpose_message.removed', defaultMessage: '{username} removed the channel purpose (was: {old})'}),
+        board: defineMessage({id: 'app.channel.post_update_channel_purpose_message.removed.board', defaultMessage: '{username} removed the board purpose (was: {old})'}),
+    },
+    archived: {
+        channel: defineMessage({id: 'api.channel.delete_channel.archived', defaultMessage: '{username} archived the channel.'}),
+        board: defineMessage({id: 'api.channel.delete_channel.archived.board', defaultMessage: '{username} archived the board.'}),
+    },
+    unarchived: {
+        channel: defineMessage({id: 'api.channel.restore_channel.unarchived', defaultMessage: '{username} unarchived the channel.'}),
+        board: defineMessage({id: 'api.channel.restore_channel.unarchived.board', defaultMessage: '{username} unarchived the board.'}),
+    },
+    autoTranslationEnabled: {
+        channel: defineMessage({id: 'api.channel.auto_translation_change.message.enabled', defaultMessage: '{username} enabled Auto-translation for this channel. All new messages will appear in your preferred language.'}),
+        board: defineMessage({id: 'api.channel.auto_translation_change.message.enabled.board', defaultMessage: '{username} enabled Auto-translation for this board. All new messages will appear in your preferred language.'}),
+    },
+    autoTranslationDisabled: {
+        channel: defineMessage({id: 'api.channel.auto_translation_change.message.disabled', defaultMessage: '{username} disabled Auto-translation for this channel. All messages will appear in the original language.'}),
+        board: defineMessage({id: 'api.channel.auto_translation_change.message.disabled.board', defaultMessage: '{username} disabled Auto-translation for this board. All messages will appear in the original language.'}),
+    },
+    nowShared: {
+        channel: defineMessage({id: 'shared_channel.system_message.now_shared', defaultMessage: 'This channel is now shared with {workspaceName}.'}),
+        board: defineMessage({id: 'shared_channel.system_message.now_shared.board', defaultMessage: 'This board is now shared with {workspaceName}.'}),
+    },
+    noLongerSharedUnknown: {
+        channel: defineMessage({id: 'shared_channel.system_message.no_longer_shared_unknown', defaultMessage: 'This channel is no longer shared with another workspace.'}),
+        board: defineMessage({id: 'shared_channel.system_message.no_longer_shared_unknown.board', defaultMessage: 'This board is no longer shared with another workspace.'}),
+    },
+    noLongerShared: {
+        channel: defineMessage({id: 'shared_channel.system_message.no_longer_shared', defaultMessage: 'This channel is no longer shared with {workspaceName}.'}),
+        board: defineMessage({id: 'shared_channel.system_message.no_longer_shared.board', defaultMessage: 'This board is no longer shared with {workspaceName}.'}),
+    },
+} satisfies Record<string, KindMessages>;
+/* eslint-enable formatjs/enforce-placeholders */

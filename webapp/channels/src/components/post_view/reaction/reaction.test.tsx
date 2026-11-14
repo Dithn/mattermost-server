@@ -1,0 +1,67 @@
+// Copyright (c) 2015-present Mattermost, Inc. All Rights Reserved.
+// See LICENSE.txt for license information.
+
+import React from 'react';
+
+import type {Reaction as ReactionType} from '@mattermost/types/reactions';
+
+import {renderWithContext, screen, userEvent} from 'tests/react_testing_utils';
+import {TestHelper} from 'utils/test_helper';
+
+import ReactionComponent from './reaction';
+
+jest.mock('./reaction_tooltip', () => {
+    return {
+        __esModule: true,
+        default: ({children, onShow}: any) => (
+            <div
+                data-testid='reaction-tooltip'
+                onMouseEnter={onShow}
+            >{children}</div>
+        ),
+    };
+});
+
+describe('components/post_view/Reaction', () => {
+    const post = TestHelper.getPostMock({
+        id: 'post_id',
+    });
+    const reactions: ReactionType[] = [{
+        user_id: 'user_id_2',
+        post_id: post.id,
+        emoji_name: ':smile:',
+        create_at: 0,
+    }, {
+        user_id: 'user_id_3',
+        post_id: post.id,
+        emoji_name: ':smile:',
+        create_at: 0}];
+    const emojiName = 'smile';
+    const actions = {
+        addReaction: jest.fn(),
+        getMissingProfilesByIds: jest.fn(),
+        removeReaction: jest.fn(),
+    };
+
+    const baseProps = {
+        canAddReactions: true,
+        canRemoveReactions: true,
+        post,
+        currentUserReacted: false,
+        emojiName,
+        reactionCount: 2,
+        reactions,
+        emojiImageUrl: 'emoji_image_url',
+        actions,
+    };
+
+    test('should have called actions.getMissingProfilesByIds when loadMissingProfiles is called', async () => {
+        renderWithContext(<ReactionComponent {...baseProps}/>);
+
+        const tooltipTrigger = screen.getByTestId('reaction-tooltip');
+        await userEvent.hover(tooltipTrigger);
+
+        expect(actions.getMissingProfilesByIds).toHaveBeenCalledTimes(1);
+        expect(actions.getMissingProfilesByIds).toHaveBeenCalledWith([reactions[0].user_id, reactions[1].user_id]);
+    });
+});

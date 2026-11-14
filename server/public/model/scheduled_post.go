@@ -1,0 +1,209 @@
+// Copyright (c) 2015-present Mattermost, Inc. All Rights Reserved.
+// See LICENSE.txt for license information.
+
+package model
+
+import (
+	"fmt"
+	"net/http"
+	"time"
+)
+
+const (
+	ScheduledPostErrorUnknownError            = "unknown"
+	ScheduledPostErrorCodeChannelArchived     = "channel_archived"
+	ScheduledPostErrorCodeRestrictedDM        = "restricted_dm"
+	ScheduledPostErrorCodeChannelNotFound     = "channel_not_found"
+	ScheduledPostErrorCodeUserDoesNotExist    = "user_missing"
+	ScheduledPostErrorCodeUserDeleted         = "user_deleted"
+	ScheduledPostErrorCodeNoChannelPermission = "no_channel_permission"
+	ScheduledPostErrorNoChannelMember         = "no_channel_member"
+	ScheduledPostErrorThreadDeleted           = "thread_deleted"
+	ScheduledPostErrorUnableToSend            = "unable_to_send"
+	ScheduledPostErrorInvalidPost             = "invalid_post"
+)
+
+// allow scheduled posts to be created up to
+// this much time in the past. While this ir primarily added for reliable test cases,
+// it also helps with flaky and slow network connection between the client and the server,
+const scheduledPostMaxTimeGap = -5000
+
+type ScheduledPost struct {
+	Draft
+	Id             string `json:"id"`
+	ScheduledAt    int64  `json:"scheduled_at"`
+	ProcessedAt    int64  `json:"processed_at"`
+	ErrorCode      string `json:"error_code"`
+	RepeatType     string `json:"repeat_type"`
+	RepeatTimezone string `json:"repeat_timezone"`
+}
+
+func (s *ScheduledPost) IsValid(maxMessageSize int) *AppError {
+	draftAppErr := s.Draft.IsValid(maxMessageSize)
+	if draftAppErr != nil {
+		return draftAppErr
+	}
+
+	return s.BaseIsValid()
+}
+
+func (s *ScheduledPost) BaseIsValid() *AppError {
+	if draftAppErr := s.Draft.BaseIsValid(); draftAppErr != nil {
+		return draftAppErr
+	}
+
+	if s.Id == "" {
+		return NewAppError("ScheduledPost.IsValid", "model.scheduled_post.is_valid.id.app_error", nil, "id="+s.Id, http.StatusBadRequest)
+	}
+
+	if len(s.Message) == 0 && len(s.FileIds) == 0 {
+		return NewAppError("ScheduledPost.IsValid", "model.scheduled_post.is_valid.empty_post.app_error", nil, "id="+s.Id, http.StatusBadRequest)
+	}
+
+	if (s.ScheduledAt - GetMillis()) < scheduledPostMaxTimeGap {
+		return NewAppError("ScheduledPost.IsValid", "model.scheduled_post.is_valid.scheduled_at.app_error", nil, "id="+s.Id, http.StatusBadRequest)
+	}
+
+	if s.ProcessedAt < 0 {
+		return NewAppError("ScheduledPost.IsValid", "model.scheduled_post.is_valid.processed_at.app_error", nil, "id="+s.Id, http.StatusBadRequest)
+	}
+
+	switch s.RepeatType {
+	case ScheduledPostRepeatTypeNone, ScheduledPostRepeatTypeWeekly:
+	default:
+		return NewAppError("ScheduledPost.IsValid", "model.scheduled_post.is_valid.repeat_type.app_error", nil, "id="+s.Id+", repeat_type="+s.RepeatType, http.StatusBadRequest)
+	}
+
+	if s.RepeatType == ScheduledPostRepeatTypeWeekly {
+		// Files are bound to the first post they're attached to, so later occurrences
+		// would silently send without them.
+		if len(s.FileIds) > 0 {
+			return NewAppError("ScheduledPost.IsValid", "model.scheduled_post.is_valid.repeat_files.app_error", nil, "id="+s.Id, http.StatusBadRequest)
+		}
+		// Burn-on-read is meant for messages that do not live indefinitely on the server - saving
+		// a weekly recurring version of that content is antithetical to the purpose of that feature.
+		if s.Type == PostTypeBurnOnRead {
+			return NewAppError("ScheduledPost.IsValid", "model.scheduled_post.is_valid.repeat_burn_on_read.app_error", nil, "id="+s.Id, http.StatusBadRequest)
+		}
+		if s.RepeatTimezone == "" {
+			return NewAppError("ScheduledPost.IsValid", "model.scheduled_post.is_valid.repeat_timezone.app_error", nil, "id="+s.Id, http.StatusBadRequest)
+		}
+		// "Local" loads successfully but depends on each server's host timezone; a persisted
+		// recurring schedule needs a fixed zone (UTC or an IANA name).
+		if s.RepeatTimezone == "Local" {
+			return NewAppError("ScheduledPost.IsValid", "model.scheduled_post.is_valid.repeat_timezone_invalid.app_error", nil, "id="+s.Id+", repeat_timezone="+s.RepeatTimezone, http.StatusBadRequest)
+		}
+		if _, err := time.LoadLocation(s.RepeatTimezone); err != nil {
+			return NewAppError("ScheduledPost.IsValid", "model.scheduled_post.is_valid.repeat_timezone_invalid.app_error", nil, "id="+s.Id+", repeat_timezone="+s.RepeatTimezone+", "+err.Error(), http.StatusBadRequest)
+		}
+	}
+
+	return nil
+}
+
+func (s *ScheduledPost) PreSave() {
+	if s.Id == "" {
+		s.Id = NewId()
+	}
+
+	s.ProcessedAt = 0
+	s.ErrorCode = ""
+
+	s.Draft.PreSave()
+}
+
+func (s *ScheduledPost) PreUpdate() {
+	s.Draft.UpdateAt = GetMillis()
+	s.Draft.PreCommit()
+}
+
+// ToPost converts a scheduled post to a regular, mattermost post object.
+func (s *ScheduledPost) ToPost() (*Post, error) {
+	post := &Post{
+		UserId:    s.UserId,
+		ChannelId: s.ChannelId,
+		Message:   s.Message,
+		FileIds:   s.FileIds,
+		RootId:    s.RootId,
+		Metadata:  s.Metadata,
+		Type:      s.Type,
+	}
+
+	for key, value := range s.GetProps() {
+		post.AddProp(key, value)
+	}
+
+	if len(s.Priority) > 0 {
+		priority, ok := s.Priority["priority"].(string)
+		if !ok {
+			return nil, fmt.Errorf(`ScheduledPost.ToPost: priority is not a string. ScheduledPost.Priority: %v`, s.Priority)
+		}
+
+		requestedAck, ok := s.Priority["requested_ack"].(bool)
+		if !ok {
+			return nil, fmt.Errorf(`ScheduledPost.ToPost: requested_ack is not a bool. ScheduledPost.Priority: %v`, s.Priority)
+		}
+
+		persistentNotifications, ok := s.Priority["persistent_notifications"].(bool)
+		if !ok {
+			return nil, fmt.Errorf(`ScheduledPost.ToPost: persistent_notifications is not a bool. ScheduledPost.Priority: %v`, s.Priority)
+		}
+
+		if post.Metadata == nil {
+			post.Metadata = &PostMetadata{}
+		}
+
+		post.Metadata.Priority = &PostPriority{
+			Priority:                new(priority),
+			RequestedAck:            new(requestedAck),
+			PersistentNotifications: new(persistentNotifications),
+		}
+	}
+
+	return post, nil
+}
+
+func (s *ScheduledPost) Auditable() map[string]any {
+	var metaData map[string]any
+	if s.Metadata != nil {
+		metaData = s.Metadata.Auditable()
+	}
+
+	return map[string]any{
+		"id":              s.Id,
+		"create_at":       s.CreateAt,
+		"update_at":       s.UpdateAt,
+		"user_id":         s.UserId,
+		"channel_id":      s.ChannelId,
+		"root_id":         s.RootId,
+		"props":           s.GetProps(),
+		"file_ids":        s.FileIds,
+		"metadata":        metaData,
+		"repeat_type":     s.RepeatType,
+		"repeat_timezone": s.RepeatTimezone,
+	}
+}
+
+func (s *ScheduledPost) RestoreNonUpdatableFields(originalScheduledPost *ScheduledPost) {
+	s.Id = originalScheduledPost.Id
+	s.CreateAt = originalScheduledPost.CreateAt
+	s.UserId = originalScheduledPost.UserId
+	s.ChannelId = originalScheduledPost.ChannelId
+	s.RootId = originalScheduledPost.RootId
+	s.Type = originalScheduledPost.Type
+}
+
+func (s *ScheduledPost) SanitizeInput() {
+	s.CreateAt = 0
+
+	if s.Metadata != nil {
+		s.Metadata.Embeds = nil
+	}
+}
+
+func (s *ScheduledPost) GetPriority() *PostPriority {
+	if s.Metadata == nil {
+		return nil
+	}
+	return s.Metadata.Priority
+}

@@ -1,0 +1,10 @@
+// AdminSectionPanel is a thin schema adapter around Compass-backed AdminPanel.
+// Keep only nesting helpers; outer chrome comes from AdminPanel / Compass.
+.AdminSectionPanel {
+    // Remove redundant nested panel chrome when settings embed another AdminPanel.
+    .AdminPanel {
+        border: none;
+        margin: 0;
+        box-shadow: none;
+    }
+}

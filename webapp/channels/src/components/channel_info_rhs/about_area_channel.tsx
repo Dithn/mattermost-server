@@ -1,0 +1,212 @@
+// Copyright (c) 2015-present Mattermost, Inc. All Rights Reserved.
+// See LICENSE.txt for license information.
+
+import React from 'react';
+import {defineMessage, useIntl} from 'react-intl';
+import styled from 'styled-components';
+
+import type {Channel} from '@mattermost/types/channels';
+
+import ChannelInfoAttributes from 'components/channel_attributes/channel_info_attributes';
+import CopyButton from 'components/copy_button';
+import Markdown from 'components/markdown';
+
+import {useChannelKind} from 'hooks/useChannelKind';
+import type {KindMessages} from 'utils/channel_kind';
+
+import EditableArea from './components/editable_area';
+import LineLimiter from './components/linelimiter';
+
+const ChannelName = styled.div`
+    margin-bottom: 12px;
+    font-size: 20px;
+    font-family: Metropolis, sans-serif;
+    font-weight: 600;
+    letter-spacing: -0.01em;
+`;
+
+const ChannelId = styled.div`
+    padding: 4px 0;
+    margin-bottom: 8px;
+    font-size: 11px;
+    line-height: 16px;
+    letter-spacing: 0.02em;
+    color: rgba(var(--center-channel-color-rgb), 0.75);
+    &:not(:last-child) {
+        margin-bottom: 0px;
+    }
+    .post-code__clipboard {
+        opacity: 0;
+    }
+    &:hover .post-code__clipboard {
+        opacity: 1;
+    }
+`;
+
+const ChannelPurpose = styled.div`
+    margin-bottom: 12px;
+    &.ChannelPurpose--is-dm {
+        margin-bottom: 16px;
+    }
+`;
+
+const ChannelDescriptionHeading = styled.div`
+    color: rgba(var(--center-channel-color-rgb), 0.75);
+    font-size: 11px;
+    font-style: normal;
+    font-weight: 600;
+    line-height: 16px;
+    letter-spacing: 0.11px;
+    text-transform: uppercase;
+    padding: 6px 0;
+`;
+
+const ChannelHeader = styled.div`
+    margin-bottom: 12px;
+`;
+
+const SmallCopyButton = styled(CopyButton)`
+    i {
+        font-size: 14px;
+        margin-left: 4px;
+        color: rgba(var(--center-channel-color-rgb), 0.64);
+
+        &:hover {
+            color: rgba(var(--center-channel-color-rgb), 0.88);
+        }
+    }
+`;
+
+interface Props {
+    channel: Channel;
+    canEditChannelProperties: boolean;
+    actions: {
+        editChannelName: () => void;
+        editChannelPurpose: () => void;
+        editChannelHeader: () => void;
+    };
+}
+
+const messages = {
+    rename: {
+        channel: defineMessage({id: 'channel_info_rhs.about_area.edit_channel_name', defaultMessage: 'Rename channel'}),
+        board: defineMessage({id: 'channel_info_rhs.about_area.edit_channel_name.board', defaultMessage: 'Rename board'}),
+    },
+    purposeHeading: {
+        channel: defineMessage({id: 'channel_info_rhs.about_area.channel_purpose.heading', defaultMessage: 'Channel Purpose'}),
+        board: defineMessage({id: 'channel_info_rhs.about_area.channel_purpose.heading.board', defaultMessage: 'Board Purpose'}),
+    },
+    editPurpose: {
+        channel: defineMessage({id: 'channel_info_rhs.about_area.edit_channel_purpose', defaultMessage: 'Edit channel purpose'}),
+        board: defineMessage({id: 'channel_info_rhs.about_area.edit_channel_purpose.board', defaultMessage: 'Edit board purpose'}),
+    },
+    addPurpose: {
+        channel: defineMessage({id: 'channel_info_rhs.about_area.add_channel_purpose', defaultMessage: 'Add a channel purpose'}),
+        board: defineMessage({id: 'channel_info_rhs.about_area.add_channel_purpose.board', defaultMessage: 'Add a board purpose'}),
+    },
+    headerHeading: {
+        channel: defineMessage({id: 'channel_info_rhs.about_area.channel_header.heading', defaultMessage: 'Channel Header'}),
+        board: defineMessage({id: 'channel_info_rhs.about_area.channel_header.heading.board', defaultMessage: 'Board Header'}),
+    },
+    editHeader: {
+        channel: defineMessage({id: 'channel_info_rhs.about_area.edit_channel_header', defaultMessage: 'Edit channel header'}),
+        board: defineMessage({id: 'channel_info_rhs.about_area.edit_channel_header.board', defaultMessage: 'Edit board header'}),
+    },
+    addHeader: {
+        channel: defineMessage({id: 'channel_info_rhs.about_area.add_channel_header', defaultMessage: 'Add a channel header'}),
+        board: defineMessage({id: 'channel_info_rhs.about_area.add_channel_header.board', defaultMessage: 'Add a board header'}),
+    },
+    handle: {
+        channel: defineMessage({id: 'channel_info_rhs.about_area_handle', defaultMessage: 'Channel handle:'}),
+        board: defineMessage({id: 'channel_info_rhs.about_area_handle.board', defaultMessage: 'Board handle:'}),
+    },
+} satisfies Record<string, KindMessages>;
+
+const AboutAreaChannel = ({channel, canEditChannelProperties, actions}: Props) => {
+    const {formatMessage} = useIntl();
+    const channelKind = useChannelKind(channel);
+
+    const renameLabel = formatMessage(messages.rename[channelKind]);
+
+    return (
+        <>
+            <ChannelName>
+                <EditableArea
+                    editable={canEditChannelProperties}
+                    content={<div>{channel.display_name}</div>}
+                    onEdit={actions.editChannelName}
+                    editTooltip={renameLabel}
+                    emptyLabel={renameLabel}
+                />
+            </ChannelName>
+
+            <ChannelInfoAttributes channelId={channel.id}/>
+
+            {(channel.purpose || canEditChannelProperties) && (
+                <ChannelPurpose>
+                    <ChannelDescriptionHeading>
+                        {formatMessage(messages.purposeHeading[channelKind])}
+                    </ChannelDescriptionHeading>
+                    <EditableArea
+                        editable={canEditChannelProperties}
+                        content={channel.purpose && (
+                            <LineLimiter
+                                maxLines={4}
+                                lineHeight={20}
+                                moreText={formatMessage({id: 'channel_info_rhs.about_area.channel_purpose.line_limiter.more', defaultMessage: 'more'})}
+                                lessText={formatMessage({id: 'channel_info_rhs.about_area.channel_purpose.line_limiter.less', defaultMessage: 'less'})}
+                            >
+                                <Markdown message={channel.purpose}/>
+                            </LineLimiter>
+                        )}
+                        onEdit={actions.editChannelPurpose}
+                        editTooltip={formatMessage(messages.editPurpose[channelKind])}
+                        emptyLabel={formatMessage(messages.addPurpose[channelKind])}
+                    />
+                </ChannelPurpose>
+            )}
+
+            {(channel.header || canEditChannelProperties) && (
+                <ChannelHeader>
+                    <ChannelDescriptionHeading>
+                        {formatMessage(messages.headerHeading[channelKind])}
+                    </ChannelDescriptionHeading>
+                    <EditableArea
+                        content={channel.header && (
+                            <LineLimiter
+                                maxLines={4}
+                                lineHeight={20}
+                                moreText={formatMessage({id: 'channel_info_rhs.about_area.channel_header.line_limiter.more', defaultMessage: 'more'})}
+                                lessText={formatMessage({id: 'channel_info_rhs.about_area.channel_header.line_limiter.less', defaultMessage: 'less'})}
+                            >
+                                <Markdown message={channel.header}/>
+                            </LineLimiter>
+                        )}
+                        editable={canEditChannelProperties}
+                        onEdit={actions.editChannelHeader}
+                        editTooltip={formatMessage(messages.editHeader[channelKind])}
+                        emptyLabel={formatMessage(messages.addHeader[channelKind])}
+                    />
+                </ChannelHeader>
+            )}
+
+            <ChannelId>
+                {formatMessage(messages.handle[channelKind])} {channel.name}
+                <SmallCopyButton
+                    content={channel.name}
+                    isForText={true}
+                />
+            </ChannelId>
+            <ChannelId>
+                {formatMessage({id: 'channel_info_rhs.about_area_id', defaultMessage: 'ID:'})} {channel.id}
+                <SmallCopyButton
+                    content={channel.id}
+                    isForText={true}
+                />
+            </ChannelId>
+
+        </>
+    );
+};
+
+export default AboutAreaChannel;

@@ -1,0 +1,29 @@
+// Copyright (c) 2015-present Mattermost, Inc. All Rights Reserved.
+// See LICENSE.txt for license information.
+
+import React from 'react';
+
+import {render} from 'tests/react_testing_utils';
+
+import RootPortal from './root_portal';
+
+describe('components/RootPortal', () => {
+    beforeEach(() => {
+        // Quick fix to disregard console error when unmounting a component
+        console.error = jest.fn();
+    });
+
+    test('should render', () => {
+        const rootPortalDiv = document.createElement('div');
+        rootPortalDiv.id = 'root-portal';
+
+        const {getByText} = render(
+            <RootPortal>
+                <div>{'Testing Portal'}</div>
+            </RootPortal>,
+            {container: document.body.appendChild(rootPortalDiv)},
+        );
+
+        expect(getByText('Testing Portal')).toBeVisible();
+    });
+});

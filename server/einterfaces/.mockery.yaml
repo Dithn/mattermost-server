@@ -1,0 +1,14 @@
+with-expecter: false
+resolve-type-alias: false
+packages:
+  github.com/mattermost/mattermost/server/v8/einterfaces:
+    config:
+      all: true
+      dir: "einterfaces/mocks"
+      filename: "{{.InterfaceName}}.go"
+      mockname: "{{.InterfaceName}}"
+      outpkg: mocks
+      recursive: true
+      exclude:
+        - mocks
+      note: "Regenerate this file using `make einterfaces-mocks`."

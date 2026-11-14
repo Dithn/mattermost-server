@@ -1,0 +1,84 @@
+// Copyright (c) 2015-present Mattermost, Inc. All Rights Reserved.
+// See LICENSE.txt for license information.
+
+import React, {useEffect, type JSX} from 'react';
+import {useIntl} from 'react-intl';
+import {useDispatch, useSelector} from 'react-redux';
+
+import {Button} from '@mattermost/compass-ui/components/button';
+import {WithTooltip} from '@mattermost/shared/components/tooltip';
+
+import {getCloudProducts, getCloudSubscription} from 'mattermost-redux/actions/cloud';
+import {getCloudSubscription as selectCloudSubscription, isCurrentLicenseCloud} from 'mattermost-redux/selectors/entities/cloud';
+import {getConfig, getLicense} from 'mattermost-redux/selectors/entities/general';
+import {isCurrentUserSystemAdmin} from 'mattermost-redux/selectors/entities/users';
+
+import useOpenPricingModal from 'components/common/hooks/useOpenPricingModal';
+
+const PlanUpgradeButton = (): JSX.Element | null => {
+    const dispatch = useDispatch();
+    const {formatMessage} = useIntl();
+
+    const {openPricingModal, isAirGapped} = useOpenPricingModal();
+    const isCloud = useSelector(isCurrentLicenseCloud);
+
+    useEffect(() => {
+        if (isCloud) {
+            dispatch(getCloudSubscription());
+            dispatch(getCloudProducts());
+        }
+    }, [isCloud]);
+
+    const isAdmin = useSelector(isCurrentUserSystemAdmin);
+    const subscription = useSelector(selectCloudSubscription);
+    const config = useSelector(getConfig);
+    const license = useSelector(getLicense);
+
+    const isEnterpriseTrial = subscription?.is_free_trial === 'true';
+
+    const isSelfHostedEnterpriseTrial = !isCloud && license.IsTrial === 'true';
+    const isSelfHostedStarter = license.IsLicensed === 'false';
+    const isEnterpriseReady = config.BuildEnterpriseReady === 'true';
+
+    if (!isAdmin) {
+        return null;
+    }
+
+    // If not on Enterprise edition, don't show
+    if (!isEnterpriseReady) {
+        return null;
+    }
+
+    // for cloud, only show when on the enterprise trial
+    if (isCloud && !isEnterpriseTrial) {
+        return null;
+    }
+
+    // for non cloud, only show when subscribed to self hosted starter or self hosted enterprise trial plans
+    if (!isCloud && !(isSelfHostedStarter || isSelfHostedEnterpriseTrial)) {
+        return null;
+    }
+
+    // Don't show the button if air-gapped
+    if (isAirGapped) {
+        return null;
+    }
+
+    return (
+        <WithTooltip
+            title={formatMessage({id: 'pricing_modal.btn.tooltip', defaultMessage: 'Only visible to system admins'})}
+            forcedPlacement='bottom'
+        >
+            <Button
+                id='UpgradeButton'
+                aria-haspopup='dialog'
+                onClick={() => openPricingModal()}
+                emphasis='primary'
+                size='x-small'
+            >
+                {formatMessage({id: 'pricing_modal.btn.viewPlans', defaultMessage: 'View plans'})}
+            </Button>
+        </WithTooltip>);
+};
+
+export default PlanUpgradeButton;

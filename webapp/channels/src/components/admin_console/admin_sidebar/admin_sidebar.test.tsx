@@ -1,0 +1,318 @@
+// Copyright (c) 2015-present Mattermost, Inc. All Rights Reserved.
+// See LICENSE.txt for license information.
+
+import React from 'react';
+
+import type {ExperimentalSettings, PluginSettings} from '@mattermost/types/config';
+
+import {RESOURCE_KEYS} from 'mattermost-redux/constants/permissions_sysconsole';
+
+import AdminDefinition from 'components/admin_console/admin_definition';
+import AdminSidebar from 'components/admin_console/admin_sidebar/admin_sidebar';
+import type {Props as OriginalProps} from 'components/admin_console/admin_sidebar/admin_sidebar';
+
+import {samplePlugin1} from 'tests/helpers/admin_console_plugin_index_sample_pluings';
+import {renderWithContext, screen, userEvent} from 'tests/react_testing_utils';
+import {generateIndex} from 'utils/admin_console_index';
+
+jest.mock('utils/utils', () => {
+    const original = jest.requireActual('utils/utils');
+    return {
+        ...original,
+        isMobile: jest.fn(() => true),
+    };
+});
+
+jest.mock('utils/admin_console_index');
+
+type Props = Omit<OriginalProps, 'intl'>;
+
+describe('components/AdminSidebar', () => {
+    const defaultProps: Omit<Props, 'intl'> = {
+        license: {},
+        config: {
+            ExperimentalSettings: {
+                RestrictSystemAdmin: false,
+            } as ExperimentalSettings,
+            PluginSettings: {
+                Enable: true,
+                EnableUploads: true,
+            } as PluginSettings,
+            FeatureFlags: {},
+        },
+        adminDefinition: AdminDefinition,
+        buildEnterpriseReady: false,
+        navigationBlocked: false,
+        siteName: 'test snap',
+        isCurrentUserSystemAdmin: true,
+        plugins: {
+            plugin_0: {
+                active: false,
+                description: 'The plugin 0.',
+                id: 'plugin_0',
+                name: 'Plugin 0',
+                version: '0.1.0',
+                settings_schema: {
+                    footer: 'This is a footer',
+                    header: 'This is a header',
+                    settings: [],
+                },
+                webapp: {bundle_path: 'webapp/dist/main.js'},
+            },
+        },
+        onSearchChange: jest.fn(),
+        actions: {
+            getPlugins: jest.fn(),
+        },
+        consoleAccess: {
+            read: {
+                about: true,
+                reporting: true,
+                environment: true,
+                site_configuration: true,
+                authentication: true,
+                plugins: true,
+                integrations: true,
+                compliance: true,
+            },
+            write: {
+                about: true,
+                reporting: true,
+                environment: true,
+                site_configuration: true,
+                authentication: true,
+                plugins: true,
+                integrations: true,
+                compliance: true,
+            },
+        },
+        cloud: {
+            limits: {
+                limitsLoaded: false,
+                limits: {},
+            },
+            errors: {},
+        },
+        showTaskList: false,
+    };
+
+    Object.keys(RESOURCE_KEYS).forEach((key) => {
+        Object.values(RESOURCE_KEYS[key as keyof typeof RESOURCE_KEYS]).forEach((value) => {
+            defaultProps.consoleAccess = {
+                ...defaultProps.consoleAccess,
+                read: {
+                    ...defaultProps.consoleAccess.read,
+                    [value]: true,
+                },
+                write: {
+                    ...defaultProps.consoleAccess.write,
+                    [value]: true,
+                },
+            };
+        });
+    });
+
+    test('should not show Workspace Optimization when Cloud license feature is enabled', () => {
+        const props = {
+            ...defaultProps,
+            license: {
+                IsLicensed: 'true',
+                Cloud: 'true',
+            },
+        };
+        renderWithContext(<AdminSidebar {...props}/>);
+        expect(screen.queryByText('Workspace Optimization')).not.toBeInTheDocument();
+    });
+
+    describe('Site health and Workspace Optimization', () => {
+        const renderSidebar = (skuShortName: string, healthDashboard: boolean) => {
+            const props = {
+                ...defaultProps,
+                license: {IsLicensed: 'true', SkuShortName: skuShortName},
+                config: {
+                    ...defaultProps.config,
+                    FeatureFlags: {HealthDashboard: healthDashboard},
+                },
+            };
+            renderWithContext(<AdminSidebar {...props}/>);
+        };
+
+        test('shows Site health and not Workspace Optimization with the flag on and an Enterprise license', () => {
+            renderSidebar('enterprise', true);
+            expect(screen.getByText('Site health')).toBeInTheDocument();
+            expect(screen.queryByText('Workspace Optimization')).not.toBeInTheDocument();
+        });
+
+        test('shows Workspace Optimization and not Site health with the flag off', () => {
+            renderSidebar('enterprise', false);
+            expect(screen.getByText('Workspace Optimization')).toBeInTheDocument();
+            expect(screen.queryByText('Site health')).not.toBeInTheDocument();
+        });
+
+        test('shows Workspace Optimization and not Site health with the flag on below Enterprise', () => {
+            renderSidebar('professional', true);
+            expect(screen.getByText('Workspace Optimization')).toBeInTheDocument();
+            expect(screen.queryByText('Site health')).not.toBeInTheDocument();
+        });
+    });
+
+    test('places Session Attributes immediately after Attribute Management', () => {
+        const props = {
+            ...defaultProps,
+            license: {
+                IsLicensed: 'true',
+                SkuShortName: 'advanced',
+            },
+            config: {
+                ...defaultProps.config,
+                FeatureFlags: {
+                    SessionAttributes: true,
+                },
+            },
+            buildEnterpriseReady: true,
+        };
+
+        renderWithContext(<AdminSidebar {...props}/>);
+
+        const systemAttributes = screen.getByTestId('system_attributes');
+        const titles = Array.from(systemAttributes.querySelectorAll('.sidebar-section-title__text')).map((el) => el.textContent);
+        const attributeManagementIndex = titles.indexOf('Attribute Management');
+        const sessionAttributesIndex = titles.indexOf('Session Attributes');
+
+        expect(attributeManagementIndex).toBeGreaterThan(-1);
+        expect(sessionAttributesIndex).toBe(attributeManagementIndex + 1);
+    });
+
+    describe('generateIndex', () => {
+        const props: Props = {
+            license: {},
+            config: {
+                ...defaultProps.config,
+                ExperimentalSettings: {
+                    RestrictSystemAdmin: false,
+                } as ExperimentalSettings,
+                PluginSettings: {
+                    Enable: true,
+                    EnableUploads: true,
+                } as PluginSettings,
+            },
+            adminDefinition: AdminDefinition,
+            buildEnterpriseReady: true,
+            navigationBlocked: false,
+            siteName: 'test snap',
+            isCurrentUserSystemAdmin: true,
+            plugins: {
+                'mattermost-autolink': samplePlugin1,
+            },
+            onSearchChange: jest.fn(),
+            actions: {
+                getPlugins: jest.fn(),
+            },
+            consoleAccess: {...defaultProps.consoleAccess},
+            cloud: {...defaultProps.cloud},
+            showTaskList: false,
+        };
+
+        beforeEach(() => {
+            (generateIndex as jest.Mock).mockReset();
+        });
+
+        test('should refresh the index in case idx is already present and there is a change in plugins or adminDefinition prop', async () => {
+            const idx = {search: jest.fn().mockReturnValue([])};
+            (generateIndex as jest.Mock).mockReturnValue(idx);
+
+            const {container, rerender} = renderWithContext(<AdminSidebar {...props}/>);
+
+            // Trigger a search to initialize idx (lazy initialization)
+            const filterInput = container.querySelector('#adminSidebarFilter') as HTMLInputElement;
+            await userEvent.type(filterInput, 'a');
+
+            // generateIndex should have been called once for the search
+            expect(generateIndex).toHaveBeenCalledTimes(1);
+
+            (generateIndex as jest.Mock).mockClear();
+
+            // Change plugins - should trigger regeneration since idx is now set
+            rerender(
+                <AdminSidebar
+                    {...props}
+                    plugins={{}}
+                />,
+            );
+            expect(generateIndex).toHaveBeenCalledTimes(1);
+
+            // Change adminDefinition - should trigger regeneration
+            rerender(
+                <AdminSidebar
+                    {...props}
+                    plugins={{}}
+                    adminDefinition={{} as any}
+                />,
+            );
+            expect(generateIndex).toHaveBeenCalledTimes(2);
+        });
+
+        test('should not call the generate index in case of idx is not already present', () => {
+            (generateIndex as jest.Mock).mockReturnValue(['mocked-index']);
+
+            const {rerender} = renderWithContext(<AdminSidebar {...props}/>);
+
+            expect(generateIndex).toHaveBeenCalledTimes(0);
+
+            rerender(
+                <AdminSidebar
+                    {...props}
+                    plugins={{}}
+                />,
+            );
+            expect(generateIndex).toHaveBeenCalledTimes(0);
+
+            rerender(
+                <AdminSidebar
+                    {...props}
+                    plugins={{}}
+                    adminDefinition={{} as any}
+                />,
+            );
+            expect(generateIndex).toHaveBeenCalledTimes(0);
+        });
+
+        test('should not generate index in case of same props', async () => {
+            const idx = {search: jest.fn().mockReturnValue([])};
+            (generateIndex as jest.Mock).mockReturnValue(idx);
+
+            const {container, rerender} = renderWithContext(<AdminSidebar {...props}/>);
+
+            // Trigger a search to initialize idx
+            const filterInput = container.querySelector('#adminSidebarFilter') as HTMLInputElement;
+            await userEvent.type(filterInput, 'a');
+
+            expect(generateIndex).toHaveBeenCalledTimes(1);
+
+            (generateIndex as jest.Mock).mockClear();
+
+            // Same plugins - should NOT trigger regeneration
+            rerender(
+                <AdminSidebar
+                    {...props}
+                    plugins={{
+                        'mattermost-autolink': samplePlugin1,
+                    }}
+                />,
+            );
+            expect(generateIndex).toHaveBeenCalledTimes(0);
+
+            // Same adminDefinition - should NOT trigger regeneration
+            rerender(
+                <AdminSidebar
+                    {...props}
+                    plugins={{
+                        'mattermost-autolink': samplePlugin1,
+                    }}
+                    adminDefinition={AdminDefinition}
+                />,
+            );
+            expect(generateIndex).toHaveBeenCalledTimes(0);
+        });
+    });
+});

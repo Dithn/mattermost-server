@@ -1,0 +1,117 @@
+// Copyright (c) 2015-present Mattermost, Inc. All Rights Reserved.
+// See LICENSE.txt for license information.
+
+package app
+
+import (
+	"net/http"
+
+	"github.com/mattermost/mattermost/server/public/model"
+)
+
+// GetPluginStatus returns the status for a plugin installed on this server.
+func (ch *Channels) GetPluginStatus(id string) (*model.PluginStatus, *model.AppError) {
+	pluginsEnvironment := ch.GetPluginsEnvironment()
+	if pluginsEnvironment == nil {
+		return nil, model.NewAppError("GetPluginStatus", "app.plugin.disabled.app_error", nil, "", http.StatusNotImplemented)
+	}
+
+	pluginStatuses, err := pluginsEnvironment.Statuses()
+	if err != nil {
+		return nil, model.NewAppError("GetPluginStatus", "app.plugin.get_statuses.app_error", nil, "", http.StatusInternalServerError).Wrap(err)
+	}
+
+	for _, status := range pluginStatuses {
+		if status.PluginId == id {
+			// Add our cluster ID
+			if ch.srv.platform.Cluster() != nil {
+				status.ClusterId = ch.srv.platform.Cluster().GetClusterId()
+			}
+
+			return status, nil
+		}
+	}
+
+	return nil, model.NewAppError("GetPluginStatus", "app.plugin.not_installed.app_error", nil, "", http.StatusNotFound)
+}
+
+// GetPluginStatus returns the status for a plugin installed on this server.
+func (a *App) GetPluginStatus(id string) (*model.PluginStatus, *model.AppError) {
+	return a.ch.GetPluginStatus(id)
+}
+
+// IsInstalledPlugin reports whether id names a plugin installed on this
+// server. It is the one plugin-membership check shared by the property
+// access-control hook and the audit basis derivation, so the two cannot
+// disagree about which caller IDs are machine callers.
+func (a *App) IsInstalledPlugin(id string) bool {
+	_, err := a.GetPluginStatus(id)
+	return err == nil
+}
+
+// GetPluginStatuses returns the status for plugins installed on this server.
+func (ch *Channels) GetPluginStatuses() (model.PluginStatuses, *model.AppError) {
+	pluginsEnvironment := ch.GetPluginsEnvironment()
+	if pluginsEnvironment == nil {
+		return nil, model.NewAppError("GetPluginStatuses", "app.plugin.disabled.app_error", nil, "", http.StatusNotImplemented)
+	}
+
+	pluginStatuses, err := pluginsEnvironment.Statuses()
+	if err != nil {
+		return nil, model.NewAppError("GetPluginStatuses", "app.plugin.get_statuses.app_error", nil, "", http.StatusInternalServerError).Wrap(err)
+	}
+
+	// Add our cluster ID
+	for _, status := range pluginStatuses {
+		if ch.srv.platform.Cluster() != nil {
+			status.ClusterId = ch.srv.platform.Cluster().GetClusterId()
+		} else {
+			status.ClusterId = ""
+		}
+	}
+
+	return pluginStatuses, nil
+}
+
+// GetPluginStatuses returns the status for plugins installed on this server.
+func (a *App) GetPluginStatuses() (model.PluginStatuses, *model.AppError) {
+	return a.ch.GetPluginStatuses()
+}
+
+// GetClusterPluginStatuses returns the status for plugins installed anywhere in the cluster.
+func (a *App) GetClusterPluginStatuses() (model.PluginStatuses, *model.AppError) {
+	return a.ch.getClusterPluginStatuses()
+}
+
+func (ch *Channels) getClusterPluginStatuses() (model.PluginStatuses, *model.AppError) {
+	pluginStatuses, err := ch.GetPluginStatuses()
+	if err != nil {
+		return nil, err
+	}
+
+	if ch.srv.platform.Cluster() != nil && *ch.cfgSvc.Config().ClusterSettings.Enable {
+		clusterPluginStatuses, err := ch.srv.platform.Cluster().GetPluginStatuses()
+		if err != nil {
+			return nil, model.NewAppError("GetClusterPluginStatuses", "app.plugin.get_cluster_plugin_statuses.app_error", nil, "", http.StatusInternalServerError).Wrap(err)
+		}
+
+		pluginStatuses = append(pluginStatuses, clusterPluginStatuses...)
+	}
+
+	return pluginStatuses, nil
+}
+
+// notifyPluginStatusesChanged signals system admins that plugin statuses have changed without
+// carrying the full status slice. That slice (status for every installed plugin, cluster-wide)
+// routinely overflows the best-effort (UDP) cluster transport, so admin clients refetch it on
+// demand instead. The signal is sent reliably (TCP) and only to system admins (ContainsSensitiveData).
+func (ch *Channels) notifyPluginStatusesChanged() {
+	message := model.NewWebSocketEvent(model.WebsocketEventPluginStatusesChanged, "", "", "", nil, "")
+	// Compatibility shim: some clients (e.g. the Boards/Focalboard plugin) call array methods on
+	// plugin_statuses, so include an empty (non-nil, to serialize as [] rather than null) slice
+	// rather than omitting the field. The payload is intentionally always empty.
+	message.Add("plugin_statuses", model.PluginStatuses{})
+	message.GetBroadcast().ContainsSensitiveData = true
+	message.GetBroadcast().ReliableClusterSend = true
+	ch.srv.platform.Publish(message)
+}

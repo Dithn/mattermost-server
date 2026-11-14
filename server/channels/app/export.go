@@ -1,0 +1,1753 @@
+// Copyright (c) 2015-present Mattermost, Inc. All Rights Reserved.
+// See LICENSE.txt for license information.
+
+package app
+
+import (
+	"archive/zip"
+	"encoding/json"
+	"fmt"
+	"io"
+	"net/http"
+	"os"
+	"path"
+	"path/filepath"
+	"strconv"
+	"strings"
+	"time"
+
+	"github.com/pkg/errors"
+
+	"github.com/mattermost/mattermost/server/public/model"
+	"github.com/mattermost/mattermost/server/public/shared/mlog"
+	"github.com/mattermost/mattermost/server/public/shared/request"
+	"github.com/mattermost/mattermost/server/v8/channels/app/imports"
+	"github.com/mattermost/mattermost/server/v8/channels/store"
+	"github.com/mattermost/mattermost/server/v8/channels/utils"
+	"github.com/mattermost/mattermost/server/v8/platform/shared/filestore"
+)
+
+const warningsFilename = "warnings.txt"
+
+// We use this map to identify the exportable preferences.
+// Here we link the preference category and name, to the name of the relevant field in the import struct.
+var exportablePreferences = map[imports.ComparablePreference]string{
+	{
+		Category: model.PreferenceCategoryTheme,
+		Name:     "",
+	}: "Theme",
+	{
+		Category: model.PreferenceCategoryAdvancedSettings,
+		Name:     "feature_enabled_markdown_preview",
+	}: "UseMarkdownPreview",
+	{
+		Category: model.PreferenceCategoryAdvancedSettings,
+		Name:     "formatting",
+	}: "UseFormatting",
+	{
+		Category: model.PreferenceCategoryAdvancedSettings,
+		Name:     "send_on_ctrl_enter",
+	}: "SendOnCtrlEnter",
+	{
+		Category: model.PreferenceCategoryAdvancedSettings,
+		Name:     "code_block_ctrl_enter",
+	}: "CodeBlockCtrlEnter",
+	{
+		Category: model.PreferenceCategoryAdvancedSettings,
+		Name:     "join_leave",
+	}: "ShowJoinLeave",
+	{
+		Category: model.PreferenceCategoryAdvancedSettings,
+		Name:     "unread_scroll_position",
+	}: "ShowUnreadScrollPosition",
+	{
+		Category: model.PreferenceCategoryAdvancedSettings,
+		Name:     "sync_drafts",
+	}: "SyncDrafts",
+	{
+		Category: model.PreferenceCategorySidebarSettings,
+		Name:     model.PreferenceNameShowUnreadSection,
+	}: "ShowUnreadSection",
+	{
+		Category: model.PreferenceCategorySidebarSettings,
+		Name:     model.PreferenceLimitVisibleDmsGms,
+	}: "LimitVisibleDmsGms",
+	{
+		Category: model.PreferenceCategoryDisplaySettings,
+		Name:     model.PreferenceNameUseMilitaryTime,
+	}: "UseMilitaryTime",
+	{
+		Category: model.PreferenceCategoryDisplaySettings,
+		Name:     model.PreferenceNameCollapseSetting,
+	}: "CollapsePreviews",
+	{
+		Category: model.PreferenceCategoryDisplaySettings,
+		Name:     model.PreferenceNameMessageDisplay,
+	}: "MessageDisplay",
+	{
+		Category: model.PreferenceCategoryDisplaySettings,
+		Name:     model.PreferenceNameChannelDisplayMode,
+	}: "ChannelDisplayMode",
+	{
+		Category: model.PreferenceCategoryDisplaySettings,
+		Name:     model.PreferenceNameCollapseConsecutive,
+	}: "CollapseConsecutive",
+	{
+		Category: model.PreferenceCategoryDisplaySettings,
+		Name:     model.PreferenceNameColorizeUsernames,
+	}: "ColorizeUsernames",
+	{
+		Category: model.PreferenceCategoryDisplaySettings,
+		Name:     model.PreferenceNameNameFormat,
+	}: "NameFormat",
+	{
+		Category: model.PreferenceCategoryTutorialSteps,
+		Name:     "",
+	}: "TutorialStep",
+	{
+		Category: model.PreferenceCategoryNotifications,
+		Name:     model.PreferenceNameEmailInterval,
+	}: "EmailInterval",
+}
+
+// splitTrimNames splits a comma-separated string into a trimmed, non-empty slice.
+// Returns nil when s is empty so callers can check len(result) == 0.
+func splitTrimNames(s string) []string {
+	if s == "" {
+		return nil
+	}
+	parts := strings.Split(s, ",")
+	out := make([]string, 0, len(parts))
+	for _, p := range parts {
+		if t := strings.TrimSpace(p); t != "" {
+			out = append(out, t)
+		}
+	}
+	return out
+}
+
+func (a *App) BulkExport(rctx request.CTX, writer io.Writer, outPath string, job *model.Job, opts model.BulkExportOpts) *model.AppError {
+	teamNames := splitTrimNames(opts.TeamName)
+	channelNames := splitTrimNames(opts.ChannelName)
+
+	if len(channelNames) > 0 && len(teamNames) == 0 {
+		return model.NewAppError("BulkExport", "app.export.channel_requires_team.error",
+			nil, "ChannelName requires TeamName to be set", http.StatusBadRequest)
+	}
+
+	var zipWr *zip.Writer
+	if opts.CreateArchive {
+		var err error
+		zipWr = zip.NewWriter(writer)
+		defer func() {
+			if err = zipWr.Close(); err != nil {
+				rctx.Logger().Error("Error closing zip writer", mlog.Err(err))
+			}
+		}()
+		writer, err = zipWr.Create("import.jsonl")
+		if err != nil {
+			return model.NewAppError("BulkExport", "app.export.zip_create.error",
+				nil, "", http.StatusInternalServerError).Wrap(err)
+		}
+	}
+
+	if job == nil {
+		job = &model.Job{
+			Data: make(model.StringMap),
+		}
+	} else if job.Data == nil {
+		job.Data = make(model.StringMap)
+	}
+
+	rctx.Logger().Info("Bulk export: exporting version")
+	if err := a.exportVersion(writer, teamNames, channelNames); err != nil {
+		return err
+	}
+
+	if opts.IncludeRolesAndSchemes {
+		if err := a.exportRolesAndSchemes(rctx, job, writer); err != nil {
+			return err
+		}
+	}
+
+	rctx.Logger().Info("Bulk export: exporting teams")
+	exportedTeamNames, appErr := a.exportAllTeams(rctx, job, writer, teamNames)
+	if appErr != nil {
+		return appErr
+	}
+
+	rctx.Logger().Info("Bulk export: exporting channels")
+	if appErr = a.exportAllChannels(rctx, job, writer, exportedTeamNames, opts.IncludeArchivedChannels, channelNames); appErr != nil {
+		return appErr
+	}
+
+	rctx.Logger().Info("Bulk export: exporting users")
+	profilePictures, appErr := a.exportAllUsers(rctx, job, writer, opts.IncludeArchivedChannels, opts.IncludeProfilePictures, teamNames, channelNames)
+	if appErr != nil {
+		return appErr
+	}
+
+	rctx.Logger().Info("Bulk export: exporting bots")
+	botPPs, appErr := a.exportAllBots(rctx, job, writer, opts.IncludeProfilePictures, opts.IncludeArchivedChannels, teamNames, channelNames)
+	if appErr != nil {
+		return appErr
+	}
+	profilePictures = append(profilePictures, botPPs...)
+
+	rctx.Logger().Info("Bulk export: exporting posts")
+	attachments, appErr := a.exportAllPosts(rctx, job, writer, opts.IncludeAttachments, opts.IncludeArchivedChannels, teamNames, channelNames)
+	if appErr != nil {
+		return appErr
+	}
+
+	// Custom emoji are instance-global, so exporting them all would drag the source
+	// instance's entire emoji library into a single-team or single-channel export.
+	var emojiPaths []string
+	if opts.IncludeCustomEmoji || (len(teamNames) == 0 && len(channelNames) == 0) {
+		rctx.Logger().Info("Bulk export: exporting emoji")
+		emojiPaths, appErr = a.exportCustomEmoji(rctx, job, writer, outPath, "exported_emoji", !opts.CreateArchive)
+		if appErr != nil {
+			return appErr
+		}
+	} else {
+		// Reactions and posts reference custom emoji by name only, so anything the
+		// exported content uses will render as literal :name: on a destination that
+		// doesn't already have it.
+		rctx.Logger().Warn("Bulk export: skipping instance-wide custom emoji for scoped export; re-run with --include-custom-emoji if the exported content references custom emoji")
+	}
+
+	// Direct channels and posts have no team affiliation; skip when exporting a team subset.
+	var directAttachments []imports.AttachmentImportData
+	if len(teamNames) == 0 {
+		rctx.Logger().Info("Bulk export: exporting direct channels")
+		if appErr = a.exportAllDirectChannels(rctx, job, writer, opts.IncludeArchivedChannels); appErr != nil {
+			return appErr
+		}
+
+		rctx.Logger().Info("Bulk export: exporting direct posts")
+		directAttachments, appErr = a.exportAllDirectPosts(rctx, job, writer, opts.IncludeAttachments, opts.IncludeArchivedChannels)
+		if appErr != nil {
+			return appErr
+		}
+	}
+
+	if opts.IncludeAttachments {
+		rctx.Logger().Info("Bulk export: exporting file attachments")
+		warnings, appErr := a.exportAttachments(rctx, attachments, outPath, zipWr)
+		if appErr != nil {
+			return appErr
+		}
+
+		rctx.Logger().Info("Bulk export: exporting direct file attachments")
+		newWarnings, appErr := a.exportAttachments(rctx, directAttachments, outPath, zipWr)
+		if appErr != nil {
+			return appErr
+		}
+		warnings = append(warnings, newWarnings...)
+
+		totalExportedEmojis := 0
+		emojisLen := len(emojiPaths)
+		rctx.Logger().Info("Bulk export: exporting custom emojis")
+		for _, emojiPath := range emojiPaths {
+			if err := a.exportFile(rctx, outPath, emojiPath, zipWr); err != nil {
+				rctx.Logger().Warn("Unable to export emoji", mlog.String("emoji_path", emojiPath), mlog.Err(err))
+			} else {
+				totalExportedEmojis++
+			}
+			if totalExportedEmojis%10 == 0 {
+				rctx.Logger().Info("Bulk export: exporting emojis progress", mlog.Int("total_successfully_exported_emojis", totalExportedEmojis), mlog.Int("total_emojis_to_export", emojisLen))
+			}
+		}
+
+		if len(warnings) > 0 {
+			warningsFile, _ := zipWr.Create(warningsFilename)
+			for _, warning := range warnings {
+				_, err := warningsFile.Write([]byte(warning + "\n"))
+				if err != nil {
+					return model.NewAppError("BulkExport", "app.export.zip_create.error",
+						nil, "", http.StatusInternalServerError).Wrap(err)
+				}
+			}
+			updateJobProgress(rctx.Logger(), a.Srv().Store(), job, "num_warnings", len(warnings))
+		}
+
+		updateJobProgress(rctx.Logger(), a.Srv().Store(), job, "attachments_exported", len(attachments)+len(directAttachments)+len(emojiPaths))
+	}
+
+	if opts.IncludeProfilePictures {
+		rctx.Logger().Info("Bulk export: exporting profile pictures")
+		for _, profilePicture := range profilePictures {
+			if err := a.exportFile(rctx, outPath, profilePicture, zipWr); err != nil {
+				rctx.Logger().Warn("Unable to export profile picture", mlog.String("profile_picture", profilePicture), mlog.Err(err))
+			}
+		}
+		updateJobProgress(rctx.Logger(), a.Srv().Store(), job, "profile_pictures_exported", len(profilePictures))
+	}
+
+	return nil
+}
+
+func (a *App) exportAttachments(rctx request.CTX, attachments []imports.AttachmentImportData, outPath string,
+	zipWr *zip.Writer) ([]string, *model.AppError) {
+	totalExportedFiles := 0
+	attachmentsLen := len(attachments)
+	var warnings []string
+	for _, attachment := range attachments {
+		if err := a.exportFile(rctx, outPath, *attachment.Path, zipWr); err != nil {
+			rctx.Logger().Warn("Unable to export file attachment", mlog.String("attachment_path", *attachment.Path), mlog.Err(err))
+			warnings = append(warnings, fmt.Sprintf("Unable to export file attachment, attachment path: %s , error: %s", *attachment.Path, err.Error()))
+		} else {
+			totalExportedFiles++
+		}
+		if totalExportedFiles%10 == 0 {
+			rctx.Logger().Info("Bulk export: exporting file attachments progress", mlog.Int("total_successfully_exported_files", totalExportedFiles), mlog.Int("total_files_to_export", attachmentsLen))
+		}
+	}
+	return warnings, nil
+}
+
+func (a *App) exportWriteLine(w io.Writer, line *imports.LineImportData) *model.AppError {
+	b, err := json.Marshal(line)
+	if err != nil {
+		return model.NewAppError("BulkExport", "app.export.export_write_line.json_marshall.error", nil, "", http.StatusBadRequest).Wrap(err)
+	}
+
+	if _, err := w.Write(append(b, '\n')); err != nil {
+		return model.NewAppError("BulkExport", "app.export.export_write_line.io_writer.error", nil, "", http.StatusBadRequest).Wrap(err)
+	}
+
+	return nil
+}
+
+func (a *App) exportVersion(writer io.Writer, teamNames []string, channelNames []string) *model.AppError {
+	version := 1
+
+	info := &imports.VersionInfoImportData{
+		Generator: "mattermost-server",
+		Version:   fmt.Sprintf("%s (%s, enterprise: %s)", model.CurrentVersion, model.BuildHash, model.BuildEnterpriseReady),
+		Created:   time.Now().Format(time.RFC3339Nano),
+	}
+
+	if len(teamNames) > 0 {
+		scope := imports.ExportScopeAdditional{
+			TeamName:    strings.Join(teamNames, ","),
+			ChannelName: strings.Join(channelNames, ","),
+		}
+		// This blob is the contract the whole scoped import keys off: its absence
+		// means "full instance", where every user missing from the destination is
+		// fatal and none of the scoped behavior applies. Emitting an unscoped
+		// archive in response to a scoped request must therefore fail the export
+		// rather than be silently downgraded.
+		additional, err := json.Marshal(scope)
+		if err != nil {
+			return model.NewAppError("exportVersion", "app.export.export_version.scope_marshal.error",
+				nil, "", http.StatusInternalServerError).Wrap(err)
+		}
+		info.Additional = additional
+	}
+
+	versionLine := &imports.LineImportData{
+		Type:    "version",
+		Version: &version,
+		Info:    info,
+	}
+
+	return a.exportWriteLine(writer, versionLine)
+}
+
+func (a *App) exportRolesAndSchemes(rctx request.CTX, job *model.Job, writer io.Writer) *model.AppError {
+	// We export schemes first since they'll already include their attached roles
+	// which we map to avoid exporting them twice later in exportRoles.
+	schemeRolesMap := make(map[string]bool)
+
+	roles, appErr := a.Srv().Store().Role().GetAll()
+	if appErr != nil {
+		return model.NewAppError("exportRolesAndSchemes", "app.role.get_all.app_error", nil, "", http.StatusInternalServerError).Wrap(appErr)
+	}
+
+	rctx.Logger().Info("Bulk export: exporting team schemes")
+	if err := a.exportSchemes(rctx, job, writer, model.SchemeScopeTeam, schemeRolesMap, roles); err != nil {
+		return err
+	}
+
+	rctx.Logger().Info("Bulk export: exporting channel schemes")
+	if err := a.exportSchemes(rctx, job, writer, model.SchemeScopeChannel, schemeRolesMap, roles); err != nil {
+		return err
+	}
+
+	rctx.Logger().Info("Bulk export: exporting roles")
+	if err := a.exportRoles(rctx, job, writer, schemeRolesMap, roles); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func (a *App) exportRoles(rctx request.CTX, job *model.Job, writer io.Writer, schemeRoles map[string]bool, allRoles []*model.Role) *model.AppError {
+	var cnt int
+	for _, role := range allRoles {
+		// We skip any roles that will be included as part of custom schemes.
+		if !schemeRoles[role.Name] {
+			if err := a.exportWriteLine(writer, importLineFromRole(role)); err != nil {
+				return err
+			}
+			cnt++
+		}
+	}
+
+	updateJobProgress(rctx.Logger(), a.Srv().Store(), job, "roles_exported", cnt)
+
+	return nil
+}
+
+func (a *App) exportSchemes(rctx request.CTX, job *model.Job, writer io.Writer, scope string, schemeRolesMap map[string]bool, allRoles []*model.Role) *model.AppError {
+	rolesMap := make(map[string]*model.Role, len(allRoles))
+	for _, role := range allRoles {
+		rolesMap[role.Name] = role
+	}
+
+	var cnt int
+	pageSize := 100
+
+	for {
+		schemes, err := a.Srv().Store().Scheme().GetAllPage(scope, cnt, pageSize)
+		if err != nil {
+			return model.NewAppError("exportSchemes", "app.scheme.get_all_page.app_error", nil, "", http.StatusInternalServerError).Wrap(err)
+		}
+
+		for _, scheme := range schemes {
+			if ok := scheme.IsValid(); !ok {
+				return model.NewAppError("exportSchemes", "model.scheme.is_valid.app_error", nil, "", http.StatusInternalServerError)
+			}
+
+			if scheme.Scope == model.SchemeScopeTeam {
+				schemeRolesMap[scheme.DefaultTeamAdminRole] = true
+				schemeRolesMap[scheme.DefaultTeamUserRole] = true
+				schemeRolesMap[scheme.DefaultTeamGuestRole] = true
+
+				// Playbooks
+				// At the moment this is only needed to avoid exporting and
+				// importing spurious roles.
+				schemeRolesMap[scheme.DefaultPlaybookAdminRole] = true
+				schemeRolesMap[scheme.DefaultPlaybookMemberRole] = true
+				schemeRolesMap[scheme.DefaultRunAdminRole] = true
+				schemeRolesMap[scheme.DefaultRunMemberRole] = true
+			}
+
+			if scheme.Scope == model.SchemeScopeTeam || scheme.Scope == model.SchemeScopeChannel {
+				schemeRolesMap[scheme.DefaultChannelAdminRole] = true
+				schemeRolesMap[scheme.DefaultChannelUserRole] = true
+				schemeRolesMap[scheme.DefaultChannelGuestRole] = true
+			}
+
+			if err := a.exportWriteLine(writer, importLineFromScheme(scheme, rolesMap)); err != nil {
+				return err
+			}
+		}
+
+		cnt += len(schemes)
+
+		updateJobProgress(rctx.Logger(), a.Srv().Store(), job, fmt.Sprintf("%s_schemes_exported", scope), cnt)
+
+		if len(schemes) < pageSize {
+			return nil
+		}
+	}
+}
+
+func (a *App) exportAllTeams(rctx request.CTX, job *model.Job, writer io.Writer, teamNameFilters []string) (map[string]bool, *model.AppError) {
+	afterId := strings.Repeat("0", 26)
+	teamNames := make(map[string]bool)
+	cnt := 0
+
+	if len(teamNameFilters) > 0 {
+		for _, teamNameFilter := range teamNameFilters {
+			team, err := a.Srv().Store().Team().GetByName(teamNameFilter)
+			if err != nil {
+				var nfErr *store.ErrNotFound
+				if errors.As(err, &nfErr) {
+					return nil, model.NewAppError("exportAllTeams", "app.export.export_all_teams.team_not_found.error", nil, "", http.StatusNotFound).Wrap(err)
+				}
+				return nil, model.NewAppError("exportAllTeams", "app.team.get_by_name.app_error", nil, "", http.StatusInternalServerError).Wrap(err)
+			}
+			if team.DeleteAt != 0 {
+				return nil, model.NewAppError("exportAllTeams", "app.export.export_all_teams.team_deleted.error", nil, "", http.StatusBadRequest)
+			}
+			teamNames[team.Name] = true
+			teamForExport := &model.TeamForExport{Team: *team}
+			if team.SchemeId != nil && *team.SchemeId != "" {
+				scheme, schemeErr := a.Srv().Store().Scheme().Get(*team.SchemeId)
+				if schemeErr != nil {
+					return nil, model.NewAppError("exportAllTeams", "app.scheme.get.app_error", nil, "", http.StatusInternalServerError).Wrap(schemeErr)
+				}
+				teamForExport.SchemeName = &scheme.Name
+			}
+			if appErr := a.exportWriteLine(writer, importLineFromTeam(teamForExport)); appErr != nil {
+				return nil, appErr
+			}
+		}
+		return teamNames, nil
+	}
+
+	for {
+		teams, err := a.Srv().Store().Team().GetAllForExportAfter(1000, afterId)
+		if err != nil {
+			return nil, model.NewAppError("exportAllTeams", "app.team.get_all.app_error", nil, "", http.StatusInternalServerError).Wrap(err)
+		}
+
+		if len(teams) == 0 {
+			break
+		}
+
+		cnt += len(teams)
+		updateJobProgress(rctx.Logger(), a.Srv().Store(), job, "teams_exported", cnt)
+
+		for _, team := range teams {
+			afterId = team.Id
+
+			// Skip deleted.
+			if team.DeleteAt != 0 {
+				continue
+			}
+			teamNames[team.Name] = true
+
+			teamLine := importLineFromTeam(team)
+			if err := a.exportWriteLine(writer, teamLine); err != nil {
+				return nil, err
+			}
+		}
+	}
+
+	return teamNames, nil
+}
+
+func (a *App) exportAllChannels(rctx request.CTX, job *model.Job, writer io.Writer, teamNames map[string]bool, withArchived bool, channelNameFilters []string) *model.AppError {
+	afterId := strings.Repeat("0", 26)
+	cnt := 0
+
+	channelNameSet := make(map[string]bool, len(channelNameFilters))
+	for _, cn := range channelNameFilters {
+		channelNameSet[cn] = true
+	}
+	// Track which requested channel names were actually found in at least one team.
+	foundChannelNames := make(map[string]bool, len(channelNameFilters))
+
+	for {
+		channels, err := a.Srv().Store().Channel().GetAllChannelsForExportAfter(1000, afterId)
+		if err != nil {
+			return model.NewAppError("exportAllChannels", "app.channel.get_all.app_error", nil, "", http.StatusInternalServerError).Wrap(err)
+		}
+
+		if len(channels) == 0 {
+			break
+		}
+
+		cnt += len(channels)
+		updateJobProgress(rctx.Logger(), a.Srv().Store(), job, "channels_exported", cnt)
+
+		for _, channel := range channels {
+			afterId = channel.Id
+
+			// Skip deleted.
+			if channel.DeleteAt != 0 && !withArchived {
+				continue
+			}
+			// Skip channels on teams not in the export set.
+			if ok := teamNames[channel.TeamName]; !ok {
+				continue
+			}
+			// If channel name filters are set, skip channels not in the set.
+			if len(channelNameSet) > 0 && !channelNameSet[channel.Name] {
+				continue
+			}
+
+			foundChannelNames[channel.Name] = true
+			channelLine := importLineFromChannel(channel)
+			if err := a.exportWriteLine(writer, channelLine); err != nil {
+				return err
+			}
+		}
+	}
+
+	// Validate that every requested channel name was found in at least one team.
+	// This catches typos and nonexistent channels before the rest of the export runs.
+	for name := range channelNameSet {
+		if !foundChannelNames[name] {
+			return model.NewAppError("exportAllChannels", "app.export.export_all_channels.channel_not_found.error",
+				nil, fmt.Sprintf("channel %q not found in any of the specified teams", name), http.StatusNotFound)
+		}
+	}
+
+	return nil
+}
+
+func (a *App) exportAllUsers(rctx request.CTX, job *model.Job, writer io.Writer, includeArchivedChannels, includeProfilePictures bool, teamNames []string, channelNames []string) ([]string, *model.AppError) {
+	afterId := strings.Repeat("0", 26)
+	cnt := 0
+	profilePictures := []string{}
+
+	// Pre-load users who authored posts in any of the target teams but may no
+	// longer be members. Their records must still be exported so the importer
+	// can resolve post authorship.
+	// postAuthorsByTeam[teamName][userID] = true
+	postAuthorsByTeam := make(map[string]map[string]bool)
+	postAuthorIDs := make(map[string]bool) // union across all teams
+	for _, teamName := range teamNames {
+		ids, err := a.Srv().Store().Post().GetPostAuthorIDsForTeam(teamName, includeArchivedChannels)
+		if err != nil {
+			return profilePictures, model.NewAppError("exportAllUsers", "app.post.get_author_ids_for_team.app_error", nil, "", http.StatusInternalServerError).Wrap(err)
+		}
+		set := make(map[string]bool, len(ids))
+		for _, id := range ids {
+			set[id] = true
+			postAuthorIDs[id] = true
+		}
+		postAuthorsByTeam[teamName] = set
+	}
+
+	// For channel-scoped exports: collect member, post-author, reaction-author, and
+	// thread-follower IDs across all (team, channel) pairs so the fast-path below can
+	// skip irrelevant users cheaply.
+	// postAuthorsByChannel[teamName][channelName][userID] = true
+	// channelMembersByTeamChannel[teamName][channelName][userID] = true
+	channelMemberIDs := make(map[string]bool)
+	channelPostAuthorIDs := make(map[string]bool)
+	channelReactionAuthorIDs := make(map[string]bool)
+	channelThreadFollowerIDs := make(map[string]bool)
+	postAuthorsByChannel := make(map[string]map[string]map[string]bool)
+	channelMembersByTeamChannel := make(map[string]map[string]map[string]bool)
+	if len(channelNames) > 0 {
+		for _, teamName := range teamNames {
+			postAuthorsByChannel[teamName] = make(map[string]map[string]bool)
+			channelMembersByTeamChannel[teamName] = make(map[string]map[string]bool)
+			team, err := a.Srv().Store().Team().GetByName(teamName)
+			if err != nil {
+				return profilePictures, model.NewAppError("exportAllUsers", "app.team.get_by_name.app_error", nil, "", http.StatusInternalServerError).Wrap(err)
+			}
+			for _, channelName := range channelNames {
+				var channel *model.Channel
+				var err error
+				if includeArchivedChannels {
+					channel, err = a.Srv().Store().Channel().GetByNameIncludeDeleted(team.Id, channelName, false)
+				} else {
+					channel, err = a.Srv().Store().Channel().GetByName(team.Id, channelName, false)
+				}
+				if err != nil {
+					var nfErr *store.ErrNotFound
+					if errors.As(err, &nfErr) {
+						continue // channel doesn't exist in this team; skip silently
+					}
+					return profilePictures, model.NewAppError("exportAllUsers", "app.channel.get_by_name.app_error", nil, "", http.StatusInternalServerError).Wrap(err)
+				}
+				memberIDs, err := a.Srv().Store().Channel().GetAllChannelMemberIdsByChannelId(channel.Id)
+				if err != nil {
+					return profilePictures, model.NewAppError("exportAllUsers", "app.channel.get_member_ids.app_error", nil, "", http.StatusInternalServerError).Wrap(err)
+				}
+				memberSet := make(map[string]bool, len(memberIDs))
+				for _, id := range memberIDs {
+					memberSet[id] = true
+					channelMemberIDs[id] = true
+				}
+				channelMembersByTeamChannel[teamName][channelName] = memberSet
+
+				authorIDs, err := a.Srv().Store().Post().GetPostAuthorIDsForChannel(teamName, channelName, includeArchivedChannels)
+				if err != nil {
+					return profilePictures, model.NewAppError("exportAllUsers", "app.post.get_author_ids_for_channel.app_error", nil, "", http.StatusInternalServerError).Wrap(err)
+				}
+				authorSet := make(map[string]bool, len(authorIDs))
+				for _, id := range authorIDs {
+					authorSet[id] = true
+					channelPostAuthorIDs[id] = true
+				}
+				postAuthorsByChannel[teamName][channelName] = authorSet
+
+				reactionAuthorIDs, err := a.Srv().Store().Reaction().GetReactionAuthorIDsForChannel(teamName, channelName, includeArchivedChannels)
+				if err != nil {
+					return profilePictures, model.NewAppError("exportAllUsers", "app.reaction.get_author_ids_for_channel.app_error", nil, "", http.StatusInternalServerError).Wrap(err)
+				}
+				for _, id := range reactionAuthorIDs {
+					channelReactionAuthorIDs[id] = true
+				}
+
+				threadFollowerIDs, err := a.Srv().Store().Thread().GetThreadFollowerIDsForChannel(teamName, channelName, includeArchivedChannels)
+				if err != nil {
+					return profilePictures, model.NewAppError("exportAllUsers", "app.thread.get_follower_ids_for_channel.app_error", nil, "", http.StatusInternalServerError).Wrap(err)
+				}
+				for _, id := range threadFollowerIDs {
+					channelThreadFollowerIDs[id] = true
+				}
+			}
+		}
+	}
+
+	for {
+		users, err := a.Srv().Store().User().GetAllAfter(1000, afterId)
+		if err != nil {
+			return profilePictures, model.NewAppError("exportAllUsers", "app.user.get.app_error", nil, "", http.StatusInternalServerError).Wrap(err)
+		}
+
+		if len(users) == 0 {
+			break
+		}
+		cnt += len(users)
+		updateJobProgress(rctx.Logger(), a.Srv().Store(), job, "users_exported", cnt)
+
+		for _, user := range users {
+			afterId = user.Id
+
+			// Skip bots as they are exported separately.
+			if user.IsBot {
+				continue
+			}
+
+			// Fast-path: for channel-scoped exports skip the expensive per-user
+			// queries (preferences, team/channel memberships) for users that have
+			// no connection to any target channel.
+			if len(channelNames) > 0 &&
+				!channelMemberIDs[user.Id] &&
+				!channelPostAuthorIDs[user.Id] &&
+				!channelReactionAuthorIDs[user.Id] &&
+				!channelThreadFollowerIDs[user.Id] {
+				continue
+			}
+
+			// Gathering here the exportable preferences to pass them on to importLineFromUser
+			exportedPrefs := make(map[string]*string)
+			allPrefs, err := a.GetPreferencesForUser(rctx, user.Id)
+			if err != nil {
+				return profilePictures, err
+			}
+			for _, pref := range allPrefs {
+				// We need to manage the special cases
+				// Here we manage Tutorial steps
+				if pref.Category == model.PreferenceCategoryTutorialSteps {
+					pref.Name = ""
+					// Then the email interval
+				} else if pref.Category == model.PreferenceCategoryNotifications && pref.Name == model.PreferenceNameEmailInterval {
+					switch pref.Value {
+					case model.PreferenceEmailIntervalNoBatchingSeconds:
+						pref.Value = model.PreferenceEmailIntervalImmediately
+					case model.PreferenceEmailIntervalFifteenAsSeconds:
+						pref.Value = model.PreferenceEmailIntervalFifteen
+					case model.PreferenceEmailIntervalHourAsSeconds:
+						pref.Value = model.PreferenceEmailIntervalHour
+					case "0":
+						pref.Value = ""
+					}
+				}
+				id, ok := exportablePreferences[imports.ComparablePreference{
+					Category: pref.Category,
+					Name:     pref.Name,
+				}]
+				if ok {
+					prefPtr := pref.Value
+					if prefPtr != "" {
+						exportedPrefs[id] = &prefPtr
+					} else {
+						exportedPrefs[id] = nil
+					}
+				}
+			}
+
+			userLine := importLineFromUser(user, exportedPrefs)
+
+			if includeProfilePictures {
+				var pp string
+				pp, err = a.GetProfileImagePath(user)
+				if err != nil {
+					return profilePictures, err
+				}
+				if pp != "" {
+					userLine.User.ProfileImage = &pp
+					profilePictures = append(profilePictures, pp)
+				}
+			}
+
+			userLine.User.NotifyProps = a.buildUserNotifyProps(user.NotifyProps)
+
+			// Adding custom status
+			if cs := user.GetCustomStatus(); cs != nil {
+				userLine.User.CustomStatus = cs
+			}
+
+			// Do the Team Memberships.
+			// Pass teamNames/channelNames so memberships outside the export scope are excluded.
+			members, err := a.buildUserTeamAndChannelMemberships(rctx, user.Id, includeArchivedChannels, teamNames, channelNames)
+			if err != nil {
+				return profilePictures, err
+			}
+
+			// Skip users outside the export scope.
+			// For team-scoped exports (no channel filter), exclude users who have
+			// no team memberships and never posted in any target team.
+			// Channel-scoped exports are already filtered above before the per-user
+			// queries, so no check is needed here for that case.
+			if len(channelNames) == 0 && len(teamNames) > 0 && len(*members) == 0 && !postAuthorIDs[user.Id] {
+				continue
+			}
+
+			// Post authors who left the team/channel have empty or partial memberships.
+			// Synthesize memberships for each target team where the user posted but
+			// no longer has a real membership, so the importer can associate their posts.
+			if len(teamNames) > 0 {
+				realMemberTeams := make(map[string]bool, len(*members))
+				for _, m := range *members {
+					if m.Name != nil {
+						realMemberTeams[*m.Name] = true
+					}
+				}
+				for _, teamName := range teamNames {
+					if realMemberTeams[teamName] {
+						continue
+					}
+					// Determine if user posted in this team (directly or via a channel).
+					isAuthorInTeam := postAuthorsByTeam[teamName][user.Id]
+					if !isAuthorInTeam && len(channelNames) > 0 {
+						for _, channelName := range channelNames {
+							if postAuthorsByChannel[teamName][channelName][user.Id] ||
+								channelMembersByTeamChannel[teamName][channelName][user.Id] {
+								isAuthorInTeam = true
+								break
+							}
+						}
+					}
+					if !isAuthorInTeam {
+						continue
+					}
+					tn := teamName
+					role := "team_user"
+					synth := imports.UserTeamImportData{
+						Name:  &tn,
+						Roles: &role,
+					}
+					if len(channelNames) > 0 {
+						var chSynths []imports.UserChannelImportData
+						for _, channelName := range channelNames {
+							if postAuthorsByChannel[teamName][channelName][user.Id] ||
+								channelMembersByTeamChannel[teamName][channelName][user.Id] {
+								cn := channelName
+								chanRole := "channel_user"
+								chSynths = append(chSynths, imports.UserChannelImportData{
+									Name:  &cn,
+									Roles: &chanRole,
+								})
+							}
+						}
+						if len(chSynths) > 0 {
+							synth.Channels = &chSynths
+						}
+					}
+					*members = append(*members, synth)
+				}
+			}
+
+			userLine.User.Teams = members
+
+			if err := a.exportWriteLine(writer, userLine); err != nil {
+				return profilePictures, err
+			}
+		}
+	}
+
+	return profilePictures, nil
+}
+
+func (a *App) exportAllBots(rctx request.CTX, job *model.Job, writer io.Writer, includeProfilePictures bool, includeArchivedChannels bool, teamNames []string, channelNames []string) ([]string, *model.AppError) {
+	afterId := ""
+	cnt := 0
+	profilePictures := []string{}
+
+	// For scoped exports, only include bots that authored posts in the target scope.
+	var botAuthorIDs map[string]bool
+	if len(channelNames) > 0 {
+		botAuthorIDs = make(map[string]bool)
+		for _, teamName := range teamNames {
+			for _, channelName := range channelNames {
+				ids, err := a.Srv().Store().Post().GetPostAuthorIDsForChannel(teamName, channelName, includeArchivedChannels)
+				if err != nil {
+					return profilePictures, model.NewAppError("exportAllBots", "app.post.get_author_ids_for_channel.app_error", nil, "", http.StatusInternalServerError).Wrap(err)
+				}
+				for _, id := range ids {
+					botAuthorIDs[id] = true
+				}
+			}
+		}
+	} else if len(teamNames) > 0 {
+		botAuthorIDs = make(map[string]bool)
+		for _, teamName := range teamNames {
+			ids, err := a.Srv().Store().Post().GetPostAuthorIDsForTeam(teamName, includeArchivedChannels)
+			if err != nil {
+				return profilePictures, model.NewAppError("exportAllBots", "app.post.get_author_ids_for_team.app_error", nil, "", http.StatusInternalServerError).Wrap(err)
+			}
+			for _, id := range ids {
+				botAuthorIDs[id] = true
+			}
+		}
+	}
+
+	const pageSize = 1000
+
+	for {
+		bots, err := a.Srv().Store().Bot().GetAllAfter(pageSize, afterId)
+		if err != nil {
+			return profilePictures, model.NewAppError("exportAllBots", "app.user.get.app_error", nil, "", http.StatusInternalServerError).Wrap(err)
+		}
+
+		cnt += len(bots)
+		updateJobProgress(rctx.Logger(), a.Srv().Store(), job, "bots_exported", cnt)
+
+		for _, bot := range bots {
+			afterId = bot.UserId
+
+			if botAuthorIDs != nil && !botAuthorIDs[bot.UserId] {
+				continue
+			}
+
+			var ownerUsername string
+			owner, err := a.Srv().Store().User().Get(rctx, bot.OwnerId)
+			if err != nil {
+				var nfErr *store.ErrNotFound
+				if errors.As(err, &nfErr) {
+					ownerUsername = bot.OwnerId
+				} else {
+					return profilePictures, model.NewAppError("exportAllBots", "app.user.get.app_error", nil, "", http.StatusInternalServerError).Wrap(err)
+				}
+			} else {
+				ownerUsername = owner.Username
+			}
+
+			botLine := importLineFromBot(bot, ownerUsername)
+
+			if includeProfilePictures {
+				pp, err := a.GetProfileImagePath(model.UserFromBot(bot))
+				if err != nil {
+					return profilePictures, err
+				}
+				if pp != "" {
+					botLine.Bot.ProfileImage = &pp
+					profilePictures = append(profilePictures, pp)
+				}
+			}
+
+			if err := a.exportWriteLine(writer, botLine); err != nil {
+				return profilePictures, err
+			}
+		}
+
+		if len(bots) < pageSize {
+			break
+		}
+	}
+
+	return profilePictures, nil
+}
+
+func (a *App) buildUserTeamAndChannelMemberships(rctx request.CTX, userID string, includeArchivedChannels bool, teamNameFilters []string, channelNameFilters []string) (*[]imports.UserTeamImportData, *model.AppError) {
+	var memberships []imports.UserTeamImportData
+
+	teamNameSet := make(map[string]bool, len(teamNameFilters))
+	for _, tn := range teamNameFilters {
+		teamNameSet[tn] = true
+	}
+
+	members, err := a.Srv().Store().Team().GetTeamMembersForExport(userID)
+	if err != nil {
+		return nil, model.NewAppError("buildUserTeamAndChannelMemberships", "app.team.get_members.app_error", nil, "", http.StatusInternalServerError).Wrap(err)
+	}
+
+	for _, member := range members {
+		// Skip deleted.
+		if member.DeleteAt != 0 {
+			continue
+		}
+
+		// If team filters are set, skip teams not in the set.
+		if len(teamNameSet) > 0 && !teamNameSet[member.TeamName] {
+			continue
+		}
+
+		memberData := importUserTeamDataFromTeamMember(member)
+
+		// Do the Channel Memberships.
+		channelMembers, err := a.buildUserChannelMemberships(rctx, userID, member.TeamId, includeArchivedChannels, channelNameFilters)
+		if err != nil {
+			return nil, err
+		}
+
+		// Get the user theme
+		themePreference, nErr := a.Srv().Store().Preference().Get(member.UserId, model.PreferenceCategoryTheme, member.TeamId)
+		if nErr == nil {
+			memberData.Theme = &themePreference.Value
+		}
+
+		memberData.Channels = channelMembers
+
+		memberships = append(memberships, *memberData)
+	}
+
+	return &memberships, nil
+}
+
+func (a *App) buildUserChannelMemberships(rctx request.CTX, userID string, teamID string, includeArchivedChannels bool, channelNameFilters []string) (*[]imports.UserChannelImportData, *model.AppError) {
+	members, nErr := a.Srv().Store().Channel().GetChannelMembersForExport(userID, teamID, includeArchivedChannels)
+	if nErr != nil {
+		return nil, model.NewAppError("buildUserChannelMemberships", "app.channel.get_members.app_error", nil, "", http.StatusInternalServerError).Wrap(nErr)
+	}
+
+	channelNameSet := make(map[string]bool, len(channelNameFilters))
+	for _, cn := range channelNameFilters {
+		channelNameSet[cn] = true
+	}
+
+	category := model.PreferenceCategoryFavoriteChannel
+	preferences, err := a.GetPreferenceByCategoryForUser(rctx, userID, category)
+	if err != nil && err.StatusCode != http.StatusNotFound {
+		return nil, err
+	}
+
+	var memberships []imports.UserChannelImportData
+	for _, member := range members {
+		if len(channelNameSet) > 0 && !channelNameSet[member.ChannelName] {
+			continue
+		}
+		memberships = append(memberships, *importUserChannelDataFromChannelMemberAndPreferences(member, &preferences))
+	}
+	return &memberships, nil
+}
+
+func (a *App) buildUserNotifyProps(notifyProps model.StringMap) *imports.UserNotifyPropsImportData {
+	getProp := func(key string) *string {
+		if v, ok := notifyProps[key]; ok {
+			return &v
+		}
+		return nil
+	}
+
+	return &imports.UserNotifyPropsImportData{
+		Desktop:          getProp(model.DesktopNotifyProp),
+		DesktopSound:     getProp(model.DesktopSoundNotifyProp),
+		Email:            getProp(model.EmailNotifyProp),
+		Mobile:           getProp(model.PushNotifyProp),
+		MobilePushStatus: getProp(model.PushStatusNotifyProp),
+		ChannelTrigger:   getProp(model.ChannelMentionsNotifyProp),
+		CommentsTrigger:  getProp(model.CommentsNotifyProp),
+		MentionKeys:      getProp(model.MentionKeysNotifyProp),
+	}
+}
+
+func (a *App) exportAllPosts(rctx request.CTX, job *model.Job, writer io.Writer, withAttachments bool, includeArchivedChannels bool, teamNames []string, channelNames []string) ([]imports.AttachmentImportData, *model.AppError) {
+	var attachments []imports.AttachmentImportData
+	var postProcessCount uint64
+	logCheckpoint := time.Now()
+	cnt := 0
+
+	// exportPostsForFilter runs a full paginated export for a single (teamName, channelName) pair.
+	// Either argument may be "" to mean "no filter on that dimension."
+	exportPostsForFilter := func(teamName, channelName string) *model.AppError {
+		afterId := strings.Repeat("0", 26)
+		for {
+			if time.Since(logCheckpoint) > 5*time.Minute {
+				rctx.Logger().Debug(fmt.Sprintf("Bulk Export: processed %d posts", postProcessCount))
+				logCheckpoint = time.Now()
+			}
+
+			posts, nErr := a.Srv().Store().Post().GetParentsForExportAfter(1000, afterId, includeArchivedChannels, teamName, channelName)
+			if nErr != nil {
+				return model.NewAppError("exportAllPosts", "app.post.get_posts.app_error", nil, "", http.StatusInternalServerError).Wrap(nErr)
+			}
+
+			if len(posts) == 0 {
+				return nil
+			}
+			cnt += len(posts)
+			updateJobProgress(rctx.Logger(), a.Srv().Store(), job, "posts_exported", cnt)
+
+			postIDs := make([]string, len(posts))
+			for i, post := range posts {
+				postIDs[i] = post.Id
+			}
+			priorities, acknowledgements, appErr := a.buildPostPriorities(rctx, postIDs)
+			if appErr != nil {
+				return appErr
+			}
+
+			for _, post := range posts {
+				afterId = post.Id
+				postProcessCount++
+
+				// Skip deleted.
+				if post.DeleteAt != 0 {
+					continue
+				}
+
+				postLine := importLineForPost(post)
+				postLine.Post.Priority = priorities[post.Id]
+				postLine.Post.Acknowledgements = acknowledgements[post.Id]
+
+				replies, replyAttachments, err := a.buildPostReplies(rctx, post.Id, withAttachments)
+				if err != nil {
+					return err
+				}
+
+				followers, err := a.buildThreadFollowers(rctx, post.Id)
+				if err != nil {
+					return err
+				}
+
+				if len(followers) > 0 {
+					postLine.Post.ThreadFollowers = &followers
+				}
+
+				if withAttachments && len(replyAttachments) > 0 {
+					attachments = append(attachments, replyAttachments...)
+				}
+
+				postLine.Post.Replies = &replies
+				postLine.Post.Reactions = &[]imports.ReactionImportData{}
+				if post.HasReactions {
+					postLine.Post.Reactions, err = a.BuildPostReactions(rctx, post.Id)
+					if err != nil {
+						return err
+					}
+				}
+
+				if len(post.FileIds) > 0 {
+					postAttachments, err := a.buildPostAttachments(post.Id)
+					if err != nil {
+						return err
+					}
+					postLine.Post.Attachments = &postAttachments
+
+					if withAttachments && len(postAttachments) > 0 {
+						attachments = append(attachments, postAttachments...)
+					}
+				}
+
+				if err := a.exportWriteLine(writer, postLine); err != nil {
+					return err
+				}
+			}
+		}
+	}
+
+	// Fan out one loop per (team, channel) pair. With no filters, a single pass
+	// over all posts is sufficient. With team-only filters, one pass per team.
+	// With channel filters, one pass per (team, channel) combination.
+	if len(teamNames) == 0 {
+		if err := exportPostsForFilter("", ""); err != nil {
+			return nil, err
+		}
+	} else if len(channelNames) == 0 {
+		for _, teamName := range teamNames {
+			if err := exportPostsForFilter(teamName, ""); err != nil {
+				return nil, err
+			}
+		}
+	} else {
+		for _, teamName := range teamNames {
+			for _, channelName := range channelNames {
+				if err := exportPostsForFilter(teamName, channelName); err != nil {
+					return nil, err
+				}
+			}
+		}
+	}
+
+	return attachments, nil
+}
+
+func (a *App) buildPostReplies(rctx request.CTX, postID string, withAttachments bool) ([]imports.ReplyImportData, []imports.AttachmentImportData, *model.AppError) {
+	var replies []imports.ReplyImportData
+	var attachments []imports.AttachmentImportData
+
+	replyPosts, nErr := a.Srv().Store().Post().GetRepliesForExport(postID)
+	if nErr != nil {
+		return nil, nil, model.NewAppError("buildPostReplies", "app.post.get_posts.app_error", nil, "", http.StatusInternalServerError).Wrap(nErr)
+	}
+
+	for _, reply := range replyPosts {
+		replyImportObject := importReplyFromPost(reply)
+		if reply.HasReactions {
+			var appErr *model.AppError
+			replyImportObject.Reactions, appErr = a.BuildPostReactions(rctx, reply.Id)
+			if appErr != nil {
+				return nil, nil, appErr
+			}
+		}
+		if len(reply.FileIds) > 0 {
+			postAttachments, appErr := a.buildPostAttachments(reply.Id)
+			if appErr != nil {
+				return nil, nil, appErr
+			}
+			replyImportObject.Attachments = &postAttachments
+			if withAttachments && len(postAttachments) > 0 {
+				attachments = append(attachments, postAttachments...)
+			}
+		}
+
+		replies = append(replies, *replyImportObject)
+	}
+
+	return replies, attachments, nil
+}
+
+func (a *App) buildThreadFollowers(_ request.CTX, postID string) ([]imports.ThreadFollowerImportData, *model.AppError) {
+	var followers []imports.ThreadFollowerImportData
+
+	threadFollowers, nErr := a.Srv().Store().Thread().GetThreadMembershipsForExport(postID)
+	if nErr != nil {
+		return nil, model.NewAppError("buildThreadFollowers", "app.thread.get_threadmembers_for_export.app_error", nil, "", http.StatusInternalServerError).Wrap(nErr)
+	}
+
+	for _, member := range threadFollowers {
+		followers = append(followers, *importFollowerFromThreadMember(member))
+	}
+
+	return followers, nil
+}
+
+func (a *App) BuildPostReactions(rctx request.CTX, postID string) (*[]ReactionImportData, *model.AppError) {
+	var reactionsOfPost []imports.ReactionImportData
+
+	reactions, nErr := a.Srv().Store().Reaction().GetForPost(postID, true)
+	if nErr != nil {
+		return nil, model.NewAppError("BuildPostReactions", "app.reaction.get_for_post.app_error", nil, "", http.StatusInternalServerError).Wrap(nErr)
+	}
+
+	for _, reaction := range reactions {
+		user, err := a.Srv().Store().User().Get(rctx, reaction.UserId)
+		if err != nil {
+			var nfErr *store.ErrNotFound
+			if errors.As(err, &nfErr) { // this is a valid case, the user that reacted might've been deleted by now
+				rctx.Logger().Info("Skipping reactions by user since the entity doesn't exist anymore", mlog.String("user_id", reaction.UserId))
+				continue
+			}
+			return nil, model.NewAppError("BuildPostReactions", "app.user.get.app_error", nil, "", http.StatusInternalServerError).Wrap(err)
+		}
+		reactionsOfPost = append(reactionsOfPost, *importReactionFromPost(user, reaction))
+	}
+
+	return &reactionsOfPost, nil
+}
+
+// buildPostPriorities returns the priority and acknowledgements of the given posts, keyed by post ID.
+func (a *App) buildPostPriorities(rctx request.CTX, postIDs []string) (map[string]*model.PostPriority, map[string]*[]imports.PostAcknowledgementImportData, *model.AppError) {
+	priorities, appErr := a.GetPriorityForPostList(&model.PostList{Order: postIDs})
+	if appErr != nil {
+		return nil, nil, appErr
+	}
+
+	var ackPostIDs []string
+	for postID, priority := range priorities {
+		priority.PostId, priority.ChannelId = "", ""
+		if model.SafeDereference(priority.RequestedAck) {
+			ackPostIDs = append(ackPostIDs, postID)
+		}
+	}
+	if len(ackPostIDs) == 0 {
+		return priorities, nil, nil
+	}
+
+	acks, appErr := a.GetAcknowledgementsForPostList(&model.PostList{Order: ackPostIDs})
+	if appErr != nil {
+		return nil, nil, appErr
+	}
+
+	var userIDs []string
+	for _, postAcks := range acks {
+		for _, ack := range postAcks {
+			userIDs = append(userIDs, ack.UserId)
+		}
+	}
+	users, appErr := a.GetUsersByIds(rctx, utils.RemoveDuplicatesFromStringArray(userIDs), &store.UserGetByIdsOpts{IsAdmin: true})
+	if appErr != nil {
+		return nil, nil, appErr
+	}
+	usernames := make(map[string]string, len(users))
+	for _, user := range users {
+		usernames[user.Id] = user.Username
+	}
+
+	acknowledgements := make(map[string]*[]imports.PostAcknowledgementImportData, len(acks))
+	for postID, postAcks := range acks {
+		exported := make([]imports.PostAcknowledgementImportData, 0, len(postAcks))
+		for _, ack := range postAcks {
+			username, ok := usernames[ack.UserId]
+			if !ok {
+				continue
+			}
+			exported = append(exported, imports.PostAcknowledgementImportData{User: &username, AcknowledgedAt: &ack.AcknowledgedAt})
+		}
+		acknowledgements[postID] = &exported
+	}
+
+	return priorities, acknowledgements, nil
+}
+
+func (a *App) buildPostAttachments(postID string) ([]imports.AttachmentImportData, *model.AppError) {
+	infos, nErr := a.Srv().Store().FileInfo().GetForPost(postID, false, false, false)
+	if nErr != nil {
+		return nil, model.NewAppError("buildPostAttachments", "app.file_info.get_for_post.app_error", nil, "", http.StatusInternalServerError).Wrap(nErr)
+	}
+
+	attachments := make([]imports.AttachmentImportData, 0, len(infos))
+	for _, info := range infos {
+		attachments = append(attachments, imports.AttachmentImportData{Path: &info.Path})
+	}
+
+	return attachments, nil
+}
+
+func (a *App) exportCustomEmoji(rctx request.CTX, job *model.Job, writer io.Writer, outPath, exportDir string, exportFiles bool) ([]string, *model.AppError) {
+	var emojiPaths []string
+	pageNumber := 0
+	cnt := 0
+	for {
+		customEmojiList, err := a.GetEmojiList(rctx, pageNumber, 100, model.EmojiSortByName)
+
+		if err != nil {
+			return nil, err
+		}
+
+		if len(customEmojiList) == 0 {
+			break
+		}
+		cnt += len(customEmojiList)
+		updateJobProgress(rctx.Logger(), a.Srv().Store(), job, "emojis_exported", cnt)
+
+		pageNumber++
+
+		emojiPath := filepath.Join(*a.Config().FileSettings.Directory, "emoji")
+		pathToDir := filepath.Join(outPath, exportDir)
+		if exportFiles {
+			if _, err := os.Stat(pathToDir); os.IsNotExist(err) {
+				if err := os.Mkdir(pathToDir, os.ModePerm); err != nil {
+					return nil, model.NewAppError("BulkExport", "app.export.export_custom_emoji.mkdir.error", nil, "", http.StatusBadRequest).Wrap(err)
+				}
+			}
+		}
+
+		for _, emoji := range customEmojiList {
+			emojiImagePath := filepath.Join(emojiPath, emoji.Id, "image")
+			filePath := filepath.Join(exportDir, emoji.Id, "image")
+			if exportFiles {
+				err := a.copyEmojiImages(rctx, emoji.Id, emojiImagePath, pathToDir)
+				if err != nil {
+					return nil, model.NewAppError("BulkExport", "app.export.export_custom_emoji.copy_emoji_images.error", nil, "", http.StatusBadRequest).Wrap(err)
+				}
+			} else {
+				filePath = filepath.Join("emoji", emoji.Id, "image")
+				emojiPaths = append(emojiPaths, filePath)
+			}
+
+			emojiImportObject := importLineFromEmoji(emoji, filePath)
+			if err := a.exportWriteLine(writer, emojiImportObject); err != nil {
+				return nil, err
+			}
+		}
+	}
+	return emojiPaths, nil
+}
+
+// Copies emoji files from 'data/emoji' dir to 'exported_emoji' dir
+func (a *App) copyEmojiImages(rctx request.CTX, emojiId string, emojiImagePath string, pathToDir string) error {
+	fromPath, err := os.Open(emojiImagePath)
+	if fromPath == nil || err != nil {
+		return errors.New("Error reading " + emojiImagePath + " file")
+	}
+	defer func() {
+		if err = fromPath.Close(); err != nil {
+			rctx.Logger().Error("Error closing source file", mlog.String("path", emojiImagePath), mlog.Err(err))
+		}
+	}()
+
+	emojiDir := pathToDir + "/" + emojiId
+
+	if _, err = os.Stat(emojiDir); err != nil {
+		if !os.IsNotExist(err) {
+			return errors.Wrapf(err, "Error fetching file info of emoji directory %v", emojiDir)
+		}
+
+		if err = os.Mkdir(emojiDir, os.ModePerm); err != nil {
+			return errors.Wrapf(err, "Error creating emoji directory %v", emojiDir)
+		}
+	}
+
+	toPath, err := os.OpenFile(emojiDir+"/image", os.O_RDWR|os.O_CREATE, 0666)
+	if err != nil {
+		return errors.New("Error creating the image file " + err.Error())
+	}
+	defer func() {
+		if err = toPath.Close(); err != nil {
+			rctx.Logger().Error("Error closing destination file", mlog.String("path", emojiDir+"/image"), mlog.Err(err))
+		}
+	}()
+	_, err = io.Copy(toPath, fromPath)
+	if err != nil {
+		return errors.New("Error copying emojis " + err.Error())
+	}
+
+	return nil
+}
+
+func (a *App) exportAllDirectChannels(rctx request.CTX, job *model.Job, writer io.Writer, includeArchivedChannels bool) *model.AppError {
+	afterId := strings.Repeat("0", 26)
+	cnt := 0
+	for {
+		channels, err := a.Srv().Store().Channel().GetAllDirectChannelsForExportAfter(1000, afterId, includeArchivedChannels)
+		if err != nil {
+			return model.NewAppError("exportAllDirectChannels", "app.channel.get_all_direct.app_error", nil, "", http.StatusInternalServerError).Wrap(err)
+		}
+
+		if len(channels) == 0 {
+			break
+		}
+		cnt += len(channels)
+		updateJobProgress(rctx.Logger(), a.Srv().Store(), job, "direct_channels_exported", cnt)
+
+		for _, channel := range channels {
+			afterId = channel.Id
+
+			// Skip deleted.
+			if channel.DeleteAt != 0 {
+				continue
+			}
+
+			// Skip if there are no active members in the channel
+			if len(channel.Members) == 0 {
+				continue
+			}
+
+			// Skip if the channel member structure is not intact
+			switch channel.Type {
+			case model.ChannelTypeGroup:
+				groupMembers := make([]string, len(channel.Members))
+				for i, m := range channel.Members {
+					groupMembers[i] = m.UserId
+				}
+				if channel.Name != model.GetGroupNameFromUserIds(groupMembers) {
+					// this is the case of a group channel when other user is permanently deleted
+					// we skip this channel and inform by logging it.
+					job.Data["skipped_direct_channels"] = job.Data["skipped_direct_channels"] + "," + channel.Id
+					rctx.Logger().Warn("Skipping group channels with partially deleted members", mlog.String("channel_id", channel.Id))
+					continue
+				}
+			case model.ChannelTypeDirect:
+				if _, u2 := channel.GetBothUsersForDM(); u2 != "" && len(channel.Members) == 1 {
+					// this is the case of a direct channel when other user is permanently deleted
+					// we skip this channel and inform by logging it.
+					job.Data["skipped_direct_channels"] = job.Data["skipped_direct_channels"] + "," + channel.Id
+					rctx.Logger().Info("Skipping direct channel with one active member", mlog.String("channel_id", channel.Id), mlog.String("user_id", channel.Members[0].UserId))
+					continue
+				}
+			}
+
+			favoritedBy, err := a.buildFavoritedByList(rctx, channel.Id)
+			if err != nil {
+				return err
+			}
+
+			shownBy, err := a.buildShownByList(rctx, channel)
+			if err != nil {
+				return err
+			}
+
+			channelLine := importLineFromDirectChannel(channel, favoritedBy, shownBy)
+			if err := a.exportWriteLine(writer, channelLine); err != nil {
+				return err
+			}
+		}
+	}
+
+	return nil
+}
+
+func (a *App) buildFavoritedByList(rctx request.CTX, channelID string) ([]string, *model.AppError) {
+	prefs, err := a.Srv().Store().Preference().GetCategoryAndName(model.PreferenceCategoryFavoriteChannel, channelID)
+	if err != nil {
+		return nil, model.NewAppError("buildFavoritedByList", "app.preference.get_category.app_error", nil, "", http.StatusInternalServerError).Wrap(err)
+	}
+
+	userIDs := make([]string, 0, len(prefs))
+	for _, pref := range prefs {
+		if pref.Value != "true" {
+			continue
+		}
+
+		user, err := a.Srv().Store().User().Get(rctx, pref.UserId)
+		if err != nil {
+			return nil, model.NewAppError("buildFavoritedByList", "app.user.get.app_error", nil, "", http.StatusInternalServerError).Wrap(err)
+		}
+
+		userIDs = append(userIDs, user.Username)
+	}
+
+	return userIDs, nil
+}
+
+func (a *App) buildShownByList(rctx request.CTX, channel *model.DirectChannelForExport) ([]string, *model.AppError) {
+	shownBy := make([]string, 0)
+	switch channel.Type {
+	case model.ChannelTypeGroup:
+		for _, member := range channel.Members {
+			prefs, err := a.Srv().Store().Preference().GetCategory(member.UserId, model.PreferenceCategoryGroupChannelShow)
+			if err != nil {
+				return nil, model.NewAppError("buildShownByList", "app.preference.get_category.app_error", nil, "", http.StatusInternalServerError).Wrap(err)
+			}
+
+			for i := range prefs {
+				if prefs[i].Name == channel.Id && prefs[i].Value == "true" {
+					user, err := a.Srv().Store().User().Get(rctx, member.UserId)
+					if err != nil {
+						return nil, model.NewAppError("buildShownByList", "app.user.get.app_error", nil, "", http.StatusInternalServerError).Wrap(err)
+					}
+
+					shownBy = append(shownBy, user.Username)
+				}
+			}
+		}
+	case model.ChannelTypeDirect:
+		for i, member := range channel.Members {
+			otherMember := member // in case it's a channel with self
+			if len(channel.Members) == 2 {
+				// since the are only two members, the other member is should be the remainder of i+1/2
+				otherMember = channel.Members[(i+1)%2]
+			}
+			prefs, err := a.Srv().Store().Preference().GetCategoryAndName(model.PreferenceCategoryDirectChannelShow, otherMember.UserId)
+			if err != nil {
+				return nil, model.NewAppError("buildShownByList", "app.preference.get_category.app_error", nil, "", http.StatusInternalServerError).Wrap(err)
+			}
+
+			for _, pref := range prefs {
+				if pref.Value == "true" && pref.UserId == member.UserId {
+					user, err := a.Srv().Store().User().Get(rctx, member.UserId)
+					if err != nil {
+						return nil, model.NewAppError("buildShownByList", "app.user.get.app_error", nil, "", http.StatusInternalServerError).Wrap(err)
+					}
+
+					shownBy = append(shownBy, user.Username)
+				}
+			}
+		}
+	}
+
+	return shownBy, nil
+}
+
+func (a *App) exportAllDirectPosts(rctx request.CTX, job *model.Job, writer io.Writer, withAttachments, includeArchivedChannels bool) ([]imports.AttachmentImportData, *model.AppError) {
+	var attachments []imports.AttachmentImportData
+	afterId := strings.Repeat("0", 26)
+	var postProcessCount uint64
+	logCheckpoint := time.Now()
+
+	cnt := 0
+	for {
+		if time.Since(logCheckpoint) > 5*time.Minute {
+			rctx.Logger().Debug(fmt.Sprintf("Bulk Export: processed %d direct posts", postProcessCount))
+			logCheckpoint = time.Now()
+		}
+
+		posts, err := a.Srv().Store().Post().GetDirectPostParentsForExportAfter(1000, afterId, includeArchivedChannels)
+		if err != nil {
+			return nil, model.NewAppError("exportAllDirectPosts", "app.post.get_direct_posts.app_error", nil, "", http.StatusInternalServerError).Wrap(err)
+		}
+
+		if len(posts) == 0 {
+			break
+		}
+		cnt += len(posts)
+		updateJobProgress(rctx.Logger(), a.Srv().Store(), job, "direct_posts_exported", cnt)
+
+		postIDs := make([]string, len(posts))
+		for i, post := range posts {
+			postIDs[i] = post.Id
+		}
+		priorities, acknowledgements, appErr := a.buildPostPriorities(rctx, postIDs)
+		if appErr != nil {
+			return nil, appErr
+		}
+
+		channelsToSkip := model.SliceToMapKey(strings.Split(job.Data["skipped_direct_channels"], ",")...)
+		for _, post := range posts {
+			afterId = post.Id
+			postProcessCount++
+
+			// Skip deleted.
+			if post.DeleteAt != 0 {
+				continue
+			}
+
+			if _, ok := channelsToSkip[post.ChannelId]; ok {
+				continue
+			}
+
+			// Handle attachments.
+			var postAttachments []imports.AttachmentImportData
+			var err *model.AppError
+			if len(post.FileIds) > 0 {
+				postAttachments, err = a.buildPostAttachments(post.Id)
+				if err != nil {
+					return nil, err
+				}
+
+				if withAttachments && len(postAttachments) > 0 {
+					attachments = append(attachments, postAttachments...)
+				}
+			}
+
+			// Do the Replies.
+			replies, replyAttachments, err := a.buildPostReplies(rctx, post.Id, withAttachments)
+			if err != nil {
+				return nil, err
+			}
+
+			if withAttachments && len(replyAttachments) > 0 {
+				attachments = append(attachments, replyAttachments...)
+			}
+
+			postLine := importLineForDirectPost(post)
+			postLine.DirectPost.Replies = &replies
+			postLine.DirectPost.Priority = priorities[post.Id]
+			postLine.DirectPost.Acknowledgements = acknowledgements[post.Id]
+			if len(postAttachments) > 0 {
+				postLine.DirectPost.Attachments = &postAttachments
+			}
+
+			followers, err := a.buildThreadFollowers(rctx, post.Id)
+			if err != nil {
+				return nil, err
+			}
+
+			if len(followers) > 0 {
+				postLine.DirectPost.ThreadFollowers = &followers
+			}
+
+			if err := a.exportWriteLine(writer, postLine); err != nil {
+				return nil, err
+			}
+		}
+	}
+	return attachments, nil
+}
+
+func (a *App) exportFile(rctx request.CTX, outPath, filePath string, zipWr *zip.Writer) *model.AppError {
+	rd, appErr := a.FileReader(filePath)
+	if appErr != nil {
+		return appErr
+	}
+	defer func() {
+		if err := rd.Close(); err != nil {
+			rctx.Logger().Error("Error closing file", mlog.Err(err))
+		}
+	}()
+
+	if zipWr != nil {
+		wr, err := zipWr.CreateHeader(&zip.FileHeader{
+			Name:   filepath.Join(model.ExportDataDir, filePath),
+			Method: zip.Store,
+		})
+		if err != nil {
+			return model.NewAppError("exportFileAttachment", "app.export.export_attachment.zip_create_header.error",
+				nil, "", http.StatusInternalServerError).Wrap(err)
+		}
+
+		if _, err = io.Copy(wr, rd); err != nil {
+			return model.NewAppError("exportFileAttachment", "app.export.export_attachment.copy_file.error",
+				nil, "", http.StatusInternalServerError).Wrap(err)
+		}
+	} else {
+		filePath = filepath.Join(outPath, model.ExportDataDir, filePath)
+		if err := os.MkdirAll(filepath.Dir(filePath), 0700); err != nil {
+			return model.NewAppError("exportFileAttachment", "app.export.export_attachment.mkdirall.error",
+				nil, "", http.StatusInternalServerError).Wrap(err)
+		}
+
+		file, err := os.Create(filePath)
+		if err != nil {
+			return model.NewAppError("exportFileAttachment", "app.export.export_attachment.create_file.error",
+				nil, "", http.StatusInternalServerError).Wrap(err)
+		}
+		defer func() {
+			if err = file.Close(); err != nil {
+				rctx.Logger().Error("Error closing file", mlog.Err(err))
+			}
+		}()
+
+		if _, err = io.Copy(file, rd); err != nil {
+			return model.NewAppError("exportFileAttachment", "app.export.export_attachment.copy_file.error",
+				nil, "", http.StatusInternalServerError).Wrap(err)
+		}
+	}
+
+	return nil
+}
+
+func (a *App) ListExports() ([]string, *model.AppError) {
+	exports, appErr := a.ListExportDirectory(*a.Config().ExportSettings.Directory)
+	if appErr != nil {
+		return nil, appErr
+	}
+
+	results := make([]string, len(exports))
+	for i := range exports {
+		results[i] = filepath.Base(exports[i])
+	}
+
+	return results, nil
+}
+
+func (a *App) GeneratePresignURLForExport(name string) (*model.PresignURLResponse, *model.AppError) {
+	if !a.License().IsCloud() {
+		return nil, model.NewAppError("GeneratePresignURLForExport", "app.export.generate_presigned_url.direct_download.app_error", nil, "", http.StatusForbidden)
+	}
+
+	if !*a.Config().FileSettings.DedicatedExportStore {
+		return nil, model.NewAppError("GeneratePresignURLForExport", "app.export.generate_presigned_url.config.app_error", nil, "", http.StatusInternalServerError)
+	}
+
+	b := a.ExportFileBackend()
+	backend, ok := b.(filestore.FileBackendWithLinkGenerator)
+	if !ok {
+		return nil, model.NewAppError("GeneratePresignURLForExport", "app.export.generate_presigned_url.driver.app_error", nil, "", http.StatusInternalServerError)
+	}
+
+	p := path.Join(*a.Config().ExportSettings.Directory, filepath.Base(name))
+	found, err := b.FileExists(p)
+	if err != nil {
+		return nil, model.NewAppError("GeneratePresignURLForExport", "app.export.generate_presigned_url.fileexist.app_error", nil, "", http.StatusInternalServerError).Wrap(err)
+	}
+	if !found {
+		return nil, model.NewAppError("GeneratePresignURLForExport", "app.export.generate_presigned_url.notfound.app_error", nil, "", http.StatusInternalServerError)
+	}
+
+	link, exp, err := backend.GeneratePublicLink(p)
+	if err != nil {
+		return nil, model.NewAppError("GeneratePresignURLForExport", "app.export.generate_presigned_url.link.app_error", nil, "", http.StatusInternalServerError).Wrap(err)
+	}
+
+	return &model.PresignURLResponse{
+		URL:        link,
+		Expiration: exp,
+	}, nil
+}
+
+func (a *App) DeleteExport(name string) *model.AppError {
+	filePath := filepath.Join(*a.Config().ExportSettings.Directory, name)
+
+	if ok, err := a.ExportFileExists(filePath); err != nil {
+		return err
+	} else if !ok {
+		return nil
+	}
+
+	return a.RemoveExportFile(filePath)
+}
+
+func updateJobProgress(logger mlog.LoggerIFace, store store.Store, job *model.Job, key string, value int) {
+	if job != nil {
+		job.Data[key] = strconv.Itoa(value)
+		if _, err2 := store.Job().UpdateOptimistically(job, model.JobStatusInProgress); err2 != nil {
+			logger.Warn("Failed to update job status", mlog.Err(err2))
+		}
+	}
+}

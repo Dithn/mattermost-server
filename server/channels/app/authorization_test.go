@@ -1,0 +1,3933 @@
+// Copyright (c) 2015-present Mattermost, Inc. All Rights Reserved.
+// See LICENSE.txt for license information.
+
+package app
+
+import (
+	"encoding/csv"
+	"fmt"
+	"io"
+	"os"
+	"strconv"
+	"strings"
+	"testing"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+
+	"github.com/mattermost/mattermost/server/public/model"
+	"github.com/mattermost/mattermost/server/public/plugin/plugintest/mock"
+	"github.com/mattermost/mattermost/server/public/shared/request"
+	"github.com/mattermost/mattermost/server/v8/channels/store/storetest/mocks"
+)
+
+func TestSessionHasPermissionTo(t *testing.T) {
+	th := Setup(t).InitBasic(t)
+
+	localSession := model.Session{
+		UserId: th.BasicUser.Id,
+		Roles:  model.SystemUserRoleId,
+		Local:  true,
+	}
+
+	adminSession := model.Session{
+		UserId: th.SystemAdminUser.Id,
+		Roles:  model.SystemAdminRoleId,
+	}
+
+	session := model.Session{
+		UserId: th.BasicUser.Id,
+		Roles:  model.SystemUserRoleId,
+	}
+
+	t.Run("basic user cannot manage system", func(t *testing.T) {
+		require.False(t, th.App.SessionHasPermissionTo(session, model.PermissionManageSystem))
+	})
+
+	t.Run("basic user generally has no global permissions", func(t *testing.T) {
+		require.False(t, th.App.SessionHasPermissionTo(session, model.PermissionReadPublicChannel))
+	})
+
+	t.Run("system admin can manage system", func(t *testing.T) {
+		require.True(t, th.App.SessionHasPermissionTo(adminSession, model.PermissionManageSystem))
+	})
+
+	t.Run("unrestricted session has all permissions", func(t *testing.T) {
+		require.True(t, th.App.SessionHasPermissionTo(localSession, model.PermissionManageSystem))
+		require.True(t, th.App.SessionHasPermissionTo(localSession, model.PermissionCreateBot))
+		require.True(t, th.App.SessionHasPermissionTo(localSession, model.PermissionReadPublicChannel))
+	})
+}
+
+func TestSessionHasPermissionToAndNotRestrictedAdmin(t *testing.T) {
+	th := Setup(t).InitBasic(t)
+
+	localSession := model.Session{
+		UserId: th.BasicUser.Id,
+		Roles:  model.SystemUserRoleId,
+		Local:  true,
+	}
+
+	adminSession := model.Session{
+		UserId: th.SystemAdminUser.Id,
+		Roles:  model.SystemAdminRoleId,
+	}
+
+	session := model.Session{
+		UserId: th.BasicUser.Id,
+		Roles:  model.SystemUserRoleId,
+	}
+
+	t.Run("basic user cannot manage system", func(t *testing.T) {
+		require.False(t, th.App.SessionHasPermissionToAndNotRestrictedAdmin(session, model.PermissionManageSystem))
+	})
+
+	t.Run("allow system admin when not restricted", func(t *testing.T) {
+		th.App.UpdateConfig(func(cfg *model.Config) {
+			*cfg.ExperimentalSettings.RestrictSystemAdmin = false
+		})
+		require.True(t, th.App.SessionHasPermissionToAndNotRestrictedAdmin(adminSession, model.PermissionManageSystem))
+	})
+
+	t.Run("reject system admin when restricted", func(t *testing.T) {
+		th.App.UpdateConfig(func(cfg *model.Config) {
+			*cfg.ExperimentalSettings.RestrictSystemAdmin = true
+		})
+		require.False(t, th.App.SessionHasPermissionToAndNotRestrictedAdmin(adminSession, model.PermissionManageSystem))
+	})
+
+	t.Run("always allow unrestricted session", func(t *testing.T) {
+		th.App.UpdateConfig(func(cfg *model.Config) {
+			*cfg.ExperimentalSettings.RestrictSystemAdmin = false
+		})
+
+		require.True(t, th.App.SessionHasPermissionToAndNotRestrictedAdmin(localSession, model.PermissionManageSystem))
+		require.True(t, th.App.SessionHasPermissionToAndNotRestrictedAdmin(localSession, model.PermissionCreateBot))
+		require.True(t, th.App.SessionHasPermissionToAndNotRestrictedAdmin(localSession, model.PermissionReadPublicChannel))
+
+		th.App.UpdateConfig(func(cfg *model.Config) {
+			*cfg.ExperimentalSettings.RestrictSystemAdmin = true
+		})
+
+		require.True(t, th.App.SessionHasPermissionToAndNotRestrictedAdmin(localSession, model.PermissionManageSystem))
+		require.True(t, th.App.SessionHasPermissionToAndNotRestrictedAdmin(localSession, model.PermissionCreateBot))
+		require.True(t, th.App.SessionHasPermissionToAndNotRestrictedAdmin(localSession, model.PermissionReadPublicChannel))
+	})
+}
+
+func TestCheckIfRolesGrantPermission(t *testing.T) {
+	mainHelper.Parallel(t)
+	th := Setup(t)
+
+	cases := []struct {
+		roles        []string
+		permissionID string
+		shouldGrant  bool
+	}{
+		{[]string{model.SystemAdminRoleId}, model.PermissionManageSystem.Id, true},
+		{[]string{model.SystemAdminRoleId}, "non-existent-permission", false},
+		{[]string{model.ChannelUserRoleId}, model.PermissionReadChannel.Id, true},
+		{[]string{model.ChannelUserRoleId}, model.PermissionReadChannelContent.Id, true},
+		{[]string{model.ChannelUserRoleId}, model.PermissionManageSystem.Id, false},
+		{[]string{model.SystemAdminRoleId, model.ChannelUserRoleId}, model.PermissionManageSystem.Id, true},
+		{[]string{model.ChannelUserRoleId, model.SystemAdminRoleId}, model.PermissionManageSystem.Id, true},
+		{[]string{model.TeamUserRoleId, model.TeamAdminRoleId}, model.PermissionManageOwnSlashCommands.Id, true},
+		{[]string{model.TeamAdminRoleId, model.TeamUserRoleId}, model.PermissionManageOwnSlashCommands.Id, true},
+		{[]string{model.ChannelGuestRoleId}, model.PermissionReadChannelContent.Id, true},
+	}
+
+	for _, testcase := range cases {
+		require.Equal(t, th.App.RolesGrantPermission(testcase.roles, testcase.permissionID), testcase.shouldGrant)
+	}
+}
+
+func TestChannelRolesGrantPermission(t *testing.T) {
+	mainHelper.Parallel(t)
+	testPermissionInheritance(t, func(t *testing.T, th *TestHelper, testData permissionInheritanceTestData) {
+		require.Equal(t, testData.shouldHavePermission, th.App.RolesGrantPermission([]string{testData.channelRole.Name}, testData.permission.Id), "row: %+v\n", testData.truthTableRow)
+	})
+}
+
+func TestHasPermissionToTeam(t *testing.T) {
+	mainHelper.Parallel(t)
+	th := Setup(t).InitBasic(t)
+
+	assert.True(t, th.App.HasPermissionToTeam(th.Context, th.BasicUser.Id, th.BasicTeam.Id, model.PermissionListTeamChannels))
+	th.RemoveUserFromTeam(t, th.BasicUser, th.BasicTeam)
+	assert.False(t, th.App.HasPermissionToTeam(th.Context, th.BasicUser.Id, th.BasicTeam.Id, model.PermissionListTeamChannels))
+
+	assert.True(t, th.App.HasPermissionToTeam(th.Context, th.SystemAdminUser.Id, th.BasicTeam.Id, model.PermissionListTeamChannels))
+	th.LinkUserToTeam(t, th.SystemAdminUser, th.BasicTeam)
+	assert.True(t, th.App.HasPermissionToTeam(th.Context, th.SystemAdminUser.Id, th.BasicTeam.Id, model.PermissionListTeamChannels))
+	th.RemovePermissionFromRole(t, model.PermissionListTeamChannels.Id, model.TeamUserRoleId)
+	assert.True(t, th.App.HasPermissionToTeam(th.Context, th.SystemAdminUser.Id, th.BasicTeam.Id, model.PermissionListTeamChannels))
+	th.RemoveUserFromTeam(t, th.SystemAdminUser, th.BasicTeam)
+	assert.True(t, th.App.HasPermissionToTeam(th.Context, th.SystemAdminUser.Id, th.BasicTeam.Id, model.PermissionListTeamChannels))
+}
+
+func TestSessionHasPermissionToTeams(t *testing.T) {
+	mainHelper.Parallel(t)
+	th := Setup(t).InitBasic(t)
+
+	// Adding another team with more channels (public and private)
+	myTeam := th.CreateTeam(t)
+
+	bothTeams := []string{th.BasicTeam.Id, myTeam.Id}
+	t.Run("session with team members can access teams", func(t *testing.T) {
+		session := model.Session{
+			UserId: th.BasicUser.Id,
+			TeamMembers: []*model.TeamMember{
+				{
+					UserId: th.BasicUser.Id,
+					TeamId: th.BasicTeam.Id,
+					Roles:  model.TeamUserRoleId,
+				},
+				{
+					UserId: th.BasicUser.Id,
+					TeamId: myTeam.Id,
+					Roles:  model.TeamUserRoleId,
+				},
+			},
+		}
+		assert.True(t, th.App.SessionHasPermissionToTeams(th.Context, session, bothTeams, model.PermissionJoinPublicChannels))
+	})
+
+	t.Run("session with one team members cannot access teams", func(t *testing.T) {
+		session := model.Session{
+			UserId: th.BasicUser.Id,
+			TeamMembers: []*model.TeamMember{
+				{
+					UserId: th.BasicUser.Id,
+					TeamId: th.BasicTeam.Id,
+					Roles:  model.TeamUserRoleId,
+				},
+			},
+		}
+		assert.False(t, th.App.SessionHasPermissionToTeams(th.Context, session, bothTeams, model.PermissionJoinPublicChannels))
+	})
+
+	t.Run("session role  cannot access teams", func(t *testing.T) {
+		session := model.Session{
+			UserId: th.BasicUser.Id,
+			Roles:  model.SystemUserRoleId,
+		}
+		assert.False(t, th.App.SessionHasPermissionToTeams(th.Context, session, bothTeams, model.PermissionJoinPublicChannels))
+	})
+
+	t.Run("session admin role can access teams", func(t *testing.T) {
+		session := model.Session{
+			UserId: th.BasicUser.Id,
+			Roles:  model.SystemAdminRoleId,
+		}
+		assert.True(t, th.App.SessionHasPermissionToTeams(th.Context, session, bothTeams, model.PermissionJoinPublicChannels))
+	})
+}
+
+func TestSessionHasPermissionToChannel(t *testing.T) {
+	mainHelper.Parallel(t)
+	th := Setup(t).InitBasic(t)
+
+	session := model.Session{
+		UserId: th.BasicUser.Id,
+	}
+
+	t.Run("basic user can access basic channel", func(t *testing.T) {
+		ok, isMember := th.App.SessionHasPermissionToChannel(th.Context, session, th.BasicChannel.Id, model.PermissionAddReaction)
+		assert.True(t, ok)
+		assert.True(t, isMember)
+	})
+
+	t.Run("basic user can access archived channel", func(t *testing.T) {
+		err := th.App.DeleteChannel(th.Context, th.BasicChannel, th.SystemAdminUser.Id)
+		require.Nil(t, err)
+		ok, isMember := th.App.SessionHasPermissionToChannel(th.Context, session, th.BasicChannel.Id, model.PermissionReadChannel)
+		assert.True(t, ok)
+		assert.True(t, isMember)
+	})
+
+	t.Run("admin user can access channel if not a member", func(t *testing.T) {
+		adminSession := model.Session{
+			UserId: th.SystemAdminUser.Id,
+			Roles:  model.SystemAdminRoleId,
+		}
+
+		ok, isMember := th.App.SessionHasPermissionToChannel(th.Context, adminSession, th.BasicChannel.Id, model.PermissionAddReaction)
+		assert.True(t, ok)
+		assert.False(t, isMember)
+	})
+
+	t.Run("does not panic if fetching channel causes an error", func(t *testing.T) {
+		// Regression test for MM-29812
+		// Mock the channel store so getting the channel returns with an error, as per the bug report.
+		mockStore := mocks.Store{}
+
+		// Playbooks DB job requires a plugin mock
+		pluginStore := mocks.PluginStore{}
+		pluginStore.On("List", mock.Anything, mock.Anything, mock.Anything).Return([]string{}, nil)
+		pluginStore.On("ListWithOptions", mock.Anything, mock.Anything, mock.Anything, mock.Anything).Return([]string{}, nil)
+		mockStore.On("Plugin").Return(&pluginStore)
+
+		mockChannelStore := mocks.ChannelStore{}
+		mockChannelStore.On("Get", mock.Anything, mock.Anything).Return(nil, fmt.Errorf("arbitrary error"))
+		mockChannelStore.On("GetAllChannelMembersForUser", mock.Anything, mock.Anything, mock.Anything, mock.Anything).Return(th.App.Srv().Store().Channel().GetAllChannelMembersForUser(th.Context, th.BasicUser.Id, false, false))
+		mockChannelStore.On("ClearCaches").Return()
+		mockStore.On("Channel").Return(&mockChannelStore)
+		mockStore.On("FileInfo").Return(th.App.Srv().Store().FileInfo())
+		mockStore.On("License").Return(th.App.Srv().Store().License())
+		mockStore.On("Post").Return(th.App.Srv().Store().Post())
+		mockStore.On("Role").Return(th.App.Srv().Store().Role())
+		mockStore.On("System").Return(th.App.Srv().Store().System())
+		mockStore.On("Team").Return(th.App.Srv().Store().Team())
+		mockStore.On("User").Return(th.App.Srv().Store().User())
+		mockStore.On("Webhook").Return(th.App.Srv().Store().Webhook())
+		mockStore.On("DeliveryTracking").Return(th.App.Srv().Store().DeliveryTracking())
+		mockStore.On("Close").Return(nil)
+		th.App.Srv().SetStore(&mockStore)
+
+		// If there's an error returned from the GetChannel call the code should continue to cascade and since there
+		// are no session level permissions in this test case, the permission should be denied.
+		ok, isMember := th.App.SessionHasPermissionToChannel(th.Context, session, th.BasicUser.Id, model.PermissionAddReaction)
+		assert.False(t, ok)
+		assert.False(t, isMember)
+	})
+}
+
+func TestSessionHasPermissionToChannels(t *testing.T) {
+	mainHelper.Parallel(t)
+	th := Setup(t).InitBasic(t)
+
+	ch1 := th.CreateChannel(t, th.BasicTeam)
+	ch2 := th.CreatePrivateChannel(t, th.BasicTeam)
+	_, appErr := th.App.AddUserToChannel(th.Context, th.BasicUser, ch1, false)
+	assert.Nil(t, appErr)
+	_, appErr = th.App.AddUserToChannel(th.Context, th.BasicUser, ch2, false)
+	assert.Nil(t, appErr)
+
+	allChannels := []string{th.BasicChannel.Id, ch1.Id, ch2.Id}
+
+	t.Run("basic user can access basic channels", func(t *testing.T) {
+		session := model.Session{
+			UserId: th.BasicUser.Id,
+		}
+
+		assert.True(t, th.App.SessionHasPermissionToChannels(th.Context, session, allChannels, model.PermissionReadChannel))
+	})
+
+	t.Run("basic user removed from channel cannot access", func(t *testing.T) {
+		session := model.Session{
+			UserId: th.BasicUser.Id,
+		}
+
+		appErr := th.App.removeUserFromChannel(th.Context, th.BasicUser.Id, th.SystemAdminUser.Id, ch1)
+		assert.Nil(t, appErr)
+		assert.False(t, th.App.SessionHasPermissionToChannels(th.Context, session, allChannels, model.PermissionReadChannel))
+	})
+
+	t.Run("basic user can access archived channel", func(t *testing.T) {
+		session := model.Session{
+			UserId: th.BasicUser.Id,
+		}
+
+		newChannel := th.CreateChannel(t, th.BasicTeam)
+		_, appErr := th.App.AddUserToChannel(th.Context, th.BasicUser, newChannel, false)
+		assert.Nil(t, appErr)
+
+		err := th.App.DeleteChannel(th.Context, newChannel, th.SystemAdminUser.Id)
+		require.Nil(t, err)
+		assert.True(t, th.App.SessionHasPermissionToChannels(th.Context, session, []string{newChannel.Id}, model.PermissionReadChannel))
+	})
+
+	t.Run("basic user can access mixed archived and non-archived channels", func(t *testing.T) {
+		session := model.Session{
+			UserId: th.BasicUser.Id,
+		}
+
+		archivedChannel := th.CreateChannel(t, th.BasicTeam)
+		_, appErr := th.App.AddUserToChannel(th.Context, th.BasicUser, archivedChannel, false)
+		assert.Nil(t, appErr)
+
+		err := th.App.DeleteChannel(th.Context, archivedChannel, th.SystemAdminUser.Id)
+		require.Nil(t, err)
+
+		mixedChannels := []string{th.BasicChannel.Id, archivedChannel.Id}
+		assert.True(t, th.App.SessionHasPermissionToChannels(th.Context, session, mixedChannels, model.PermissionReadChannel))
+	})
+
+	t.Run("System Admins can access basic channels", func(t *testing.T) {
+		session := model.Session{
+			UserId: th.SystemAdminUser.Id,
+			Roles:  model.SystemAdminRoleId,
+		}
+		assert.True(t, th.App.SessionHasPermissionToChannels(th.Context, session, allChannels, model.PermissionManagePrivateChannelMembers))
+	})
+
+	t.Run("does not panic if fetching channel causes an error", func(t *testing.T) {
+		// Regression test for MM-29812
+		// Mock the channel store so getting the channel returns with an error, as per the bug report.
+		mockStore := mocks.Store{}
+		mockChannelStore := mocks.ChannelStore{}
+		mockChannelStore.On("Get", mock.Anything, mock.Anything).Return(nil, fmt.Errorf("arbitrary error"))
+		mockChannelStore.On("GetAllChannelMembersForUser", mock.Anything, mock.Anything, mock.Anything, mock.Anything).Return(th.App.Srv().Store().Channel().GetAllChannelMembersForUser(th.Context, th.BasicUser.Id, false, false))
+		mockChannelStore.On("ClearCaches").Return()
+		mockStore.On("Channel").Return(&mockChannelStore)
+		mockStore.On("FileInfo").Return(th.App.Srv().Store().FileInfo())
+		mockStore.On("License").Return(th.App.Srv().Store().License())
+		mockStore.On("Post").Return(th.App.Srv().Store().Post())
+		mockStore.On("Role").Return(th.App.Srv().Store().Role())
+		mockStore.On("System").Return(th.App.Srv().Store().System())
+		mockStore.On("Team").Return(th.App.Srv().Store().Team())
+		mockStore.On("User").Return(th.App.Srv().Store().User())
+		mockStore.On("Webhook").Return(th.App.Srv().Store().Webhook())
+		mockStore.On("DeliveryTracking").Return(th.App.Srv().Store().DeliveryTracking())
+		mockStore.On("Close").Return(nil)
+		th.App.Srv().SetStore(&mockStore)
+
+		// If there's an error returned from the GetChannel call the code should continue to cascade and since there
+		// are no session level permissions in this test case, the permission should be denied.
+		session := model.Session{
+			UserId: th.BasicUser.Id,
+		}
+		assert.False(t, th.App.SessionHasPermissionToChannels(th.Context, session, allChannels, model.PermissionReadChannel))
+	})
+}
+
+func TestHasPermissionToUser(t *testing.T) {
+	mainHelper.Parallel(t)
+	th := Setup(t).InitBasic(t)
+
+	assert.True(t, th.App.HasPermissionToUser(th.Context, th.SystemAdminUser.Id, th.BasicUser.Id))
+	assert.True(t, th.App.HasPermissionToUser(th.Context, th.BasicUser.Id, th.BasicUser.Id))
+	assert.False(t, th.App.HasPermissionToUser(th.Context, th.BasicUser.Id, th.BasicUser2.Id))
+}
+
+func TestSessionHasPermissionToManageBot(t *testing.T) {
+	mainHelper.Parallel(t)
+	th := Setup(t).InitBasic(t)
+
+	bot, err := th.App.CreateBot(th.Context, &model.Bot{
+		Username:    "username",
+		Description: "a bot",
+		OwnerId:     th.BasicUser.Id,
+	})
+	require.Nil(t, err)
+	defer func() {
+		appErr := th.App.PermanentDeleteBot(th.Context, bot.UserId)
+		assert.Nil(t, appErr)
+	}()
+	assert.NotNil(t, bot)
+
+	t.Run("test my bot", func(t *testing.T) {
+		session := model.Session{
+			UserId: th.BasicUser.Id,
+			Roles:  model.SystemUserRoleId,
+		}
+		err = th.App.SessionHasPermissionToManageBot(th.Context, session, bot.UserId)
+		assert.NotNil(t, err)
+		assert.Equal(t, "store.sql_bot.get.missing.app_error", err.Id)
+		assert.NoError(t, err.Unwrap())
+
+		th.AddPermissionToRole(t, model.PermissionReadBots.Id, model.SystemUserRoleId)
+		err = th.App.SessionHasPermissionToManageBot(th.Context, session, bot.UserId)
+		assert.NotNil(t, err)
+		assert.Equal(t, "api.context.permissions.app_error", err.Id)
+		assert.NoError(t, err.Unwrap())
+
+		th.AddPermissionToRole(t, model.PermissionManageBots.Id, model.SystemUserRoleId)
+		err = th.App.SessionHasPermissionToManageBot(th.Context, session, bot.UserId)
+		assert.Nil(t, err)
+
+		th.RemovePermissionFromRole(t, model.PermissionReadBots.Id, model.SystemUserRoleId)
+		th.RemovePermissionFromRole(t, model.PermissionManageBots.Id, model.SystemUserRoleId)
+	})
+
+	t.Run("test others bot", func(t *testing.T) {
+		session := model.Session{
+			UserId: th.BasicUser2.Id,
+			Roles:  model.SystemUserRoleId,
+		}
+		err = th.App.SessionHasPermissionToManageBot(th.Context, session, bot.UserId)
+		assert.NotNil(t, err)
+		assert.Equal(t, "store.sql_bot.get.missing.app_error", err.Id)
+		assert.NoError(t, err.Unwrap())
+
+		th.AddPermissionToRole(t, model.PermissionReadOthersBots.Id, model.SystemUserRoleId)
+		err = th.App.SessionHasPermissionToManageBot(th.Context, session, bot.UserId)
+		assert.NotNil(t, err)
+		assert.Equal(t, "api.context.permissions.app_error", err.Id)
+		assert.NoError(t, err.Unwrap())
+
+		th.AddPermissionToRole(t, model.PermissionManageOthersBots.Id, model.SystemUserRoleId)
+		err = th.App.SessionHasPermissionToManageBot(th.Context, session, bot.UserId)
+		assert.Nil(t, err)
+
+		th.RemovePermissionFromRole(t, model.PermissionReadOthersBots.Id, model.SystemUserRoleId)
+		th.RemovePermissionFromRole(t, model.PermissionManageOthersBots.Id, model.SystemUserRoleId)
+	})
+
+	t.Run("test user manager access", func(t *testing.T) {
+		session := model.Session{
+			UserId: th.BasicUser2.Id,
+			Roles:  model.SystemUserManagerRoleId,
+		}
+
+		// test non bot, contains wrapped error
+		err = th.App.SessionHasPermissionToManageBot(th.Context, session, "12345")
+		assert.NotNil(t, err)
+		assert.Equal(t, "store.sql_bot.get.missing.app_error", err.Id)
+		assert.Error(t, err.Unwrap())
+
+		// test existing bot, without PermissionManageOthersBots - no wrapped error
+		err = th.App.SessionHasPermissionToManageBot(th.Context, session, bot.UserId)
+		assert.NotNil(t, err)
+		assert.Equal(t, "store.sql_bot.get.missing.app_error", err.Id)
+		assert.NoError(t, err.Unwrap())
+
+		// test with correct permissions
+		th.AddPermissionToRole(t, model.PermissionManageOthersBots.Id, model.SystemUserManagerRoleId)
+		err = th.App.SessionHasPermissionToManageBot(th.Context, session, bot.UserId)
+		assert.Nil(t, err)
+
+		th.RemovePermissionFromRole(t, model.PermissionManageOthersBots.Id, model.SystemUserManagerRoleId)
+	})
+
+	t.Run("test sysadmin role", func(t *testing.T) {
+		session := model.Session{
+			UserId: th.SystemAdminUser.Id,
+			Roles:  model.SystemAdminRoleId,
+		}
+		err = th.App.SessionHasPermissionToManageBot(th.Context, session, bot.UserId)
+		assert.Nil(t, err)
+	})
+
+	t.Run("test non bot ", func(t *testing.T) {
+		session := model.Session{
+			UserId: th.SystemAdminUser.Id,
+			Roles:  model.SystemUserRoleId,
+		}
+		err = th.App.SessionHasPermissionToManageBot(th.Context, session, "12345")
+		assert.NotNil(t, err)
+		assert.Equal(t, "store.sql_bot.get.missing.app_error", err.Id)
+		assert.Error(t, err.Unwrap())
+	})
+}
+
+func TestSessionHasPermissionToUser(t *testing.T) {
+	mainHelper.Parallel(t)
+	th := Setup(t).InitBasic(t)
+
+	t.Run("test my user access", func(t *testing.T) {
+		session := model.Session{
+			UserId: th.BasicUser.Id,
+			Roles:  model.SystemUserRoleId,
+		}
+		assert.True(t, th.App.SessionHasPermissionToUser(th.Context, session, th.BasicUser.Id))
+		assert.False(t, th.App.SessionHasPermissionToUser(th.Context, session, th.BasicUser2.Id))
+	})
+
+	t.Run("test user manager access", func(t *testing.T) {
+		session := model.Session{
+			UserId: th.BasicUser.Id,
+			Roles:  model.SystemUserManagerRoleId,
+		}
+		assert.False(t, th.App.SessionHasPermissionToUser(th.Context, session, th.BasicUser2.Id))
+
+		th.AddPermissionToRole(t, model.PermissionEditOtherUsers.Id, model.SystemUserManagerRoleId)
+		assert.True(t, th.App.SessionHasPermissionToUser(th.Context, session, th.BasicUser2.Id))
+		assert.False(t, th.App.SessionHasPermissionToUser(th.Context, session, th.SystemAdminUser.Id))
+		th.RemovePermissionFromRole(t, model.PermissionEditOtherUsers.Id, model.SystemUserManagerRoleId)
+
+		bot, err := th.App.CreateBot(th.Context, &model.Bot{
+			Username:    "username",
+			Description: "a bot",
+			OwnerId:     th.BasicUser2.Id,
+		})
+		require.Nil(t, err)
+		assert.NotNil(t, bot)
+		defer func() {
+			appErr := th.App.PermanentDeleteBot(th.Context, bot.UserId)
+			assert.Nil(t, appErr)
+		}()
+
+		assert.False(t, th.App.SessionHasPermissionToUser(th.Context, session, bot.UserId))
+	})
+
+	t.Run("test admin user access", func(t *testing.T) {
+		session := model.Session{
+			UserId: th.SystemAdminUser.Id,
+			Roles:  model.SystemAdminRoleId,
+		}
+		assert.True(t, th.App.SessionHasPermissionToUser(th.Context, session, th.BasicUser.Id))
+		assert.True(t, th.App.SessionHasPermissionToUser(th.Context, session, th.BasicUser2.Id))
+	})
+}
+
+func TestSessionHasPermissionToManageUserOrBot(t *testing.T) {
+	mainHelper.Parallel(t)
+	th := Setup(t).InitBasic(t)
+
+	bot, err := th.App.CreateBot(th.Context, &model.Bot{
+		Username:    "username",
+		Description: "a bot",
+		OwnerId:     th.BasicUser.Id,
+	})
+	require.Nil(t, err)
+	defer func() {
+		appErr := th.App.PermanentDeleteBot(th.Context, bot.UserId)
+		assert.Nil(t, appErr)
+	}()
+
+	t.Run("test basic user access", func(t *testing.T) {
+		session := model.Session{
+			UserId: th.BasicUser.Id,
+			Roles:  model.SystemUserRoleId,
+		}
+		assert.True(t, th.App.SessionHasPermissionToUserOrBot(th.Context, session, th.BasicUser.Id))
+		assert.False(t, th.App.SessionHasPermissionToUserOrBot(th.Context, session, bot.UserId))
+		assert.False(t, th.App.SessionHasPermissionToUserOrBot(th.Context, session, th.BasicUser2.Id))
+	})
+
+	t.Run("test user manager access", func(t *testing.T) {
+		session := model.Session{
+			UserId: th.BasicUser2.Id,
+			Roles:  model.SystemUserManagerRoleId,
+		}
+		assert.False(t, th.App.SessionHasPermissionToUserOrBot(th.Context, session, th.BasicUser.Id))
+		assert.True(t, th.App.SessionHasPermissionToUserOrBot(th.Context, session, th.BasicUser2.Id))
+		assert.False(t, th.App.SessionHasPermissionToUserOrBot(th.Context, session, bot.UserId))
+
+		th.AddPermissionToRole(t, model.PermissionEditOtherUsers.Id, model.SystemUserManagerRoleId)
+		assert.True(t, th.App.SessionHasPermissionToUserOrBot(th.Context, session, th.BasicUser.Id))
+		assert.False(t, th.App.SessionHasPermissionToUserOrBot(th.Context, session, bot.UserId))
+		th.RemovePermissionFromRole(t, model.PermissionEditOtherUsers.Id, model.SystemUserManagerRoleId)
+
+		th.AddPermissionToRole(t, model.PermissionManageOthersBots.Id, model.SystemUserManagerRoleId)
+		assert.False(t, th.App.SessionHasPermissionToUserOrBot(th.Context, session, th.BasicUser.Id))
+		assert.True(t, th.App.SessionHasPermissionToUserOrBot(th.Context, session, bot.UserId))
+		th.RemovePermissionFromRole(t, model.PermissionManageOthersBots.Id, model.SystemUserManagerRoleId)
+	})
+
+	t.Run("test system admin access", func(t *testing.T) {
+		session := model.Session{
+			UserId: th.SystemAdminUser.Id,
+			Roles:  model.SystemAdminRoleId,
+		}
+		assert.True(t, th.App.SessionHasPermissionToUserOrBot(th.Context, session, bot.UserId))
+		assert.True(t, th.App.SessionHasPermissionToUserOrBot(th.Context, session, th.BasicUser.Id))
+	})
+}
+
+func TestHasPermissionToCategory(t *testing.T) {
+	mainHelper.Parallel(t)
+	th := Setup(t).InitBasic(t)
+
+	session, err := th.App.CreateSession(th.Context, &model.Session{UserId: th.BasicUser.Id, Props: model.StringMap{}})
+	require.Nil(t, err)
+
+	categories, err := th.App.GetSidebarCategoriesForTeamForUser(th.Context, th.BasicUser.Id, th.BasicTeam.Id)
+	require.Nil(t, err)
+
+	_, err = th.App.GetSession(session.Token)
+	require.Nil(t, err)
+	require.True(t, th.App.SessionHasPermissionToCategory(th.Context, *session, th.BasicUser.Id, th.BasicTeam.Id, categories.Order[0]))
+
+	categories2, err := th.App.GetSidebarCategoriesForTeamForUser(th.Context, th.BasicUser2.Id, th.BasicTeam.Id)
+	require.Nil(t, err)
+	require.False(t, th.App.SessionHasPermissionToCategory(th.Context, *session, th.BasicUser.Id, th.BasicTeam.Id, categories2.Order[0]))
+}
+
+func TestSessionHasPermissionToGroup(t *testing.T) {
+	mainHelper.Parallel(t)
+	th := Setup(t).InitBasic(t)
+
+	file, e := os.Open("tests/group-role-has-permission.csv")
+	require.NoError(t, e)
+	defer file.Close()
+
+	b, e := io.ReadAll(file)
+	require.NoError(t, e)
+
+	r := csv.NewReader(strings.NewReader(string(b)))
+	records, e := r.ReadAll()
+	require.NoError(t, e)
+
+	systemRole, err := th.App.GetRoleByName(th.Context, model.SystemUserRoleId)
+	require.Nil(t, err)
+
+	groupRole, err := th.App.GetRoleByName(th.Context, model.CustomGroupUserRoleId)
+	require.Nil(t, err)
+
+	group, err := th.App.CreateGroup(&model.Group{
+		Name:           new(model.NewId()),
+		DisplayName:    model.NewId(),
+		Source:         model.GroupSourceCustom,
+		AllowReference: true,
+	})
+	require.Nil(t, err)
+
+	permission := model.PermissionDeleteCustomGroup
+
+	for i, row := range records {
+		// skip csv header
+		if i == 0 {
+			continue
+		}
+
+		systemRoleHasPermission, e := strconv.ParseBool(row[0])
+		require.NoError(t, e)
+
+		isGroupMember, e := strconv.ParseBool(row[1])
+		require.NoError(t, e)
+
+		groupRoleHasPermission, e := strconv.ParseBool(row[2])
+		require.NoError(t, e)
+
+		permissionShouldBeGranted, e := strconv.ParseBool(row[3])
+		require.NoError(t, e)
+
+		if systemRoleHasPermission {
+			th.AddPermissionToRole(t, permission.Id, systemRole.Name)
+		} else {
+			th.RemovePermissionFromRole(t, permission.Id, systemRole.Name)
+		}
+
+		if isGroupMember {
+			_, err := th.App.UpsertGroupMember(group.Id, th.BasicUser.Id)
+			require.Nil(t, err)
+		} else {
+			_, err := th.App.DeleteGroupMember(group.Id, th.BasicUser.Id)
+			if err != nil && err.Id != "app.group.no_rows" {
+				t.Error(err)
+			}
+		}
+
+		if groupRoleHasPermission {
+			th.AddPermissionToRole(t, permission.Id, groupRole.Name)
+		} else {
+			th.RemovePermissionFromRole(t, permission.Id, groupRole.Name)
+		}
+
+		session, err := th.App.CreateSession(th.Context, &model.Session{UserId: th.BasicUser.Id, Props: model.StringMap{}, Roles: systemRole.Name})
+		require.Nil(t, err)
+
+		result := th.App.SessionHasPermissionToGroup(*session, group.Id, permission)
+
+		if permissionShouldBeGranted {
+			require.True(t, result, fmt.Sprintf("row: %v", row))
+		} else {
+			require.False(t, result, fmt.Sprintf("row: %v", row))
+		}
+	}
+}
+
+func TestHasPermissionToReadChannel(t *testing.T) {
+	mainHelper.Parallel(t)
+	th := Setup(t).InitBasic(t)
+
+	ttcc := []struct {
+		name                    string
+		configComplianceEnabled bool
+		channelDeleted          bool
+		canReadChannel          bool
+		channelType             model.ChannelType
+		canReadPublicChannel    bool
+		expected                bool
+		isAdmin                 bool
+	}{
+		{
+			name:                    "Can read archived channels",
+			configComplianceEnabled: true,
+			channelDeleted:          true,
+			canReadChannel:          true,
+			channelType:             model.ChannelTypeOpen,
+			canReadPublicChannel:    true,
+			expected:                true,
+		},
+		{
+			name:                    "Can read if it has permissions to read",
+			configComplianceEnabled: true,
+			channelDeleted:          false,
+			canReadChannel:          true,
+			channelType:             model.ChannelTypePrivate,
+			canReadPublicChannel:    true,
+			expected:                true,
+		},
+		{
+			name:                    "Cannot read private channels if it has no permission",
+			configComplianceEnabled: false,
+			channelDeleted:          false,
+			canReadChannel:          false,
+			channelType:             model.ChannelTypePrivate,
+			canReadPublicChannel:    true,
+			expected:                false,
+		},
+		{
+			name:                    "Cannot read open channels if compliance is enabled",
+			configComplianceEnabled: true,
+			channelDeleted:          false,
+			canReadChannel:          false,
+			channelType:             model.ChannelTypeOpen,
+			canReadPublicChannel:    true,
+			expected:                false,
+		},
+		{
+			name:                    "Cannot read open channels if it has no team permissions",
+			configComplianceEnabled: false,
+			channelDeleted:          false,
+			canReadChannel:          false,
+			channelType:             model.ChannelTypeOpen,
+			canReadPublicChannel:    false,
+			expected:                false,
+		},
+		{
+			name:                    "Can read open channels if it has team permissions and compliance is not enabled",
+			configComplianceEnabled: false,
+			channelDeleted:          false,
+			canReadChannel:          false,
+			channelType:             model.ChannelTypeOpen,
+			canReadPublicChannel:    true,
+			expected:                true,
+		},
+		{
+			name:                    "Can read private channels if it is a sysadmin and it is not member of the channel",
+			configComplianceEnabled: false,
+			channelDeleted:          false,
+			canReadChannel:          false,
+			channelType:             model.ChannelTypePrivate,
+			canReadPublicChannel:    false,
+			expected:                true,
+			isAdmin:                 true,
+		},
+		{
+			name:                    "Can read open board if team permissions and compliance disabled",
+			configComplianceEnabled: false,
+			channelDeleted:          false,
+			canReadChannel:          false,
+			channelType:             model.ChannelTypeOpenBoard,
+			canReadPublicChannel:    true,
+			expected:                true,
+		},
+		{
+			name:                    "Cannot read open board if compliance enabled",
+			configComplianceEnabled: true,
+			channelDeleted:          false,
+			canReadChannel:          false,
+			channelType:             model.ChannelTypeOpenBoard,
+			canReadPublicChannel:    true,
+			expected:                false,
+		},
+		{
+			name:                    "Cannot read private board if not member",
+			configComplianceEnabled: false,
+			channelDeleted:          false,
+			canReadChannel:          false,
+			channelType:             model.ChannelTypePrivateBoard,
+			canReadPublicChannel:    false,
+			expected:                false,
+		},
+	}
+
+	for _, tc := range ttcc {
+		t.Run(tc.name, func(t *testing.T) {
+			user := th.BasicUser2
+			if tc.isAdmin {
+				user = th.SystemAdminUser
+			}
+
+			th.App.UpdateConfig(func(cfg *model.Config) {
+				configComplianceEnabled := tc.configComplianceEnabled
+				cfg.ComplianceSettings.Enable = &configComplianceEnabled
+			})
+
+			team := th.CreateTeam(t)
+			if tc.canReadPublicChannel {
+				th.LinkUserToTeam(t, th.BasicUser2, team)
+			}
+
+			var channel *model.Channel
+			switch tc.channelType {
+			case model.ChannelTypeOpenBoard, model.ChannelTypePrivateBoard:
+				kanban := &model.KanbanProps{
+					GroupBy: model.KanbanGroupBy{
+						FieldID: model.NewId(),
+						Columns: []model.KanbanColumn{
+							{ID: model.NewId(), Name: "Todo", OptionIDs: []string{model.NewId()}},
+						},
+					},
+				}
+				viewProps, _ := kanban.ToProps()
+				view := &model.View{CreatorId: th.SystemAdminUser.Id, Type: model.ViewTypeKanban, Title: "Board", Props: viewProps}
+				ch, _, storeErr := th.App.Srv().Store().Channel().SaveBoardChannel(th.Context, &model.Channel{
+					TeamId:      team.Id,
+					DisplayName: "Board " + model.NewId(),
+					Name:        "board-" + model.NewId(),
+					Type:        tc.channelType,
+					CreatorId:   th.SystemAdminUser.Id,
+				}, -1, view)
+				require.NoError(t, storeErr)
+				channel = ch
+			case model.ChannelTypeOpen:
+				channel = th.CreateChannel(t, team)
+			default:
+				channel = th.CreatePrivateChannel(t, team)
+			}
+			if tc.canReadChannel {
+				_, err := th.App.AddUserToChannel(th.Context, user, channel, false)
+				require.Nil(t, err)
+			}
+
+			if tc.channelDeleted {
+				err := th.App.DeleteChannel(th.Context, channel, th.SystemAdminUser.Id)
+				require.Nil(t, err)
+				channel, err = th.App.GetChannel(th.Context, channel.Id)
+				require.Nil(t, err)
+			}
+
+			result, isMember := th.App.HasPermissionToReadChannel(th.Context, user.Id, channel)
+			require.Equal(t, tc.expected, result)
+			if result {
+				require.Equal(t, tc.canReadChannel, isMember)
+			} else {
+				require.Equal(t, false, isMember)
+			}
+		})
+	}
+}
+
+func TestHasPermissionToResolveChannelMention(t *testing.T) {
+	mainHelper.Parallel(t)
+	th := Setup(t).InitBasic(t)
+
+	ttcc := []struct {
+		name                    string
+		configComplianceEnabled bool
+		channelType             model.ChannelType
+		isChannelMember         bool
+		isTeamMember            bool
+		expected                bool
+	}{
+		{
+			name:                    "public, team member, not channel member, compliance ON -> resolves",
+			configComplianceEnabled: true,
+			channelType:             model.ChannelTypeOpen,
+			isChannelMember:         false,
+			isTeamMember:            true,
+			expected:                true,
+		},
+		{
+			name:                    "public, team member, not channel member, compliance OFF -> resolves",
+			configComplianceEnabled: false,
+			channelType:             model.ChannelTypeOpen,
+			isChannelMember:         false,
+			isTeamMember:            true,
+			expected:                true,
+		},
+		{
+			name:                    "public, NOT team member, compliance ON -> stripped",
+			configComplianceEnabled: true,
+			channelType:             model.ChannelTypeOpen,
+			isChannelMember:         false,
+			isTeamMember:            false,
+			expected:                false,
+		},
+		{
+			name:                    "public, NOT team member, compliance OFF -> stripped",
+			configComplianceEnabled: false,
+			channelType:             model.ChannelTypeOpen,
+			isChannelMember:         false,
+			isTeamMember:            false,
+			expected:                false,
+		},
+		{
+			name:                    "open board, team member, compliance ON -> resolves",
+			configComplianceEnabled: true,
+			channelType:             model.ChannelTypeOpenBoard,
+			isChannelMember:         false,
+			isTeamMember:            true,
+			expected:                true,
+		},
+		{
+			name:                    "private, channel member -> resolves",
+			configComplianceEnabled: false,
+			channelType:             model.ChannelTypePrivate,
+			isChannelMember:         true,
+			isTeamMember:            true,
+			expected:                true,
+		},
+		{
+			name:                    "private, team member but not channel member, compliance OFF -> stripped",
+			configComplianceEnabled: false,
+			channelType:             model.ChannelTypePrivate,
+			isChannelMember:         false,
+			isTeamMember:            true,
+			expected:                false,
+		},
+		{
+			name:                    "private, not member, compliance ON -> stripped",
+			configComplianceEnabled: true,
+			channelType:             model.ChannelTypePrivate,
+			isChannelMember:         false,
+			isTeamMember:            false,
+			expected:                false,
+		},
+	}
+
+	for _, tc := range ttcc {
+		t.Run(tc.name, func(t *testing.T) {
+			th.App.UpdateConfig(func(cfg *model.Config) {
+				enabled := tc.configComplianceEnabled
+				cfg.ComplianceSettings.Enable = &enabled
+			})
+
+			team := th.CreateTeam(t)
+			if tc.isTeamMember {
+				th.LinkUserToTeam(t, th.BasicUser2, team)
+			}
+
+			var channel *model.Channel
+			switch tc.channelType {
+			case model.ChannelTypeOpenBoard:
+				kanban := &model.KanbanProps{
+					GroupBy: model.KanbanGroupBy{
+						FieldID: model.NewId(),
+						Columns: []model.KanbanColumn{
+							{ID: model.NewId(), Name: "Todo", OptionIDs: []string{model.NewId()}},
+						},
+					},
+				}
+				viewProps, _ := kanban.ToProps()
+				view := &model.View{CreatorId: th.SystemAdminUser.Id, Type: model.ViewTypeKanban, Title: "Board", Props: viewProps}
+				ch, _, storeErr := th.App.Srv().Store().Channel().SaveBoardChannel(th.Context, &model.Channel{
+					TeamId:      team.Id,
+					DisplayName: "Board " + model.NewId(),
+					Name:        "board-" + model.NewId(),
+					Type:        tc.channelType,
+					CreatorId:   th.SystemAdminUser.Id,
+				}, -1, view)
+				require.NoError(t, storeErr)
+				channel = ch
+			case model.ChannelTypePrivate:
+				channel = th.CreatePrivateChannel(t, team)
+			default:
+				channel = th.CreateChannel(t, team)
+			}
+
+			if tc.isChannelMember {
+				_, err := th.App.AddUserToChannel(th.Context, th.BasicUser2, channel, false)
+				require.Nil(t, err)
+			}
+
+			require.Equal(t, tc.expected, th.App.HasPermissionToResolveChannelMention(th.Context, th.BasicUser2.Id, channel))
+		})
+	}
+
+	t.Run("DM, non-member -> stripped", func(t *testing.T) {
+		// DM between BasicUser and SystemAdminUser; BasicUser2 (the viewer) is not a participant.
+		dm := th.CreateDmChannel(t, th.SystemAdminUser)
+		require.False(t, th.App.HasPermissionToResolveChannelMention(th.Context, th.BasicUser2.Id, dm))
+	})
+
+	t.Run("GM, non-member -> stripped", func(t *testing.T) {
+		// GM between BasicUser and two fresh users; BasicUser2 (the viewer) is not a participant.
+		gm := th.CreateGroupChannel(t, th.CreateUser(t), th.CreateUser(t))
+		require.False(t, th.App.HasPermissionToResolveChannelMention(th.Context, th.BasicUser2.Id, gm))
+	})
+}
+
+func TestSessionHasPermissionToChannelByPost(t *testing.T) {
+	mainHelper.Parallel(t)
+	th := Setup(t).InitBasic(t)
+
+	session, err := th.App.CreateSession(th.Context, &model.Session{
+		UserId: th.BasicUser.Id,
+		Roles:  model.SystemUserRoleId,
+	})
+	require.Nil(t, err)
+
+	session2, err := th.App.CreateSession(th.Context, &model.Session{
+		UserId: th.BasicUser2.Id,
+		Roles:  model.SystemUserRoleId,
+	})
+	require.Nil(t, err)
+
+	channel := th.CreateChannel(t, th.BasicTeam)
+	_, appErr := th.App.AddUserToChannel(th.Context, th.BasicUser, channel, false)
+	assert.Nil(t, appErr)
+	post := th.CreatePost(t, channel)
+
+	archivedChannel := th.CreateChannel(t, th.BasicTeam)
+	archivedPost := th.CreatePost(t, archivedChannel)
+	appErr = th.App.DeleteChannel(th.Context, archivedChannel, th.SystemAdminUser.Id)
+	assert.Nil(t, appErr)
+
+	t.Run("read channel", func(t *testing.T) {
+		require.Equal(t, true, th.App.SessionHasPermissionToChannelByPost(*session, post.Id, model.PermissionReadChannel))
+		require.Equal(t, false, th.App.SessionHasPermissionToChannelByPost(*session2, post.Id, model.PermissionReadChannel))
+	})
+
+	t.Run("read archived channel", func(t *testing.T) {
+		require.Equal(t, true, th.App.SessionHasPermissionToChannelByPost(*session, archivedPost.Id, model.PermissionReadChannel))
+		require.Equal(t, false, th.App.SessionHasPermissionToChannelByPost(*session2, archivedPost.Id, model.PermissionReadChannel))
+	})
+
+	t.Run("read public channel", func(t *testing.T) {
+		require.Equal(t, true, th.App.SessionHasPermissionToChannelByPost(*session, post.Id, model.PermissionReadPublicChannel))
+		require.Equal(t, true, th.App.SessionHasPermissionToChannelByPost(*session2, post.Id, model.PermissionReadPublicChannel))
+	})
+
+	t.Run("read channel - user is admin", func(t *testing.T) {
+		adminSession, err := th.App.CreateSession(th.Context, &model.Session{
+			UserId: th.SystemAdminUser.Id,
+			Roles:  model.SystemAdminRoleId,
+		})
+		require.Nil(t, err)
+
+		require.Equal(t, true, th.App.SessionHasPermissionToChannelByPost(*adminSession, post.Id, model.PermissionReadChannel))
+	})
+}
+
+func TestHasPermissionToChannelByPost(t *testing.T) {
+	mainHelper.Parallel(t)
+	th := Setup(t).InitBasic(t)
+
+	channel := th.CreateChannel(t, th.BasicTeam)
+	_, appErr := th.App.AddUserToChannel(th.Context, th.BasicUser, channel, false)
+	assert.Nil(t, appErr)
+	post := th.CreatePost(t, channel)
+
+	archivedChannel := th.CreateChannel(t, th.BasicTeam)
+	archivedPost := th.CreatePost(t, archivedChannel)
+	appErr = th.App.DeleteChannel(th.Context, archivedChannel, th.SystemAdminUser.Id)
+	assert.Nil(t, appErr)
+
+	t.Run("read channel", func(t *testing.T) {
+		require.Equal(t, true, th.App.HasPermissionToChannelByPost(th.Context, th.BasicUser.Id, post.Id, model.PermissionReadChannel))
+		require.Equal(t, false, th.App.HasPermissionToChannelByPost(th.Context, th.BasicUser2.Id, post.Id, model.PermissionReadChannel))
+	})
+
+	t.Run("read archived channel", func(t *testing.T) {
+		require.Equal(t, true, th.App.HasPermissionToChannelByPost(th.Context, th.BasicUser.Id, archivedPost.Id, model.PermissionReadChannel))
+		require.Equal(t, false, th.App.HasPermissionToChannelByPost(th.Context, th.BasicUser2.Id, archivedPost.Id, model.PermissionReadChannel))
+	})
+
+	t.Run("read public channel", func(t *testing.T) {
+		require.Equal(t, true, th.App.HasPermissionToChannelByPost(th.Context, th.BasicUser.Id, post.Id, model.PermissionReadPublicChannel))
+		require.Equal(t, true, th.App.HasPermissionToChannelByPost(th.Context, th.BasicUser2.Id, post.Id, model.PermissionReadPublicChannel))
+	})
+
+	t.Run("read channel - user is admin", func(t *testing.T) {
+		require.Equal(t, true, th.App.HasPermissionToChannelByPost(th.Context, th.SystemAdminUser.Id, post.Id, model.PermissionReadChannel))
+	})
+}
+
+func TestHasPermissionToChannel(t *testing.T) {
+	mainHelper.Parallel(t)
+	th := Setup(t).InitBasic(t)
+
+	channel := th.CreateChannel(t, th.BasicTeam)
+	_, appErr := th.App.AddUserToChannel(th.Context, th.BasicUser, channel, false)
+	assert.Nil(t, appErr)
+
+	archivedChannel := th.CreateChannel(t, th.BasicTeam)
+	_, appErr = th.App.AddUserToChannel(th.Context, th.BasicUser, archivedChannel, false)
+	assert.Nil(t, appErr)
+	appErr = th.App.DeleteChannel(th.Context, archivedChannel, th.SystemAdminUser.Id)
+	assert.Nil(t, appErr)
+
+	t.Run("read channel", func(t *testing.T) {
+		ok, isMember := th.App.HasPermissionToChannel(th.Context, th.BasicUser.Id, channel.Id, model.PermissionReadChannel)
+		assert.True(t, ok)
+		assert.True(t, isMember)
+
+		ok, isMember = th.App.HasPermissionToChannel(th.Context, th.BasicUser2.Id, channel.Id, model.PermissionReadChannel)
+		assert.False(t, ok)
+		assert.False(t, isMember)
+	})
+
+	t.Run("read archived channel", func(t *testing.T) {
+		ok, isMember := th.App.HasPermissionToChannel(th.Context, th.BasicUser.Id, archivedChannel.Id, model.PermissionReadChannel)
+		assert.True(t, ok)
+		assert.True(t, isMember)
+
+		ok, isMember = th.App.HasPermissionToChannel(th.Context, th.BasicUser2.Id, archivedChannel.Id, model.PermissionReadChannel)
+		assert.False(t, ok)
+		assert.False(t, isMember)
+	})
+
+	t.Run("read public channel", func(t *testing.T) {
+		ok, isMember := th.App.HasPermissionToChannel(th.Context, th.BasicUser.Id, channel.Id, model.PermissionReadPublicChannel)
+		assert.True(t, ok)
+		assert.True(t, isMember)
+
+		ok, isMember = th.App.HasPermissionToChannel(th.Context, th.BasicUser2.Id, channel.Id, model.PermissionReadPublicChannel)
+		assert.True(t, ok)
+		assert.False(t, isMember)
+	})
+
+	t.Run("read channel - user is admin", func(t *testing.T) {
+		ok, isMember := th.App.HasPermissionToChannel(th.Context, th.SystemAdminUser.Id, channel.Id, model.PermissionReadChannel)
+		assert.True(t, ok)
+		assert.False(t, isMember)
+	})
+}
+
+func TestSessionHasPermissionToReadChannel(t *testing.T) {
+	mainHelper.Parallel(t)
+	th := Setup(t).InitBasic(t)
+
+	channel := th.CreateChannel(t, th.BasicTeam)
+	_, appErr := th.App.AddUserToChannel(th.Context, th.BasicUser, channel, false)
+	assert.Nil(t, appErr)
+
+	archivedChannel := th.CreateChannel(t, th.BasicTeam)
+	_, appErr = th.App.AddUserToChannel(th.Context, th.BasicUser, archivedChannel, false)
+	assert.Nil(t, appErr)
+	appErr = th.App.DeleteChannel(th.Context, archivedChannel, th.SystemAdminUser.Id)
+	assert.Nil(t, appErr)
+
+	t.Run("basic user can read channel", func(t *testing.T) {
+		session := model.Session{
+			UserId: th.BasicUser.Id,
+		}
+		ok, isMember := th.App.SessionHasPermissionToReadChannel(th.Context, session, channel)
+		assert.True(t, ok)
+		assert.True(t, isMember)
+	})
+
+	t.Run("basic user cannot read channel if not a member and not public", func(t *testing.T) {
+		privateChannel := th.CreatePrivateChannel(t, th.BasicTeam)
+		session := model.Session{
+			UserId: th.BasicUser2.Id,
+		}
+		ok, isMember := th.App.SessionHasPermissionToReadChannel(th.Context, session, privateChannel)
+		assert.False(t, ok)
+		assert.False(t, isMember)
+	})
+
+	t.Run("basic user can read archived channel if member", func(t *testing.T) {
+		session := model.Session{
+			UserId: th.BasicUser.Id,
+		}
+		ok, isMember := th.App.SessionHasPermissionToReadChannel(th.Context, session, archivedChannel)
+		assert.True(t, ok)
+		assert.True(t, isMember)
+	})
+
+	t.Run("non-member can read public channel", func(t *testing.T) {
+		session := model.Session{
+			UserId: th.BasicUser2.Id,
+		}
+		ok, isMember := th.App.SessionHasPermissionToReadChannel(th.Context, session, channel)
+		assert.True(t, ok)
+		assert.False(t, isMember)
+	})
+
+	t.Run("admin can read any channel", func(t *testing.T) {
+		session := model.Session{
+			UserId: th.SystemAdminUser.Id,
+			Roles:  model.SystemAdminRoleId,
+		}
+		ok, isMember := th.App.SessionHasPermissionToReadChannel(th.Context, session, channel)
+		assert.True(t, ok)
+		assert.False(t, isMember)
+	})
+}
+
+func TestSessionHasPermissionToReadPost(t *testing.T) {
+	mainHelper.Parallel(t)
+	th := Setup(t).InitBasic(t)
+
+	// Create a post in a public channel, ensure basic user can read it.
+	post, _, err := th.App.CreatePost(th.Context, &model.Post{
+		UserId:    th.BasicUser.Id,
+		ChannelId: th.BasicChannel.Id,
+		Message:   "hello world",
+	}, th.BasicChannel, model.CreatePostFlags{})
+	require.Nil(t, err)
+
+	t.Run("basic user can read their post", func(t *testing.T) {
+		session := model.Session{
+			UserId: th.BasicUser.Id,
+		}
+		ok, isMember := th.App.SessionHasPermissionToReadPost(th.Context, session, post.Id)
+		assert.True(t, ok)
+		assert.True(t, isMember)
+	})
+
+	t.Run("other member in channel can read post", func(t *testing.T) {
+		// Add BasicUser2 to channel
+		_, aerr := th.App.AddUserToChannel(th.Context, th.BasicUser2, th.BasicChannel, false)
+		require.Nil(t, aerr)
+		session := model.Session{
+			UserId: th.BasicUser2.Id,
+		}
+		ok, isMember := th.App.SessionHasPermissionToReadPost(th.Context, session, post.Id)
+		assert.True(t, ok)
+		assert.True(t, isMember)
+	})
+
+	t.Run("non-member can read post in public channel", func(t *testing.T) {
+		// Remove BasicUser2 from channel
+		aerr := th.App.removeUserFromChannel(th.Context, th.BasicUser2.Id, th.SystemAdminUser.Id, th.BasicChannel)
+		assert.Nil(t, aerr)
+		session := model.Session{
+			UserId: th.BasicUser2.Id,
+		}
+		ok, isMember := th.App.SessionHasPermissionToReadPost(th.Context, session, post.Id)
+		assert.True(t, ok)
+		assert.False(t, isMember)
+	})
+
+	t.Run("non-member cannot read post in private channel", func(t *testing.T) {
+		privateChan := th.CreatePrivateChannel(t, th.BasicTeam)
+		privatePost, _, err := th.App.CreatePost(th.Context, &model.Post{
+			UserId:    th.BasicUser.Id,
+			ChannelId: privateChan.Id,
+			Message:   "private message",
+		}, privateChan, model.CreatePostFlags{})
+		require.Nil(t, err)
+
+		session := model.Session{
+			UserId: th.BasicUser2.Id,
+		}
+		ok, isMember := th.App.SessionHasPermissionToReadPost(th.Context, session, privatePost.Id)
+		assert.False(t, ok)
+		assert.False(t, isMember)
+	})
+
+	t.Run("admin can read post even if not a channel member", func(t *testing.T) {
+		privateChan := th.CreatePrivateChannel(t, th.BasicTeam)
+		privatePost, _, err := th.App.CreatePost(th.Context, &model.Post{
+			UserId:    th.BasicUser.Id,
+			ChannelId: privateChan.Id,
+			Message:   "private admin",
+		}, privateChan, model.CreatePostFlags{})
+		require.Nil(t, err)
+
+		session := model.Session{
+			UserId: th.SystemAdminUser.Id,
+			Roles:  model.SystemAdminRoleId,
+		}
+		ok, isMember := th.App.SessionHasPermissionToReadPost(th.Context, session, privatePost.Id)
+		assert.True(t, ok)
+		assert.False(t, isMember)
+	})
+
+	t.Run("returns false for empty postID", func(t *testing.T) {
+		session := model.Session{
+			UserId: th.BasicUser.Id,
+		}
+		ok, isMember := th.App.SessionHasPermissionToReadPost(th.Context, session, "")
+		assert.False(t, ok)
+		assert.False(t, isMember)
+	})
+
+	t.Run("returns permission based on system level if postID is missing", func(t *testing.T) {
+		// To simulate a missing post, use a postID that doesn't exist
+		session := model.Session{
+			UserId: th.SystemAdminUser.Id,
+			Roles:  model.SystemAdminRoleId,
+		}
+
+		ok, isMember := th.App.SessionHasPermissionToReadPost(th.Context, session, model.NewId())
+		assert.True(t, ok)
+		assert.False(t, isMember)
+
+		// Basic user, should be false
+		session = model.Session{
+			UserId: th.BasicUser2.Id,
+		}
+		ok, isMember = th.App.SessionHasPermissionToReadPost(th.Context, session, model.NewId())
+		assert.False(t, ok)
+		assert.False(t, isMember)
+	})
+}
+
+func TestHasPermissionToEditPropertyField(t *testing.T) {
+	mainHelper.Parallel(t)
+	th := Setup(t).InitBasic(t)
+
+	cpaGroup, groupErr := th.App.GetPropertyGroup(request.TestContext(t), model.AccessControlPropertyGroupName)
+	require.Nil(t, groupErr)
+	groupID := cpaGroup.ID
+
+	testCases := []struct {
+		name     string
+		userID   string
+		field    *model.PropertyField
+		expected bool
+	}{
+		{
+			name:     "nil field returns false",
+			userID:   th.BasicUser.Id,
+			field:    nil,
+			expected: false,
+		},
+		{
+			name:   "empty userID returns false",
+			userID: "",
+			field: &model.PropertyField{
+				GroupID:           groupID,
+				Name:              "Test Field",
+				Type:              model.PropertyFieldTypeText,
+				TargetType:        string(model.PropertyFieldTargetLevelSystem),
+				PermissionField:   model.NewPointer(model.PermissionLevelMember),
+				PermissionValues:  model.NewPointer(model.PermissionLevelMember),
+				PermissionOptions: model.NewPointer(model.PermissionLevelMember),
+			},
+			expected: false,
+		},
+		{
+			name:   "protected field always returns false",
+			userID: th.SystemAdminUser.Id,
+			field: &model.PropertyField{
+				GroupID:           groupID,
+				Name:              "Protected Field",
+				Type:              model.PropertyFieldTypeText,
+				TargetType:        string(model.PropertyFieldTargetLevelSystem),
+				Protected:         true,
+				PermissionField:   model.NewPointer(model.PermissionLevelNone),
+				PermissionValues:  model.NewPointer(model.PermissionLevelMember),
+				PermissionOptions: model.NewPointer(model.PermissionLevelSysadmin),
+			},
+			expected: false,
+		},
+		{
+			name:   "nil permissions returns false",
+			userID: th.BasicUser.Id,
+			field: &model.PropertyField{
+				GroupID:    groupID,
+				Name:       "Field Without Permissions",
+				Type:       model.PropertyFieldTypeText,
+				TargetType: string(model.PropertyFieldTargetLevelSystem),
+			},
+			expected: false,
+		},
+		{
+			name:   "admin user can edit field with admin permission",
+			userID: th.SystemAdminUser.Id,
+			field: &model.PropertyField{
+				GroupID:           groupID,
+				Name:              "Admin Only Field",
+				Type:              model.PropertyFieldTypeText,
+				TargetType:        string(model.PropertyFieldTargetLevelSystem),
+				PermissionField:   model.NewPointer(model.PermissionLevelSysadmin),
+				PermissionValues:  model.NewPointer(model.PermissionLevelMember),
+				PermissionOptions: model.NewPointer(model.PermissionLevelSysadmin),
+			},
+			expected: true,
+		},
+		{
+			name:   "non-admin user cannot edit field with admin permission",
+			userID: th.BasicUser.Id,
+			field: &model.PropertyField{
+				GroupID:           groupID,
+				Name:              "Admin Only Field",
+				Type:              model.PropertyFieldTypeText,
+				TargetType:        string(model.PropertyFieldTargetLevelSystem),
+				PermissionField:   model.NewPointer(model.PermissionLevelSysadmin),
+				PermissionValues:  model.NewPointer(model.PermissionLevelMember),
+				PermissionOptions: model.NewPointer(model.PermissionLevelSysadmin),
+			},
+			expected: false,
+		},
+		{
+			name:   "member can edit field with member permission on system field",
+			userID: th.BasicUser.Id,
+			field: &model.PropertyField{
+				GroupID:           groupID,
+				Name:              "Member Edit Field",
+				Type:              model.PropertyFieldTypeText,
+				TargetType:        string(model.PropertyFieldTargetLevelSystem),
+				PermissionField:   model.NewPointer(model.PermissionLevelMember),
+				PermissionValues:  model.NewPointer(model.PermissionLevelMember),
+				PermissionOptions: model.NewPointer(model.PermissionLevelMember),
+			},
+			expected: true,
+		},
+		{
+			name:   "field permission none denies admin",
+			userID: th.SystemAdminUser.Id,
+			field: &model.PropertyField{
+				GroupID:           groupID,
+				Name:              "No Edit Field",
+				Type:              model.PropertyFieldTypeText,
+				TargetType:        string(model.PropertyFieldTargetLevelSystem),
+				PermissionField:   model.NewPointer(model.PermissionLevelNone),
+				PermissionValues:  model.NewPointer(model.PermissionLevelMember),
+				PermissionOptions: model.NewPointer(model.PermissionLevelSysadmin),
+			},
+			expected: false,
+		},
+		{
+			name:   "field permission none denies member",
+			userID: th.BasicUser.Id,
+			field: &model.PropertyField{
+				GroupID:           groupID,
+				Name:              "No Edit Field",
+				Type:              model.PropertyFieldTypeText,
+				TargetType:        string(model.PropertyFieldTargetLevelSystem),
+				PermissionField:   model.NewPointer(model.PermissionLevelNone),
+				PermissionValues:  model.NewPointer(model.PermissionLevelMember),
+				PermissionOptions: model.NewPointer(model.PermissionLevelSysadmin),
+			},
+			expected: false,
+		},
+	}
+
+	for _, tc := range testCases {
+		if tc.field != nil {
+			tc.field.Permissions = model.PermissionsFromLegacy(tc.field, model.LegacyConversionOpts{ConvertAttrs: true})
+		}
+		t.Run(tc.name, func(t *testing.T) {
+			assert.Equal(t, tc.expected, th.App.HasPermissionToEditPropertyField(th.Context, tc.userID, tc.field))
+		})
+	}
+}
+
+// TestHasPermissionToSetPropertyFieldValues exercises the field-target
+// dispatch path: user-object values defer to hasPropertyFieldScopeAccess on
+// the field's TargetType (channel/team/system). Per-value-target dispatch
+// (channel- and post-object values) is covered separately in
+// TestSessionHasPropertyFieldPermissionAdmin and
+// TestSessionHasPermissionToSetPropertyFieldValues_PostMember.
+func TestHasPermissionToSetPropertyFieldValues(t *testing.T) {
+	mainHelper.Parallel(t)
+	th := Setup(t).InitBasic(t)
+
+	cpaGroup, groupErr := th.App.GetPropertyGroup(request.TestContext(t), model.AccessControlPropertyGroupName)
+	require.Nil(t, groupErr)
+	groupID := cpaGroup.ID
+
+	// nonMember belongs to no team or channel — used for cascade-denial cases.
+	nonMember := th.CreateUser(t)
+
+	testCases := []struct {
+		name     string
+		userID   string
+		field    *model.PropertyField
+		expected bool
+	}{
+		{
+			name:     "nil field returns false",
+			userID:   th.BasicUser.Id,
+			field:    nil,
+			expected: false,
+		},
+		{
+			name:   "empty userID returns false",
+			userID: "",
+			field: &model.PropertyField{
+				GroupID:           groupID,
+				Name:              "Test Field",
+				Type:              model.PropertyFieldTypeText,
+				ObjectType:        model.PropertyFieldObjectTypeUser,
+				TargetType:        string(model.PropertyFieldTargetLevelSystem),
+				PermissionField:   model.NewPointer(model.PermissionLevelSysadmin),
+				PermissionValues:  model.NewPointer(model.PermissionLevelMember),
+				PermissionOptions: model.NewPointer(model.PermissionLevelSysadmin),
+			},
+			expected: false,
+		},
+		{
+			name:   "nil permissions returns false",
+			userID: th.BasicUser.Id,
+			field: &model.PropertyField{
+				GroupID:    groupID,
+				Name:       "Field Without Permissions",
+				Type:       model.PropertyFieldTypeText,
+				ObjectType: model.PropertyFieldObjectTypeUser,
+				TargetType: string(model.PropertyFieldTargetLevelSystem),
+			},
+			expected: false,
+		},
+		{
+			name:   "sysadmin can set values on channel-target field with values permission sysadmin",
+			userID: th.SystemAdminUser.Id,
+			field: &model.PropertyField{
+				GroupID:           groupID,
+				Name:              "Channel Field Sysadmin",
+				Type:              model.PropertyFieldTypeText,
+				ObjectType:        model.PropertyFieldObjectTypeUser,
+				TargetType:        string(model.PropertyFieldTargetLevelChannel),
+				TargetID:          th.BasicChannel.Id,
+				PermissionField:   model.NewPointer(model.PermissionLevelSysadmin),
+				PermissionValues:  model.NewPointer(model.PermissionLevelSysadmin),
+				PermissionOptions: model.NewPointer(model.PermissionLevelSysadmin),
+			},
+			expected: true,
+		},
+		{
+			name:   "sysadmin cascades through channel scope on channel-target field with values permission member",
+			userID: th.SystemAdminUser.Id,
+			field: &model.PropertyField{
+				GroupID:           groupID,
+				Name:              "Channel Field Member",
+				Type:              model.PropertyFieldTypeText,
+				ObjectType:        model.PropertyFieldObjectTypeUser,
+				TargetType:        string(model.PropertyFieldTargetLevelChannel),
+				TargetID:          th.BasicChannel.Id,
+				PermissionField:   model.NewPointer(model.PermissionLevelSysadmin),
+				PermissionValues:  model.NewPointer(model.PermissionLevelMember),
+				PermissionOptions: model.NewPointer(model.PermissionLevelSysadmin),
+			},
+			expected: true,
+		},
+		{
+			name:   "channel member can set values on channel-target field with values permission member",
+			userID: th.BasicUser.Id,
+			field: &model.PropertyField{
+				GroupID:           groupID,
+				Name:              "Channel Field",
+				Type:              model.PropertyFieldTypeText,
+				ObjectType:        model.PropertyFieldObjectTypeUser,
+				TargetType:        string(model.PropertyFieldTargetLevelChannel),
+				TargetID:          th.BasicChannel.Id,
+				PermissionField:   model.NewPointer(model.PermissionLevelSysadmin),
+				PermissionValues:  model.NewPointer(model.PermissionLevelMember),
+				PermissionOptions: model.NewPointer(model.PermissionLevelSysadmin),
+			},
+			expected: true,
+		},
+		{
+			name:   "channel member can set values on protected channel-target field with values permission member",
+			userID: th.BasicUser.Id,
+			field: &model.PropertyField{
+				GroupID:           groupID,
+				Name:              "Channel Field Protected",
+				Type:              model.PropertyFieldTypeText,
+				ObjectType:        model.PropertyFieldObjectTypeUser,
+				TargetType:        string(model.PropertyFieldTargetLevelChannel),
+				TargetID:          th.BasicChannel.Id,
+				Protected:         true,
+				PermissionField:   model.NewPointer(model.PermissionLevelNone),
+				PermissionValues:  model.NewPointer(model.PermissionLevelMember),
+				PermissionOptions: model.NewPointer(model.PermissionLevelSysadmin),
+			},
+			expected: true,
+		},
+		{
+			name:   "non-member cannot set values on channel-target field with values permission member",
+			userID: nonMember.Id,
+			field: &model.PropertyField{
+				GroupID:           groupID,
+				Name:              "Channel Field",
+				Type:              model.PropertyFieldTypeText,
+				ObjectType:        model.PropertyFieldObjectTypeUser,
+				TargetType:        string(model.PropertyFieldTargetLevelChannel),
+				TargetID:          th.BasicChannel.Id,
+				PermissionField:   model.NewPointer(model.PermissionLevelSysadmin),
+				PermissionValues:  model.NewPointer(model.PermissionLevelMember),
+				PermissionOptions: model.NewPointer(model.PermissionLevelSysadmin),
+			},
+			expected: false,
+		},
+		{
+			name:   "team member can set values on team-target field with values permission member",
+			userID: th.BasicUser.Id,
+			field: &model.PropertyField{
+				GroupID:           groupID,
+				Name:              "Team Field",
+				Type:              model.PropertyFieldTypeText,
+				ObjectType:        model.PropertyFieldObjectTypeUser,
+				TargetType:        string(model.PropertyFieldTargetLevelTeam),
+				TargetID:          th.BasicTeam.Id,
+				PermissionField:   model.NewPointer(model.PermissionLevelSysadmin),
+				PermissionValues:  model.NewPointer(model.PermissionLevelMember),
+				PermissionOptions: model.NewPointer(model.PermissionLevelSysadmin),
+			},
+			expected: true,
+		},
+		{
+			name:   "non-team-member cannot set values on team-target field with values permission member",
+			userID: nonMember.Id,
+			field: &model.PropertyField{
+				GroupID:           groupID,
+				Name:              "Team Field",
+				Type:              model.PropertyFieldTypeText,
+				ObjectType:        model.PropertyFieldObjectTypeUser,
+				TargetType:        string(model.PropertyFieldTargetLevelTeam),
+				TargetID:          th.BasicTeam.Id,
+				PermissionField:   model.NewPointer(model.PermissionLevelSysadmin),
+				PermissionValues:  model.NewPointer(model.PermissionLevelMember),
+				PermissionOptions: model.NewPointer(model.PermissionLevelSysadmin),
+			},
+			expected: false,
+		},
+		{
+			name:   "sysadmin can set values on team-target field with values permission sysadmin",
+			userID: th.SystemAdminUser.Id,
+			field: &model.PropertyField{
+				GroupID:           groupID,
+				Name:              "Team Field Sysadmin",
+				Type:              model.PropertyFieldTypeText,
+				ObjectType:        model.PropertyFieldObjectTypeUser,
+				TargetType:        string(model.PropertyFieldTargetLevelTeam),
+				TargetID:          th.BasicTeam.Id,
+				PermissionField:   model.NewPointer(model.PermissionLevelSysadmin),
+				PermissionValues:  model.NewPointer(model.PermissionLevelSysadmin),
+				PermissionOptions: model.NewPointer(model.PermissionLevelSysadmin),
+			},
+			expected: true,
+		},
+		{
+			name:   "any authenticated user can set values on system-target field with values permission member",
+			userID: th.BasicUser.Id,
+			field: &model.PropertyField{
+				GroupID:           groupID,
+				Name:              "System Field",
+				Type:              model.PropertyFieldTypeText,
+				ObjectType:        model.PropertyFieldObjectTypeUser,
+				TargetType:        string(model.PropertyFieldTargetLevelSystem),
+				PermissionField:   model.NewPointer(model.PermissionLevelSysadmin),
+				PermissionValues:  model.NewPointer(model.PermissionLevelMember),
+				PermissionOptions: model.NewPointer(model.PermissionLevelSysadmin),
+			},
+			expected: true,
+		},
+		{
+			name:   "values permission none denies sysadmin",
+			userID: th.SystemAdminUser.Id,
+			field: &model.PropertyField{
+				GroupID:           groupID,
+				Name:              "System Managed Values Field",
+				Type:              model.PropertyFieldTypeText,
+				ObjectType:        model.PropertyFieldObjectTypeUser,
+				TargetType:        string(model.PropertyFieldTargetLevelSystem),
+				PermissionField:   model.NewPointer(model.PermissionLevelSysadmin),
+				PermissionValues:  model.NewPointer(model.PermissionLevelNone),
+				PermissionOptions: model.NewPointer(model.PermissionLevelSysadmin),
+			},
+			expected: false,
+		},
+		{
+			name:   "values permission none denies member",
+			userID: th.BasicUser.Id,
+			field: &model.PropertyField{
+				GroupID:           groupID,
+				Name:              "System Managed Values Field",
+				Type:              model.PropertyFieldTypeText,
+				ObjectType:        model.PropertyFieldObjectTypeUser,
+				TargetType:        string(model.PropertyFieldTargetLevelSystem),
+				PermissionField:   model.NewPointer(model.PermissionLevelSysadmin),
+				PermissionValues:  model.NewPointer(model.PermissionLevelNone),
+				PermissionOptions: model.NewPointer(model.PermissionLevelSysadmin),
+			},
+			expected: false,
+		},
+	}
+
+	// All cases above use user-object values; valueTargetID is unused by the
+	// user/system/template branch of hasPropertyFieldValueScopeAccess.
+	const unusedValueTargetID = ""
+
+	for _, tc := range testCases {
+		if tc.field != nil {
+			tc.field.Permissions = model.PermissionsFromLegacy(tc.field, model.LegacyConversionOpts{ConvertAttrs: true})
+		}
+		t.Run(tc.name, func(t *testing.T) {
+			assert.Equal(t, tc.expected, th.App.HasPermissionToSetPropertyFieldValues(th.Context, tc.userID, tc.field, unusedValueTargetID))
+		})
+	}
+}
+
+func TestHasPermissionToManagePropertyFieldOptions(t *testing.T) {
+	mainHelper.Parallel(t)
+	th := Setup(t).InitBasic(t)
+
+	cpaGroup, groupErr := th.App.GetPropertyGroup(request.TestContext(t), model.AccessControlPropertyGroupName)
+	require.Nil(t, groupErr)
+	groupID := cpaGroup.ID
+
+	testCases := []struct {
+		name     string
+		userID   string
+		field    *model.PropertyField
+		expected bool
+	}{
+		{
+			name:     "nil field returns false",
+			userID:   th.BasicUser.Id,
+			field:    nil,
+			expected: false,
+		},
+		{
+			name:   "empty userID returns false",
+			userID: "",
+			field: &model.PropertyField{
+				GroupID:           groupID,
+				Name:              "Test Field",
+				Type:              model.PropertyFieldTypeSelect,
+				TargetType:        string(model.PropertyFieldTargetLevelSystem),
+				PermissionField:   model.NewPointer(model.PermissionLevelSysadmin),
+				PermissionValues:  model.NewPointer(model.PermissionLevelMember),
+				PermissionOptions: model.NewPointer(model.PermissionLevelMember),
+			},
+			expected: false,
+		},
+		{
+			name:   "nil permissions returns false",
+			userID: th.BasicUser.Id,
+			field: &model.PropertyField{
+				GroupID:    groupID,
+				Name:       "Field Without Permissions",
+				Type:       model.PropertyFieldTypeSelect,
+				TargetType: string(model.PropertyFieldTargetLevelSystem),
+			},
+			expected: false,
+		},
+		{
+			name:   "admin user can manage options with admin permission",
+			userID: th.SystemAdminUser.Id,
+			field: &model.PropertyField{
+				GroupID:           groupID,
+				Name:              "Admin Options Field",
+				Type:              model.PropertyFieldTypeSelect,
+				TargetType:        string(model.PropertyFieldTargetLevelSystem),
+				PermissionField:   model.NewPointer(model.PermissionLevelSysadmin),
+				PermissionValues:  model.NewPointer(model.PermissionLevelMember),
+				PermissionOptions: model.NewPointer(model.PermissionLevelSysadmin),
+			},
+			expected: true,
+		},
+		{
+			name:   "non-admin user cannot manage options with admin permission",
+			userID: th.BasicUser.Id,
+			field: &model.PropertyField{
+				GroupID:           groupID,
+				Name:              "Admin Options Field",
+				Type:              model.PropertyFieldTypeSelect,
+				TargetType:        string(model.PropertyFieldTargetLevelSystem),
+				PermissionField:   model.NewPointer(model.PermissionLevelSysadmin),
+				PermissionValues:  model.NewPointer(model.PermissionLevelMember),
+				PermissionOptions: model.NewPointer(model.PermissionLevelSysadmin),
+			},
+			expected: false,
+		},
+		{
+			name:   "member can manage options with member permission",
+			userID: th.BasicUser.Id,
+			field: &model.PropertyField{
+				GroupID:           groupID,
+				Name:              "Member Options Field",
+				Type:              model.PropertyFieldTypeSelect,
+				TargetType:        string(model.PropertyFieldTargetLevelSystem),
+				PermissionField:   model.NewPointer(model.PermissionLevelSysadmin),
+				PermissionValues:  model.NewPointer(model.PermissionLevelMember),
+				PermissionOptions: model.NewPointer(model.PermissionLevelMember),
+			},
+			expected: true,
+		},
+		{
+			name:   "admin can manage options on protected field with admin permission",
+			userID: th.SystemAdminUser.Id,
+			field: &model.PropertyField{
+				GroupID:           groupID,
+				Name:              "Protected Options Field",
+				Type:              model.PropertyFieldTypeSelect,
+				TargetType:        string(model.PropertyFieldTargetLevelSystem),
+				Protected:         true,
+				PermissionField:   model.NewPointer(model.PermissionLevelNone),
+				PermissionValues:  model.NewPointer(model.PermissionLevelMember),
+				PermissionOptions: model.NewPointer(model.PermissionLevelSysadmin),
+			},
+			expected: true,
+		},
+		{
+			name:   "options permission none denies admin",
+			userID: th.SystemAdminUser.Id,
+			field: &model.PropertyField{
+				GroupID:           groupID,
+				Name:              "Locked Options Field",
+				Type:              model.PropertyFieldTypeSelect,
+				TargetType:        string(model.PropertyFieldTargetLevelSystem),
+				PermissionField:   model.NewPointer(model.PermissionLevelSysadmin),
+				PermissionValues:  model.NewPointer(model.PermissionLevelMember),
+				PermissionOptions: model.NewPointer(model.PermissionLevelNone),
+			},
+			expected: false,
+		},
+		{
+			name:   "options permission none denies member",
+			userID: th.BasicUser.Id,
+			field: &model.PropertyField{
+				GroupID:           groupID,
+				Name:              "Locked Options Field",
+				Type:              model.PropertyFieldTypeSelect,
+				TargetType:        string(model.PropertyFieldTargetLevelSystem),
+				PermissionField:   model.NewPointer(model.PermissionLevelSysadmin),
+				PermissionValues:  model.NewPointer(model.PermissionLevelMember),
+				PermissionOptions: model.NewPointer(model.PermissionLevelNone),
+			},
+			expected: false,
+		},
+	}
+
+	for _, tc := range testCases {
+		if tc.field != nil {
+			tc.field.Permissions = model.PermissionsFromLegacy(tc.field, model.LegacyConversionOpts{ConvertAttrs: true})
+		}
+		t.Run(tc.name, func(t *testing.T) {
+			assert.Equal(t, tc.expected, th.App.HasPermissionToManagePropertyFieldOptions(th.Context, tc.userID, tc.field))
+		})
+	}
+}
+
+func TestSessionHasPermissionToEditPropertyField(t *testing.T) {
+	mainHelper.Parallel(t)
+	th := Setup(t).InitBasic(t)
+
+	cpaGroup, groupErr := th.App.GetPropertyGroup(request.TestContext(t), model.AccessControlPropertyGroupName)
+	require.Nil(t, groupErr)
+	groupID := cpaGroup.ID
+
+	testCases := []struct {
+		name     string
+		session  model.Session
+		field    *model.PropertyField
+		expected bool
+	}{
+		{
+			name:     "nil field returns false even for unrestricted session",
+			session:  model.Session{UserId: th.BasicUser.Id, Local: true},
+			field:    nil,
+			expected: false,
+		},
+		{
+			name:    "unconverted protected field returns false even for unrestricted session",
+			session: model.Session{UserId: th.SystemAdminUser.Id, Local: true},
+			field: &model.PropertyField{
+				GroupID:           groupID,
+				Name:              "Protected Field",
+				Type:              model.PropertyFieldTypeText,
+				TargetType:        string(model.PropertyFieldTargetLevelSystem),
+				Protected:         true,
+				PermissionField:   model.NewPointer(model.PermissionLevelNone),
+				PermissionValues:  model.NewPointer(model.PermissionLevelMember),
+				PermissionOptions: model.NewPointer(model.PermissionLevelSysadmin),
+			},
+			expected: false,
+		},
+		{
+			name:    "unconverted field with nil permissions returns false even for unrestricted session",
+			session: model.Session{UserId: th.SystemAdminUser.Id, Local: true},
+			field: &model.PropertyField{
+				GroupID:    groupID,
+				Name:       "Field Without Permissions",
+				Type:       model.PropertyFieldTypeText,
+				TargetType: string(model.PropertyFieldTargetLevelSystem),
+			},
+			expected: false,
+		},
+		{
+			name:    "unrestricted session can edit valid field",
+			session: model.Session{UserId: th.BasicUser.Id, Local: true},
+			field: &model.PropertyField{
+				GroupID:           groupID,
+				Name:              "Valid Field",
+				Type:              model.PropertyFieldTypeText,
+				TargetType:        string(model.PropertyFieldTargetLevelSystem),
+				PermissionField:   model.NewPointer(model.PermissionLevelSysadmin),
+				PermissionValues:  model.NewPointer(model.PermissionLevelMember),
+				PermissionOptions: model.NewPointer(model.PermissionLevelSysadmin),
+			},
+			expected: true,
+		},
+		{
+			name:    "regular session respects permission level",
+			session: model.Session{UserId: th.BasicUser.Id},
+			field: &model.PropertyField{
+				GroupID:           groupID,
+				Name:              "Admin Field",
+				Type:              model.PropertyFieldTypeText,
+				TargetType:        string(model.PropertyFieldTargetLevelSystem),
+				PermissionField:   model.NewPointer(model.PermissionLevelSysadmin),
+				PermissionValues:  model.NewPointer(model.PermissionLevelMember),
+				PermissionOptions: model.NewPointer(model.PermissionLevelSysadmin),
+			},
+			expected: false,
+		},
+		{
+			name:    "admin session can edit field with admin permission",
+			session: model.Session{UserId: th.SystemAdminUser.Id, Roles: model.SystemAdminRoleId},
+			field: &model.PropertyField{
+				GroupID:           groupID,
+				Name:              "Admin Only Field",
+				Type:              model.PropertyFieldTypeText,
+				TargetType:        string(model.PropertyFieldTargetLevelSystem),
+				PermissionField:   model.NewPointer(model.PermissionLevelSysadmin),
+				PermissionValues:  model.NewPointer(model.PermissionLevelMember),
+				PermissionOptions: model.NewPointer(model.PermissionLevelSysadmin),
+			},
+			expected: true,
+		},
+		{
+			name:    "non-admin session cannot edit field with admin permission",
+			session: model.Session{UserId: th.BasicUser.Id, Roles: model.SystemUserRoleId},
+			field: &model.PropertyField{
+				GroupID:           groupID,
+				Name:              "Admin Only Field",
+				Type:              model.PropertyFieldTypeText,
+				TargetType:        string(model.PropertyFieldTargetLevelSystem),
+				PermissionField:   model.NewPointer(model.PermissionLevelSysadmin),
+				PermissionValues:  model.NewPointer(model.PermissionLevelMember),
+				PermissionOptions: model.NewPointer(model.PermissionLevelSysadmin),
+			},
+			expected: false,
+		},
+		{
+			name:    "member session can edit field with member permission on system field",
+			session: model.Session{UserId: th.BasicUser.Id, Roles: model.SystemUserRoleId},
+			field: &model.PropertyField{
+				GroupID:           groupID,
+				Name:              "Member Edit Field",
+				Type:              model.PropertyFieldTypeText,
+				TargetType:        string(model.PropertyFieldTargetLevelSystem),
+				PermissionField:   model.NewPointer(model.PermissionLevelMember),
+				PermissionValues:  model.NewPointer(model.PermissionLevelMember),
+				PermissionOptions: model.NewPointer(model.PermissionLevelMember),
+			},
+			expected: true,
+		},
+		{
+			name:    "field permission none denies admin session",
+			session: model.Session{UserId: th.SystemAdminUser.Id, Roles: model.SystemAdminRoleId},
+			field: &model.PropertyField{
+				GroupID:           groupID,
+				Name:              "No Edit Field",
+				Type:              model.PropertyFieldTypeText,
+				TargetType:        string(model.PropertyFieldTargetLevelSystem),
+				PermissionField:   model.NewPointer(model.PermissionLevelNone),
+				PermissionValues:  model.NewPointer(model.PermissionLevelMember),
+				PermissionOptions: model.NewPointer(model.PermissionLevelSysadmin),
+			},
+			expected: false,
+		},
+		{
+			name:    "field permission none denies member session",
+			session: model.Session{UserId: th.BasicUser.Id, Roles: model.SystemUserRoleId},
+			field: &model.PropertyField{
+				GroupID:           groupID,
+				Name:              "No Edit Field",
+				Type:              model.PropertyFieldTypeText,
+				TargetType:        string(model.PropertyFieldTargetLevelSystem),
+				PermissionField:   model.NewPointer(model.PermissionLevelNone),
+				PermissionValues:  model.NewPointer(model.PermissionLevelMember),
+				PermissionOptions: model.NewPointer(model.PermissionLevelSysadmin),
+			},
+			expected: false,
+		},
+	}
+
+	for _, tc := range testCases {
+		// A Local session bypasses the decision outright once the field
+		// carries Permissions (SessionPropertyFieldEditBasis stops short-
+		// circuiting on Protected/nil-Permissions and falls through to
+		// IsUnrestricted). A case that denies a Local session relies on the
+		// field staying unconverted to keep hitting that short circuit.
+		if tc.field != nil && (!tc.session.Local || tc.expected) {
+			tc.field.Permissions = model.PermissionsFromLegacy(tc.field, model.LegacyConversionOpts{ConvertAttrs: true})
+		}
+		t.Run(tc.name, func(t *testing.T) {
+			assert.Equal(t, tc.expected, th.App.SessionHasPermissionToEditPropertyField(th.Context, tc.session, tc.field))
+		})
+	}
+}
+
+// TestSessionHasPermissionToSetPropertyFieldValues is the session-bound twin
+// of TestHasPermissionToSetPropertyFieldValues — same field-target dispatch
+// path via user-object values. Per-value-target dispatch is covered in
+// TestSessionHasPropertyFieldPermissionAdmin and
+// TestSessionHasPermissionToSetPropertyFieldValues_PostMember.
+func TestSessionHasPermissionToSetPropertyFieldValues(t *testing.T) {
+	mainHelper.Parallel(t)
+	th := Setup(t).InitBasic(t)
+
+	cpaGroup, groupErr := th.App.GetPropertyGroup(request.TestContext(t), model.AccessControlPropertyGroupName)
+	require.Nil(t, groupErr)
+	groupID := cpaGroup.ID
+
+	// nonMember belongs to no team or channel — used for cascade-denial cases.
+	nonMember := th.CreateUser(t)
+
+	testCases := []struct {
+		name     string
+		session  model.Session
+		field    *model.PropertyField
+		expected bool
+	}{
+		{
+			name:     "nil field returns false even for unrestricted session",
+			session:  model.Session{UserId: th.BasicUser.Id, Local: true},
+			field:    nil,
+			expected: false,
+		},
+		{
+			name:    "unconverted field with nil permissions returns false even for unrestricted session",
+			session: model.Session{UserId: th.SystemAdminUser.Id, Local: true},
+			field: &model.PropertyField{
+				GroupID:    groupID,
+				Name:       "Field Without Permissions",
+				Type:       model.PropertyFieldTypeText,
+				ObjectType: model.PropertyFieldObjectTypeUser,
+				TargetType: string(model.PropertyFieldTargetLevelSystem),
+			},
+			expected: false,
+		},
+		{
+			name:    "unrestricted session can set values on valid field",
+			session: model.Session{UserId: th.BasicUser.Id, Local: true},
+			field: &model.PropertyField{
+				GroupID:           groupID,
+				Name:              "Valid Field",
+				Type:              model.PropertyFieldTypeText,
+				ObjectType:        model.PropertyFieldObjectTypeUser,
+				TargetType:        string(model.PropertyFieldTargetLevelSystem),
+				PermissionField:   model.NewPointer(model.PermissionLevelSysadmin),
+				PermissionValues:  model.NewPointer(model.PermissionLevelSysadmin),
+				PermissionOptions: model.NewPointer(model.PermissionLevelSysadmin),
+			},
+			expected: true,
+		},
+		{
+			name:    "unrestricted session can set values on protected field",
+			session: model.Session{UserId: th.BasicUser.Id, Local: true},
+			field: &model.PropertyField{
+				GroupID:           groupID,
+				Name:              "Protected Field",
+				Type:              model.PropertyFieldTypeText,
+				ObjectType:        model.PropertyFieldObjectTypeUser,
+				TargetType:        string(model.PropertyFieldTargetLevelSystem),
+				Protected:         true,
+				PermissionField:   model.NewPointer(model.PermissionLevelNone),
+				PermissionValues:  model.NewPointer(model.PermissionLevelMember),
+				PermissionOptions: model.NewPointer(model.PermissionLevelSysadmin),
+			},
+			expected: true,
+		},
+		{
+			name:    "sysadmin session can set values on channel-target field with values permission sysadmin",
+			session: model.Session{UserId: th.SystemAdminUser.Id, Roles: model.SystemAdminRoleId},
+			field: &model.PropertyField{
+				GroupID:           groupID,
+				Name:              "Channel Field Sysadmin",
+				Type:              model.PropertyFieldTypeText,
+				ObjectType:        model.PropertyFieldObjectTypeUser,
+				TargetType:        string(model.PropertyFieldTargetLevelChannel),
+				TargetID:          th.BasicChannel.Id,
+				PermissionField:   model.NewPointer(model.PermissionLevelSysadmin),
+				PermissionValues:  model.NewPointer(model.PermissionLevelSysadmin),
+				PermissionOptions: model.NewPointer(model.PermissionLevelSysadmin),
+			},
+			expected: true,
+		},
+		{
+			name:    "sysadmin session cascades through channel scope on channel-target field with values permission member",
+			session: model.Session{UserId: th.SystemAdminUser.Id, Roles: model.SystemAdminRoleId},
+			field: &model.PropertyField{
+				GroupID:           groupID,
+				Name:              "Channel Field Member",
+				Type:              model.PropertyFieldTypeText,
+				ObjectType:        model.PropertyFieldObjectTypeUser,
+				TargetType:        string(model.PropertyFieldTargetLevelChannel),
+				TargetID:          th.BasicChannel.Id,
+				PermissionField:   model.NewPointer(model.PermissionLevelSysadmin),
+				PermissionValues:  model.NewPointer(model.PermissionLevelMember),
+				PermissionOptions: model.NewPointer(model.PermissionLevelSysadmin),
+			},
+			expected: true,
+		},
+		{
+			name:    "channel member session can set values on channel-target field with values permission member",
+			session: model.Session{UserId: th.BasicUser.Id, Roles: model.SystemUserRoleId},
+			field: &model.PropertyField{
+				GroupID:           groupID,
+				Name:              "Channel Field",
+				Type:              model.PropertyFieldTypeText,
+				ObjectType:        model.PropertyFieldObjectTypeUser,
+				TargetType:        string(model.PropertyFieldTargetLevelChannel),
+				TargetID:          th.BasicChannel.Id,
+				PermissionField:   model.NewPointer(model.PermissionLevelSysadmin),
+				PermissionValues:  model.NewPointer(model.PermissionLevelMember),
+				PermissionOptions: model.NewPointer(model.PermissionLevelSysadmin),
+			},
+			expected: true,
+		},
+		{
+			name:    "non-member session cannot set values on channel-target field with values permission member",
+			session: model.Session{UserId: nonMember.Id, Roles: model.SystemUserRoleId},
+			field: &model.PropertyField{
+				GroupID:           groupID,
+				Name:              "Channel Field",
+				Type:              model.PropertyFieldTypeText,
+				ObjectType:        model.PropertyFieldObjectTypeUser,
+				TargetType:        string(model.PropertyFieldTargetLevelChannel),
+				TargetID:          th.BasicChannel.Id,
+				PermissionField:   model.NewPointer(model.PermissionLevelSysadmin),
+				PermissionValues:  model.NewPointer(model.PermissionLevelMember),
+				PermissionOptions: model.NewPointer(model.PermissionLevelSysadmin),
+			},
+			expected: false,
+		},
+		{
+			name:    "team member session can set values on team-target field with values permission member",
+			session: model.Session{UserId: th.BasicUser.Id, Roles: model.SystemUserRoleId},
+			field: &model.PropertyField{
+				GroupID:           groupID,
+				Name:              "Team Field",
+				Type:              model.PropertyFieldTypeText,
+				ObjectType:        model.PropertyFieldObjectTypeUser,
+				TargetType:        string(model.PropertyFieldTargetLevelTeam),
+				TargetID:          th.BasicTeam.Id,
+				PermissionField:   model.NewPointer(model.PermissionLevelSysadmin),
+				PermissionValues:  model.NewPointer(model.PermissionLevelMember),
+				PermissionOptions: model.NewPointer(model.PermissionLevelSysadmin),
+			},
+			expected: true,
+		},
+		{
+			name:    "non-team-member session cannot set values on team-target field with values permission member",
+			session: model.Session{UserId: nonMember.Id, Roles: model.SystemUserRoleId},
+			field: &model.PropertyField{
+				GroupID:           groupID,
+				Name:              "Team Field",
+				Type:              model.PropertyFieldTypeText,
+				ObjectType:        model.PropertyFieldObjectTypeUser,
+				TargetType:        string(model.PropertyFieldTargetLevelTeam),
+				TargetID:          th.BasicTeam.Id,
+				PermissionField:   model.NewPointer(model.PermissionLevelSysadmin),
+				PermissionValues:  model.NewPointer(model.PermissionLevelMember),
+				PermissionOptions: model.NewPointer(model.PermissionLevelSysadmin),
+			},
+			expected: false,
+		},
+		{
+			name:    "sysadmin session can set values on team-target field with values permission sysadmin",
+			session: model.Session{UserId: th.SystemAdminUser.Id, Roles: model.SystemAdminRoleId},
+			field: &model.PropertyField{
+				GroupID:           groupID,
+				Name:              "Team Field Sysadmin",
+				Type:              model.PropertyFieldTypeText,
+				ObjectType:        model.PropertyFieldObjectTypeUser,
+				TargetType:        string(model.PropertyFieldTargetLevelTeam),
+				TargetID:          th.BasicTeam.Id,
+				PermissionField:   model.NewPointer(model.PermissionLevelSysadmin),
+				PermissionValues:  model.NewPointer(model.PermissionLevelSysadmin),
+				PermissionOptions: model.NewPointer(model.PermissionLevelSysadmin),
+			},
+			expected: true,
+		},
+		{
+			name:    "any authenticated session can set values on system-target field with values permission member",
+			session: model.Session{UserId: th.BasicUser.Id, Roles: model.SystemUserRoleId},
+			field: &model.PropertyField{
+				GroupID:           groupID,
+				Name:              "System Field",
+				Type:              model.PropertyFieldTypeText,
+				ObjectType:        model.PropertyFieldObjectTypeUser,
+				TargetType:        string(model.PropertyFieldTargetLevelSystem),
+				PermissionField:   model.NewPointer(model.PermissionLevelSysadmin),
+				PermissionValues:  model.NewPointer(model.PermissionLevelMember),
+				PermissionOptions: model.NewPointer(model.PermissionLevelSysadmin),
+			},
+			expected: true,
+		},
+		{
+			name:    "values permission none denies sysadmin session",
+			session: model.Session{UserId: th.SystemAdminUser.Id, Roles: model.SystemAdminRoleId},
+			field: &model.PropertyField{
+				GroupID:           groupID,
+				Name:              "System Managed Values Field",
+				Type:              model.PropertyFieldTypeText,
+				ObjectType:        model.PropertyFieldObjectTypeUser,
+				TargetType:        string(model.PropertyFieldTargetLevelSystem),
+				PermissionField:   model.NewPointer(model.PermissionLevelSysadmin),
+				PermissionValues:  model.NewPointer(model.PermissionLevelNone),
+				PermissionOptions: model.NewPointer(model.PermissionLevelSysadmin),
+			},
+			expected: false,
+		},
+		{
+			name:    "values permission none denies member session",
+			session: model.Session{UserId: th.BasicUser.Id, Roles: model.SystemUserRoleId},
+			field: &model.PropertyField{
+				GroupID:           groupID,
+				Name:              "System Managed Values Field",
+				Type:              model.PropertyFieldTypeText,
+				ObjectType:        model.PropertyFieldObjectTypeUser,
+				TargetType:        string(model.PropertyFieldTargetLevelSystem),
+				PermissionField:   model.NewPointer(model.PermissionLevelSysadmin),
+				PermissionValues:  model.NewPointer(model.PermissionLevelNone),
+				PermissionOptions: model.NewPointer(model.PermissionLevelSysadmin),
+			},
+			expected: false,
+		},
+	}
+
+	// All cases above use user-object values; valueTargetID is unused by the
+	// user/system/template branch of hasPropertyFieldValueScopeAccess.
+	const unusedValueTargetID = ""
+
+	for _, tc := range testCases {
+		// See TestSessionHasPermissionToEditPropertyField for why a Local
+		// session that must be denied needs the field left unconverted.
+		if tc.field != nil && (!tc.session.Local || tc.expected) {
+			tc.field.Permissions = model.PermissionsFromLegacy(tc.field, model.LegacyConversionOpts{ConvertAttrs: true})
+		}
+		t.Run(tc.name, func(t *testing.T) {
+			assert.Equal(t, tc.expected, th.App.SessionHasPermissionToSetPropertyFieldValues(th.Context, tc.session, tc.field, unusedValueTargetID))
+		})
+	}
+}
+
+func TestSessionHasPermissionToManagePropertyFieldOptions(t *testing.T) {
+	mainHelper.Parallel(t)
+	th := Setup(t).InitBasic(t)
+
+	cpaGroup, groupErr := th.App.GetPropertyGroup(request.TestContext(t), model.AccessControlPropertyGroupName)
+	require.Nil(t, groupErr)
+	groupID := cpaGroup.ID
+
+	testCases := []struct {
+		name     string
+		session  model.Session
+		field    *model.PropertyField
+		expected bool
+	}{
+		{
+			name:     "nil field returns false even for unrestricted session",
+			session:  model.Session{UserId: th.BasicUser.Id, Local: true},
+			field:    nil,
+			expected: false,
+		},
+		{
+			name:    "unconverted field with nil permissions returns false even for unrestricted session",
+			session: model.Session{UserId: th.SystemAdminUser.Id, Local: true},
+			field: &model.PropertyField{
+				GroupID:    groupID,
+				Name:       "Field Without Permissions",
+				Type:       model.PropertyFieldTypeSelect,
+				TargetType: string(model.PropertyFieldTargetLevelSystem),
+			},
+			expected: false,
+		},
+		{
+			name:    "unrestricted session can manage options on valid field",
+			session: model.Session{UserId: th.BasicUser.Id, Local: true},
+			field: &model.PropertyField{
+				GroupID:           groupID,
+				Name:              "Valid Select Field",
+				Type:              model.PropertyFieldTypeSelect,
+				TargetType:        string(model.PropertyFieldTargetLevelSystem),
+				PermissionField:   model.NewPointer(model.PermissionLevelSysadmin),
+				PermissionValues:  model.NewPointer(model.PermissionLevelMember),
+				PermissionOptions: model.NewPointer(model.PermissionLevelSysadmin),
+			},
+			expected: true,
+		},
+		{
+			name:    "unrestricted session can manage options on protected field",
+			session: model.Session{UserId: th.BasicUser.Id, Local: true},
+			field: &model.PropertyField{
+				GroupID:           groupID,
+				Name:              "Protected Select Field",
+				Type:              model.PropertyFieldTypeSelect,
+				TargetType:        string(model.PropertyFieldTargetLevelSystem),
+				Protected:         true,
+				PermissionField:   model.NewPointer(model.PermissionLevelNone),
+				PermissionValues:  model.NewPointer(model.PermissionLevelMember),
+				PermissionOptions: model.NewPointer(model.PermissionLevelSysadmin),
+			},
+			expected: true,
+		},
+		{
+			name:    "admin session can manage options with admin permission",
+			session: model.Session{UserId: th.SystemAdminUser.Id, Roles: model.SystemAdminRoleId},
+			field: &model.PropertyField{
+				GroupID:           groupID,
+				Name:              "Admin Options Field",
+				Type:              model.PropertyFieldTypeSelect,
+				TargetType:        string(model.PropertyFieldTargetLevelSystem),
+				PermissionField:   model.NewPointer(model.PermissionLevelSysadmin),
+				PermissionValues:  model.NewPointer(model.PermissionLevelMember),
+				PermissionOptions: model.NewPointer(model.PermissionLevelSysadmin),
+			},
+			expected: true,
+		},
+		{
+			name:    "non-admin session cannot manage options with admin permission",
+			session: model.Session{UserId: th.BasicUser.Id, Roles: model.SystemUserRoleId},
+			field: &model.PropertyField{
+				GroupID:           groupID,
+				Name:              "Admin Options Field",
+				Type:              model.PropertyFieldTypeSelect,
+				TargetType:        string(model.PropertyFieldTargetLevelSystem),
+				PermissionField:   model.NewPointer(model.PermissionLevelSysadmin),
+				PermissionValues:  model.NewPointer(model.PermissionLevelMember),
+				PermissionOptions: model.NewPointer(model.PermissionLevelSysadmin),
+			},
+			expected: false,
+		},
+		{
+			name:    "member session can manage options with member permission",
+			session: model.Session{UserId: th.BasicUser.Id, Roles: model.SystemUserRoleId},
+			field: &model.PropertyField{
+				GroupID:           groupID,
+				Name:              "Member Options Field",
+				Type:              model.PropertyFieldTypeSelect,
+				TargetType:        string(model.PropertyFieldTargetLevelSystem),
+				PermissionField:   model.NewPointer(model.PermissionLevelSysadmin),
+				PermissionValues:  model.NewPointer(model.PermissionLevelMember),
+				PermissionOptions: model.NewPointer(model.PermissionLevelMember),
+			},
+			expected: true,
+		},
+		{
+			name:    "options permission none denies admin session",
+			session: model.Session{UserId: th.SystemAdminUser.Id, Roles: model.SystemAdminRoleId},
+			field: &model.PropertyField{
+				GroupID:           groupID,
+				Name:              "Locked Options Field",
+				Type:              model.PropertyFieldTypeSelect,
+				TargetType:        string(model.PropertyFieldTargetLevelSystem),
+				PermissionField:   model.NewPointer(model.PermissionLevelSysadmin),
+				PermissionValues:  model.NewPointer(model.PermissionLevelMember),
+				PermissionOptions: model.NewPointer(model.PermissionLevelNone),
+			},
+			expected: false,
+		},
+		{
+			name:    "options permission none denies member session",
+			session: model.Session{UserId: th.BasicUser.Id, Roles: model.SystemUserRoleId},
+			field: &model.PropertyField{
+				GroupID:           groupID,
+				Name:              "Locked Options Field",
+				Type:              model.PropertyFieldTypeSelect,
+				TargetType:        string(model.PropertyFieldTargetLevelSystem),
+				PermissionField:   model.NewPointer(model.PermissionLevelSysadmin),
+				PermissionValues:  model.NewPointer(model.PermissionLevelMember),
+				PermissionOptions: model.NewPointer(model.PermissionLevelNone),
+			},
+			expected: false,
+		},
+	}
+
+	for _, tc := range testCases {
+		// See TestSessionHasPermissionToEditPropertyField for why a Local
+		// session that must be denied needs the field left unconverted.
+		if tc.field != nil && (!tc.session.Local || tc.expected) {
+			tc.field.Permissions = model.PermissionsFromLegacy(tc.field, model.LegacyConversionOpts{ConvertAttrs: true})
+		}
+		t.Run(tc.name, func(t *testing.T) {
+			assert.Equal(t, tc.expected, th.App.SessionHasPermissionToManagePropertyFieldOptions(th.Context, tc.session, tc.field))
+		})
+	}
+}
+
+func TestSessionHasPropertyFieldPermissionAdmin(t *testing.T) {
+	mainHelper.Parallel(t)
+	th := Setup(t).InitBasic(t)
+
+	groupID := registerTestPropertyGroup(t, th)
+
+	// BasicUser2 is in the team but not the channel — add them so denial
+	// cases land at "in the channel, but not an admin" rather than "not a
+	// member at all".
+	require.NotEqual(t, th.BasicUser.Id, th.BasicUser2.Id)
+	_, appErr := th.App.AddUserToChannel(th.Context, th.BasicUser2, th.BasicChannel, false)
+	require.Nil(t, appErr)
+
+	t.Run("field-level admin resolves against field target", func(t *testing.T) {
+		// Edit and ManageOptions operate on the field definition; admin
+		// means admin of the field's TargetType+TargetID.
+		fieldFor := func(target model.PropertyFieldTargetLevel, targetID string) *model.PropertyField {
+			field := &model.PropertyField{
+				GroupID:           groupID,
+				Name:              "admin only " + string(target),
+				Type:              model.PropertyFieldTypeText,
+				ObjectType:        model.PropertyFieldObjectTypeUser,
+				TargetType:        string(target),
+				TargetID:          targetID,
+				PermissionField:   model.NewPointer(model.PermissionLevelAdmin),
+				PermissionValues:  model.NewPointer(model.PermissionLevelSysadmin),
+				PermissionOptions: model.NewPointer(model.PermissionLevelAdmin),
+			}
+			field.Permissions = model.PermissionsFromLegacy(field, model.LegacyConversionOpts{ConvertAttrs: false})
+			return field
+		}
+		fieldOps := func(t *testing.T, session model.Session, field *model.PropertyField, want bool) {
+			t.Helper()
+			assert.Equal(t, want, th.App.SessionHasPermissionToEditPropertyField(th.Context, session, field))
+			assert.Equal(t, want, th.App.SessionHasPermissionToManagePropertyFieldOptions(th.Context, session, field))
+		}
+
+		t.Run("channel target", func(t *testing.T) {
+			field := fieldFor(model.PropertyFieldTargetLevelChannel, th.BasicChannel.Id)
+			_, appErr := th.App.UpdateChannelMemberRoles(th.Context, th.BasicChannel.Id, th.BasicUser.Id,
+				model.ChannelUserRoleId+" "+model.ChannelAdminRoleId)
+			require.Nil(t, appErr)
+			t.Cleanup(func() {
+				_, _ = th.App.UpdateChannelMemberRoles(th.Context, th.BasicChannel.Id, th.BasicUser.Id, model.ChannelUserRoleId)
+			})
+			fieldOps(t, model.Session{UserId: th.BasicUser.Id, Roles: model.SystemUserRoleId}, field, true)
+			fieldOps(t, model.Session{UserId: th.BasicUser2.Id, Roles: model.SystemUserRoleId}, field, false)
+		})
+
+		t.Run("team target", func(t *testing.T) {
+			field := fieldFor(model.PropertyFieldTargetLevelTeam, th.BasicTeam.Id)
+			_, appErr := th.App.UpdateTeamMemberRoles(th.Context, th.BasicTeam.Id, th.BasicUser.Id,
+				model.TeamUserRoleId+" "+model.TeamAdminRoleId)
+			require.Nil(t, appErr)
+			t.Cleanup(func() {
+				_, _ = th.App.UpdateTeamMemberRoles(th.Context, th.BasicTeam.Id, th.BasicUser.Id, model.TeamUserRoleId)
+			})
+			fieldOps(t, model.Session{UserId: th.BasicUser.Id, Roles: model.SystemUserRoleId}, field, true)
+			fieldOps(t, model.Session{UserId: th.BasicUser2.Id, Roles: model.SystemUserRoleId}, field, false)
+		})
+
+		t.Run("system target", func(t *testing.T) {
+			field := fieldFor(model.PropertyFieldTargetLevelSystem, "")
+			sysadmin := model.Session{UserId: th.SystemAdminUser.Id, Roles: model.SystemUserRoleId + " " + model.SystemAdminRoleId}
+			fieldOps(t, sysadmin, field, true)
+			fieldOps(t, model.Session{UserId: th.BasicUser.Id, Roles: model.SystemUserRoleId}, field, false)
+		})
+	})
+
+	t.Run("value-level admin resolves against value target", func(t *testing.T) {
+		// Use a system-target field so the dispatch is purely driven by
+		// ObjectType + the value's TargetID — the channel classification
+		// shape: one global field, per-channel values.
+		fieldFor := func(objectType string) *model.PropertyField {
+			field := &model.PropertyField{
+				GroupID:           groupID,
+				Name:              "values admin " + objectType,
+				Type:              model.PropertyFieldTypeText,
+				ObjectType:        objectType,
+				TargetType:        string(model.PropertyFieldTargetLevelSystem),
+				PermissionField:   model.NewPointer(model.PermissionLevelSysadmin),
+				PermissionValues:  model.NewPointer(model.PermissionLevelAdmin),
+				PermissionOptions: model.NewPointer(model.PermissionLevelSysadmin),
+			}
+			field.Permissions = model.PermissionsFromLegacy(field, model.LegacyConversionOpts{ConvertAttrs: false})
+			return field
+		}
+
+		t.Run("channel-object value: admin of the value's channel passes", func(t *testing.T) {
+			field := fieldFor(model.PropertyFieldObjectTypeChannel)
+			_, appErr := th.App.UpdateChannelMemberRoles(th.Context, th.BasicChannel.Id, th.BasicUser.Id,
+				model.ChannelUserRoleId+" "+model.ChannelAdminRoleId)
+			require.Nil(t, appErr)
+			t.Cleanup(func() {
+				_, _ = th.App.UpdateChannelMemberRoles(th.Context, th.BasicChannel.Id, th.BasicUser.Id, model.ChannelUserRoleId)
+			})
+
+			channelAdmin := model.Session{UserId: th.BasicUser.Id, Roles: model.SystemUserRoleId}
+			channelMember := model.Session{UserId: th.BasicUser2.Id, Roles: model.SystemUserRoleId}
+
+			assert.True(t, th.App.SessionHasPermissionToSetPropertyFieldValues(th.Context, channelAdmin, field, th.BasicChannel.Id))
+			assert.False(t, th.App.SessionHasPermissionToSetPropertyFieldValues(th.Context, channelMember, field, th.BasicChannel.Id))
+		})
+
+		t.Run("channel-object value: team admin of the channel's team passes without a channel role", func(t *testing.T) {
+			// The cascade this relies on is load-bearing for channel attributes: the
+			// System Console offers no setter control, so "admin" is the only tier
+			// they get, and it has to admit the roles above channel admin.
+			field := fieldFor(model.PropertyFieldObjectTypeChannel)
+			_, appErr := th.App.UpdateTeamMemberRoles(th.Context, th.BasicTeam.Id, th.BasicUser.Id,
+				model.TeamUserRoleId+" "+model.TeamAdminRoleId)
+			require.Nil(t, appErr)
+			t.Cleanup(func() {
+				_, _ = th.App.UpdateTeamMemberRoles(th.Context, th.BasicTeam.Id, th.BasicUser.Id, model.TeamUserRoleId)
+			})
+
+			teamAdmin := model.Session{UserId: th.BasicUser.Id, Roles: model.SystemUserRoleId}
+			assert.True(t, th.App.SessionHasPermissionToSetPropertyFieldValues(th.Context, teamAdmin, field, th.BasicChannel.Id))
+
+			sysadmin := model.Session{UserId: th.SystemAdminUser.Id, Roles: model.SystemUserRoleId + " " + model.SystemAdminRoleId}
+			assert.True(t, th.App.SessionHasPermissionToSetPropertyFieldValues(th.Context, sysadmin, field, th.BasicChannel.Id))
+		})
+
+		t.Run("post-object value: post-lookup yields the post's channel admin", func(t *testing.T) {
+			field := fieldFor(model.PropertyFieldObjectTypePost)
+			_, appErr := th.App.UpdateChannelMemberRoles(th.Context, th.BasicChannel.Id, th.BasicUser.Id,
+				model.ChannelUserRoleId+" "+model.ChannelAdminRoleId)
+			require.Nil(t, appErr)
+			t.Cleanup(func() {
+				_, _ = th.App.UpdateChannelMemberRoles(th.Context, th.BasicChannel.Id, th.BasicUser.Id, model.ChannelUserRoleId)
+			})
+
+			post := th.CreatePost(t, th.BasicChannel)
+
+			channelAdmin := model.Session{UserId: th.BasicUser.Id, Roles: model.SystemUserRoleId}
+			channelMember := model.Session{UserId: th.BasicUser2.Id, Roles: model.SystemUserRoleId}
+
+			assert.True(t, th.App.SessionHasPermissionToSetPropertyFieldValues(th.Context, channelAdmin, field, post.Id))
+			assert.False(t, th.App.SessionHasPermissionToSetPropertyFieldValues(th.Context, channelMember, field, post.Id))
+		})
+
+		t.Run("user-object value: no per-user admin, falls back to sysadmin", func(t *testing.T) {
+			field := fieldFor(model.PropertyFieldObjectTypeUser)
+
+			sysadmin := model.Session{UserId: th.SystemAdminUser.Id, Roles: model.SystemUserRoleId + " " + model.SystemAdminRoleId}
+			regularUser := model.Session{UserId: th.BasicUser.Id, Roles: model.SystemUserRoleId}
+
+			assert.True(t, th.App.SessionHasPermissionToSetPropertyFieldValues(th.Context, sysadmin, field, th.BasicUser2.Id))
+			assert.False(t, th.App.SessionHasPermissionToSetPropertyFieldValues(th.Context, regularUser, field, th.BasicUser2.Id))
+		})
+
+		t.Run("user-object value with channel-scoped field: falls back to channel admin", func(t *testing.T) {
+			// When ObjectType has no per-value admin notion (user/system/template),
+			// the check defers to the field's TargetType. A channel-scoped
+			// user-object field should require channel admin on the field's
+			// channel — not sysadmin.
+			field := &model.PropertyField{
+				GroupID:           groupID,
+				Name:              "values admin user-channel",
+				Type:              model.PropertyFieldTypeText,
+				ObjectType:        model.PropertyFieldObjectTypeUser,
+				TargetType:        string(model.PropertyFieldTargetLevelChannel),
+				TargetID:          th.BasicChannel.Id,
+				PermissionField:   model.NewPointer(model.PermissionLevelSysadmin),
+				PermissionValues:  model.NewPointer(model.PermissionLevelAdmin),
+				PermissionOptions: model.NewPointer(model.PermissionLevelSysadmin),
+			}
+			field.Permissions = model.PermissionsFromLegacy(field, model.LegacyConversionOpts{ConvertAttrs: false})
+
+			_, appErr := th.App.UpdateChannelMemberRoles(th.Context, th.BasicChannel.Id, th.BasicUser.Id,
+				model.ChannelUserRoleId+" "+model.ChannelAdminRoleId)
+			require.Nil(t, appErr)
+			t.Cleanup(func() {
+				_, _ = th.App.UpdateChannelMemberRoles(th.Context, th.BasicChannel.Id, th.BasicUser.Id, model.ChannelUserRoleId)
+			})
+
+			channelAdmin := model.Session{UserId: th.BasicUser.Id, Roles: model.SystemUserRoleId}
+			channelMember := model.Session{UserId: th.BasicUser2.Id, Roles: model.SystemUserRoleId}
+
+			assert.True(t, th.App.SessionHasPermissionToSetPropertyFieldValues(th.Context, channelAdmin, field, th.BasicUser2.Id))
+			assert.False(t, th.App.SessionHasPermissionToSetPropertyFieldValues(th.Context, channelMember, field, th.BasicUser2.Id))
+		})
+
+		t.Run("unrestricted session bypasses value-target check", func(t *testing.T) {
+			field := fieldFor(model.PropertyFieldObjectTypeChannel)
+			local := model.Session{UserId: th.BasicUser2.Id, Local: true}
+			assert.True(t, th.App.SessionHasPermissionToSetPropertyFieldValues(th.Context, local, field, th.BasicChannel.Id))
+		})
+	})
+}
+
+// Member-level scope access on post-object values requires only channel
+// membership: any member of the post's channel can set a value on any post
+// in that channel, regardless of whether they are the post's author.
+func TestSessionHasPermissionToSetPropertyFieldValues_PostMember(t *testing.T) {
+	mainHelper.Parallel(t)
+	th := Setup(t).InitBasic(t)
+
+	groupID := registerTestPropertyGroup(t, th)
+
+	// BasicUser2 is a channel member but not the post's author.
+	_, appErr := th.App.AddUserToChannel(th.Context, th.BasicUser2, th.BasicChannel, false)
+	require.Nil(t, appErr)
+
+	field := &model.PropertyField{
+		GroupID:           groupID,
+		Name:              "post values member",
+		Type:              model.PropertyFieldTypeText,
+		ObjectType:        model.PropertyFieldObjectTypePost,
+		TargetType:        string(model.PropertyFieldTargetLevelSystem),
+		PermissionField:   model.NewPointer(model.PermissionLevelSysadmin),
+		PermissionValues:  model.NewPointer(model.PermissionLevelMember),
+		PermissionOptions: model.NewPointer(model.PermissionLevelSysadmin),
+	}
+	field.Permissions = model.PermissionsFromLegacy(field, model.LegacyConversionOpts{ConvertAttrs: false})
+
+	post := th.CreatePost(t, th.BasicChannel) // authored by BasicUser
+
+	authorSession := model.Session{UserId: th.BasicUser.Id, Roles: model.SystemUserRoleId}
+	nonAuthorSession := model.Session{UserId: th.BasicUser2.Id, Roles: model.SystemUserRoleId}
+
+	// Author (channel member) can set the value.
+	assert.True(t, th.App.SessionHasPermissionToSetPropertyFieldValues(th.Context, authorSession, field, post.Id))
+	// Non-author who is also a channel member can set the value.
+	assert.True(t, th.App.SessionHasPermissionToSetPropertyFieldValues(th.Context, nonAuthorSession, field, post.Id))
+}
+
+func TestSessionHasPermissionToSetPropertyFieldValues_DirectAndGroupChannels(t *testing.T) {
+	mainHelper.Parallel(t)
+	th := Setup(t).InitBasic(t)
+
+	groupID := registerTestPropertyGroup(t, th)
+
+	fieldFor := func(objectType string, level model.PermissionLevel) *model.PropertyField {
+		field := &model.PropertyField{
+			GroupID:           groupID,
+			Name:              objectType + " values " + string(level),
+			Type:              model.PropertyFieldTypeText,
+			ObjectType:        objectType,
+			TargetType:        string(model.PropertyFieldTargetLevelSystem),
+			PermissionField:   model.NewPointer(model.PermissionLevelSysadmin),
+			PermissionValues:  model.NewPointer(level),
+			PermissionOptions: model.NewPointer(model.PermissionLevelSysadmin),
+		}
+		field.Permissions = model.PermissionsFromLegacy(field, model.LegacyConversionOpts{ConvertAttrs: false})
+		return field
+	}
+
+	memberField := fieldFor(model.PropertyFieldObjectTypeChannel, model.PermissionLevelMember)
+	adminField := fieldFor(model.PropertyFieldObjectTypeChannel, model.PermissionLevelAdmin)
+	postMemberField := fieldFor(model.PropertyFieldObjectTypePost, model.PermissionLevelMember)
+
+	participant := model.Session{UserId: th.BasicUser.Id, Roles: model.SystemUserRoleId}
+	sysadmin := model.Session{UserId: th.SystemAdminUser.Id, Roles: model.SystemUserRoleId + " " + model.SystemAdminRoleId}
+
+	dmChannel := th.CreateDmChannel(t, th.BasicUser2)
+	gmChannel := th.CreateGroupChannel(t, th.BasicUser2, th.SystemAdminUser)
+
+	t.Run("DM: participant can set a member-tier value", func(t *testing.T) {
+		assert.True(t, th.App.SessionHasPermissionToSetPropertyFieldValues(th.Context, participant, memberField, dmChannel.Id))
+	})
+
+	t.Run("GM: participant can set a member-tier value", func(t *testing.T) {
+		assert.True(t, th.App.SessionHasPermissionToSetPropertyFieldValues(th.Context, participant, memberField, gmChannel.Id))
+	})
+
+	t.Run("DM: participant can set an admin-tier value", func(t *testing.T) {
+		assert.True(t, th.App.SessionHasPermissionToSetPropertyFieldValues(th.Context, participant, adminField, dmChannel.Id))
+	})
+
+	// A non-participant is denied without needing any DM/GM-specific rule:
+	// they hold no channel membership, a DM carries no TeamId to cascade
+	// through, and read_channel comes from channel_user rather than
+	// system_user.
+	t.Run("DM: non-participant cannot set a member-tier value", func(t *testing.T) {
+		outsider := th.CreateUser(t)
+		th.LinkUserToTeam(t, outsider, th.BasicTeam)
+		outsiderSession := model.Session{UserId: outsider.Id, Roles: model.SystemUserRoleId}
+
+		assert.False(t, th.App.SessionHasPermissionToSetPropertyFieldValues(th.Context, outsiderSession, memberField, dmChannel.Id))
+	})
+
+	// The guest line sits between the tiers, and stating both halves together
+	// is the point: a guest participates, so the member tier is theirs, but
+	// does not administer, so the admin tier is not.
+	t.Run("DM: a guest participant sits between the tiers", func(t *testing.T) {
+		guest := th.CreateGuest(t)
+		guestDM, appErr := th.App.GetOrCreateDirectChannel(th.Context, guest.Id, th.BasicUser.Id)
+		require.Nil(t, appErr)
+		guestSession := model.Session{UserId: guest.Id, Roles: model.SystemUserRoleId}
+
+		// Precondition: the guest really is in the channel, so the admin
+		// denial below is the guest check and not a missing membership.
+		_, isMember := th.App.HasPermissionToChannel(th.Context, guest.Id, guestDM.Id, model.PermissionReadChannel)
+		require.True(t, isMember, "precondition: guest is a member of the DM")
+
+		assert.True(t, th.App.SessionHasPermissionToSetPropertyFieldValues(th.Context, guestSession, memberField, guestDM.Id))
+		assert.False(t, th.App.SessionHasPermissionToSetPropertyFieldValues(th.Context, guestSession, adminField, guestDM.Id))
+	})
+
+	// Mirrors _PostMember into the DM case, so the post-object decision is
+	// pinned at this layer too: the restriction never applied to post-object
+	// values, and after the split it still does not.
+	t.Run("DM: participant can set a member-tier value on a post", func(t *testing.T) {
+		post := th.CreatePost(t, dmChannel)
+
+		assert.True(t, th.App.SessionHasPermissionToSetPropertyFieldValues(th.Context, participant, postMemberField, post.Id))
+	})
+
+	t.Run("DM: sysadmin can set a member-tier value", func(t *testing.T) {
+		assert.True(t, th.App.SessionHasPermissionToSetPropertyFieldValues(th.Context, sysadmin, memberField, dmChannel.Id))
+	})
+
+	t.Run("GM: sysadmin can set a member-tier value", func(t *testing.T) {
+		assert.True(t, th.App.SessionHasPermissionToSetPropertyFieldValues(th.Context, sysadmin, memberField, gmChannel.Id))
+	})
+
+	t.Run("public channel: ordinary member can still set a member-tier value", func(t *testing.T) {
+		assert.True(t, th.App.SessionHasPermissionToSetPropertyFieldValues(th.Context, participant, memberField, th.BasicChannel.Id))
+	})
+
+	t.Run("private channel: channel admin can still set a member-tier value", func(t *testing.T) {
+		privateChannel := th.CreatePrivateChannel(t, th.BasicTeam)
+		_, appErr := th.App.AddUserToChannel(th.Context, th.BasicUser, privateChannel, false)
+		require.Nil(t, appErr)
+		_, appErr = th.App.UpdateChannelMemberRoles(th.Context, privateChannel.Id, th.BasicUser.Id,
+			model.ChannelUserRoleId+" "+model.ChannelAdminRoleId)
+		require.Nil(t, appErr)
+
+		assert.True(t, th.App.SessionHasPermissionToSetPropertyFieldValues(th.Context, participant, memberField, privateChannel.Id))
+	})
+}
+
+func TestSessionHasPermissionToAdministerPropertyFieldScope(t *testing.T) {
+	mainHelper.Parallel(t)
+	th := Setup(t).InitBasic(t)
+
+	groupID := registerTestPropertyGroup(t, th)
+
+	// th.BasicUser created th.BasicChannel, and CreateChannel grants the
+	// creator SchemeAdmin, so BasicUser is already a channel admin there.
+	// Denial rows must therefore use a different user, or they silently
+	// become allow rows.
+	plainMember := th.BasicUser2
+	_, appErr := th.App.AddUserToChannel(th.Context, plainMember, th.BasicChannel, false)
+	require.Nil(t, appErr)
+
+	// A team admin who is deliberately never added to th.BasicChannel, so the
+	// channel rows exercise the manage_channel_roles cascade rather than
+	// channel membership.
+	teamAdmin := th.CreateUser(t)
+	th.LinkUserToTeam(t, teamAdmin, th.BasicTeam)
+	_, appErr = th.App.UpdateTeamMemberRoles(th.Context, th.BasicTeam.Id, teamAdmin.Id,
+		model.TeamUserRoleId+" "+model.TeamAdminRoleId)
+	require.Nil(t, appErr)
+
+	// A second channel where plainMember *is* a channel admin, to prove the
+	// check is scoped to the field's TargetID and not to "is an admin of
+	// something somewhere".
+	otherChannel := th.CreateChannel(t, th.BasicTeam)
+	th.AddUserToChannel(t, plainMember, otherChannel)
+	_, appErr = th.App.UpdateChannelMemberRoles(th.Context, otherChannel.Id, plainMember.Id,
+		model.ChannelUserRoleId+" "+model.ChannelAdminRoleId)
+	require.Nil(t, appErr)
+
+	userSession := func(u *model.User) model.Session {
+		return model.Session{UserId: u.Id, Roles: model.SystemUserRoleId}
+	}
+	sysadminSession := model.Session{
+		UserId: th.SystemAdminUser.Id,
+		Roles:  model.SystemUserRoleId + " " + model.SystemAdminRoleId,
+	}
+
+	fieldFor := func(target model.PropertyFieldTargetLevel, targetID string) *model.PropertyField {
+		return &model.PropertyField{
+			GroupID:           groupID,
+			Name:              "scope admin " + string(target) + " " + targetID,
+			Type:              model.PropertyFieldTypeText,
+			ObjectType:        model.PropertyFieldObjectTypePost,
+			TargetType:        string(target),
+			TargetID:          targetID,
+			PermissionField:   model.NewPointer(model.PermissionLevelMember),
+			PermissionValues:  model.NewPointer(model.PermissionLevelMember),
+			PermissionOptions: model.NewPointer(model.PermissionLevelMember),
+		}
+	}
+
+	channelField := fieldFor(model.PropertyFieldTargetLevelChannel, th.BasicChannel.Id)
+	otherChannelField := fieldFor(model.PropertyFieldTargetLevelChannel, otherChannel.Id)
+	teamField := fieldFor(model.PropertyFieldTargetLevelTeam, th.BasicTeam.Id)
+	systemField := fieldFor(model.PropertyFieldTargetLevelSystem, "")
+
+	protectedField := fieldFor(model.PropertyFieldTargetLevelChannel, th.BasicChannel.Id)
+	protectedField.Protected = true
+	protectedField.PermissionField = model.NewPointer(model.PermissionLevelNone)
+
+	testCases := []struct {
+		name    string
+		session model.Session
+		field   *model.PropertyField
+		want    bool
+	}{
+		// Channel targets: manage_channel_roles on the target channel.
+		{"channel admin of the target channel", userSession(th.BasicUser), channelField, true},
+		{"plain member of the target channel", userSession(plainMember), channelField, false},
+		{"team admin who is not a channel member", userSession(teamAdmin), channelField, true},
+		{"sysadmin on a channel target", sysadminSession, channelField, true},
+		{"channel admin of a different channel", userSession(plainMember), channelField, false},
+		{"same user is an admin on the channel they administer", userSession(plainMember), otherChannelField, true},
+
+		// Team targets: manage_team on the target team.
+		{"team admin of the target team", userSession(teamAdmin), teamField, true},
+		{"plain team member", userSession(plainMember), teamField, false},
+		{"sysadmin on a team target", sysadminSession, teamField, true},
+
+		// System targets: manage_system.
+		{"team admin on a system target", userSession(teamAdmin), systemField, false},
+		{"sysadmin on a system target", sysadminSession, systemField, true},
+
+		// Fail-closed cases.
+		{"nil field", userSession(th.BasicUser), nil, false},
+		{"protected field", userSession(th.BasicUser), protectedField, false},
+		{"empty target type", userSession(th.BasicUser), fieldFor("", th.BasicChannel.Id), false},
+		{"unknown target type", userSession(th.BasicUser), fieldFor("bogus", th.BasicChannel.Id), false},
+
+		// Fails closed on a zero-value session rather than granting.
+		{"empty user id", model.Session{}, channelField, false},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			assert.Equal(t, tc.want,
+				th.App.SessionHasPermissionToAdministerPropertyFieldScope(th.Context, tc.session, tc.field))
+		})
+	}
+}
+
+func TestHasChannelPropertyAdmin(t *testing.T) {
+	mainHelper.Parallel(t)
+	th := Setup(t).InitBasic(t)
+
+	// th.BasicUser created th.BasicChannel and so holds SchemeAdmin there.
+	// th.BasicUser2 is a plain member, added below.
+	plainMember := th.BasicUser2
+	_, appErr := th.App.AddUserToChannel(th.Context, plainMember, th.BasicChannel, false)
+	require.Nil(t, appErr)
+
+	outsider := th.CreateUser(t)
+	th.LinkUserToTeam(t, outsider, th.BasicTeam)
+
+	// A read-only admin, deliberately not a member of anything below. This
+	// role holds read_channel as an ancillary of
+	// sysconsole_read_user_management_channels but not manage_channel_roles,
+	// so it is the role that distinguishes "is a member" from "can read".
+	readOnlyAdmin := th.CreateUser(t)
+	_, appErr = th.App.UpdateUserRoles(th.Context, readOnlyAdmin.Id,
+		model.SystemUserRoleId+" "+model.SystemReadOnlyAdminRoleId, false)
+	require.Nil(t, appErr)
+
+	// A team admin who never joins the channel below, so the normal-channel
+	// rows exercise the manage_channel_roles cascade rather than membership.
+	teamAdmin := th.CreateUser(t)
+	th.LinkUserToTeam(t, teamAdmin, th.BasicTeam)
+	_, appErr = th.App.UpdateTeamMemberRoles(th.Context, th.BasicTeam.Id, teamAdmin.Id,
+		model.TeamUserRoleId+" "+model.TeamAdminRoleId)
+	require.Nil(t, appErr)
+
+	dm := th.CreateDmChannel(t, plainMember)
+	gm := th.CreateGroupChannel(t, plainMember, th.CreateUser(t))
+
+	// A guest who really is a participant of both, so the denial below is the
+	// guest check firing rather than a missing membership.
+	guest := th.CreateGuest(t)
+	guestDM, appErr := th.App.GetOrCreateDirectChannel(th.Context, guest.Id, plainMember.Id)
+	require.Nil(t, appErr)
+	guestGM, appErr := th.App.CreateGroupChannel(th.Context, []string{guest.Id, plainMember.Id, th.BasicUser.Id}, th.BasicUser.Id)
+	require.Nil(t, appErr)
+
+	testCases := []struct {
+		name      string
+		userID    string
+		channelID string
+		want      bool
+	}{
+		// Normal channels keep requiring manage_channel_roles. read_channel
+		// must not be enough on any of these rows.
+		{"channel admin on a normal channel", th.BasicUser.Id, th.BasicChannel.Id, true},
+		{"plain member on a normal channel", plainMember.Id, th.BasicChannel.Id, false},
+		{"team admin who is not a channel member", teamAdmin.Id, th.BasicChannel.Id, true},
+		{"sysadmin on a normal channel", th.SystemAdminUser.Id, th.BasicChannel.Id, true},
+		{"read-only admin on a normal channel", readOnlyAdmin.Id, th.BasicChannel.Id, false},
+
+		// DM/GM have no channel-admin tier, so participants administer them.
+		{"DM participant", th.BasicUser.Id, dm.Id, true},
+		{"other DM participant", plainMember.Id, dm.Id, true},
+		{"non-participant on a DM", outsider.Id, dm.Id, false},
+		{"sysadmin on a DM", th.SystemAdminUser.Id, dm.Id, true},
+		{"GM participant", th.BasicUser.Id, gm.Id, true},
+		{"other GM participant", plainMember.Id, gm.Id, true},
+		{"non-participant on a GM", outsider.Id, gm.Id, false},
+
+		// A DM/GM has no team, so HasPermissionToChannel falls through to the
+		// caller's system roles.
+		{"read-only admin on a DM they are not in", readOnlyAdmin.Id, dm.Id, false},
+		{"read-only admin on a GM they are not in", readOnlyAdmin.Id, gm.Id, false},
+		{"team admin on a DM they are not in", teamAdmin.Id, dm.Id, false},
+
+		// Guests are participants but not administrators, matching the four
+		// channel-bookmark write handlers, which reject guests on DM/GM.
+		{"guest participant of a DM", guest.Id, guestDM.Id, false},
+		{"guest participant of a GM", guest.Id, guestGM.Id, false},
+		{"non-guest participant of the same DM", plainMember.Id, guestDM.Id, true},
+		{"non-guest participant of the same GM", plainMember.Id, guestGM.Id, true},
+
+		// Fail closed.
+		{"nonexistent channel", th.BasicUser.Id, model.NewId(), false},
+		{"empty channel id", th.BasicUser.Id, "", false},
+		{"empty user id", "", dm.Id, false},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			assert.Equal(t, tc.want, th.App.hasChannelPropertyAdmin(th.Context, tc.userID, tc.channelID))
+		})
+	}
+}
+
+func TestPropertyFieldAdminOnDirectAndGroupChannels(t *testing.T) {
+	mainHelper.Parallel(t)
+	th := Setup(t).InitBasic(t)
+
+	groupID := registerTestPropertyGroup(t, th)
+
+	plainMember := th.BasicUser2
+	_, appErr := th.App.AddUserToChannel(th.Context, plainMember, th.BasicChannel, false)
+	require.Nil(t, appErr)
+
+	outsider := th.CreateUser(t)
+	th.LinkUserToTeam(t, outsider, th.BasicTeam)
+
+	session := func(u *model.User) model.Session {
+		return model.Session{UserId: u.Id, Roles: model.SystemUserRoleId}
+	}
+	converted := func(field *model.PropertyField) *model.PropertyField {
+		field.Permissions = model.PermissionsFromLegacy(field, model.LegacyConversionOpts{ConvertAttrs: false})
+		return field
+	}
+
+	// Both channel types have no channel-admin tier, so both must resolve the
+	// admin level to participation. GMs additionally carry no CreatorId, so
+	// they are the case most likely to diverge from DMs under future changes.
+	for _, tc := range []struct {
+		name    string
+		channel *model.Channel
+	}{
+		{"direct channel", th.CreateDmChannel(t, plainMember)},
+		{"group channel", th.CreateGroupChannel(t, plainMember, th.CreateUser(t))},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			post := th.CreatePost(t, tc.channel)
+
+			// Field-level admin: a field scoped to this channel is administered
+			// by its participants, so pinning permission_field=admin does not
+			// lock them out.
+			t.Run("field level", func(t *testing.T) {
+				field := converted(&model.PropertyField{
+					GroupID:           groupID,
+					Name:              "scoped " + model.NewId(),
+					Type:              model.PropertyFieldTypeText,
+					ObjectType:        model.PropertyFieldObjectTypePost,
+					TargetType:        string(model.PropertyFieldTargetLevelChannel),
+					TargetID:          tc.channel.Id,
+					PermissionField:   model.NewPointer(model.PermissionLevelAdmin),
+					PermissionValues:  model.NewPointer(model.PermissionLevelAdmin),
+					PermissionOptions: model.NewPointer(model.PermissionLevelAdmin),
+				})
+
+				assert.True(t, th.App.SessionHasPermissionToEditPropertyField(th.Context, session(plainMember), field))
+				assert.True(t, th.App.SessionHasPermissionToManagePropertyFieldOptions(th.Context, session(plainMember), field))
+				assert.False(t, th.App.SessionHasPermissionToEditPropertyField(th.Context, session(outsider), field))
+
+				// The scope-admin helper agrees, which is what keeps "who may
+				// pin" and "who admin grants" the same set.
+				assert.True(t, th.App.SessionHasPermissionToAdministerPropertyFieldScope(th.Context, session(plainMember), field))
+				assert.False(t, th.App.SessionHasPermissionToAdministerPropertyFieldScope(th.Context, session(outsider), field))
+			})
+
+			// Value-level admin dispatches on the value's own target, so both
+			// the channel-object and post-object arms need covering.
+			t.Run("value level", func(t *testing.T) {
+				channelField := converted(&model.PropertyField{
+					GroupID:          groupID,
+					Name:             "channel values " + model.NewId(),
+					Type:             model.PropertyFieldTypeText,
+					ObjectType:       model.PropertyFieldObjectTypeChannel,
+					TargetType:       string(model.PropertyFieldTargetLevelSystem),
+					PermissionValues: model.NewPointer(model.PermissionLevelAdmin),
+				})
+				assert.True(t, th.App.SessionHasPermissionToSetPropertyFieldValues(th.Context, session(plainMember), channelField, tc.channel.Id))
+				assert.False(t, th.App.SessionHasPermissionToSetPropertyFieldValues(th.Context, session(outsider), channelField, tc.channel.Id))
+
+				postField := converted(&model.PropertyField{
+					GroupID:          groupID,
+					Name:             "post values " + model.NewId(),
+					Type:             model.PropertyFieldTypeText,
+					ObjectType:       model.PropertyFieldObjectTypePost,
+					TargetType:       string(model.PropertyFieldTargetLevelSystem),
+					PermissionValues: model.NewPointer(model.PermissionLevelAdmin),
+				})
+				assert.True(t, th.App.SessionHasPermissionToSetPropertyFieldValues(th.Context, session(plainMember), postField, post.Id))
+				assert.False(t, th.App.SessionHasPermissionToSetPropertyFieldValues(th.Context, session(outsider), postField, post.Id))
+
+				// Administering a DM/GM confers authority over that channel and
+				// nothing else. Value permissions dispatch on the value's own
+				// target regardless of how the field is scoped (see
+				// hasPropertyFieldValuePermissionLevel), so the guarantee that
+				// matters is that a participant's reach stops at their own
+				// conversation.
+				stranger1, stranger2 := th.CreateUser(t), th.CreateUser(t)
+				otherDM, appErr := th.App.GetOrCreateDirectChannel(th.Context, stranger1.Id, stranger2.Id)
+				require.Nil(t, appErr)
+				otherPost := th.CreatePost(t, otherDM)
+
+				assert.False(t, th.App.SessionHasPermissionToSetPropertyFieldValues(th.Context, session(plainMember), channelField, otherDM.Id))
+				assert.False(t, th.App.SessionHasPermissionToSetPropertyFieldValues(th.Context, session(plainMember), postField, otherPost.Id))
+			})
+
+			// Administering a DM/GM never extends to a field scoped elsewhere. The
+			// participation fallback is reachable from permission_values, which
+			// dispatches on the value's own target, but not from permission_field or
+			// permission_options: those resolve through hasPropertyFieldPermissionLevel,
+			// whose admin arm dispatches on field.TargetType. So a system-wide field
+			// stays with the system admins who defined it, and a participant cannot
+			// rename, retype, delete or re-option it by virtue of being in the
+			// conversation its values land on.
+			t.Run("system-scoped field is not administered by participants", func(t *testing.T) {
+				systemField := converted(&model.PropertyField{
+					GroupID:           groupID,
+					Name:              "system scoped " + model.NewId(),
+					Type:              model.PropertyFieldTypeText,
+					ObjectType:        model.PropertyFieldObjectTypePost,
+					TargetType:        string(model.PropertyFieldTargetLevelSystem),
+					PermissionField:   model.NewPointer(model.PermissionLevelAdmin),
+					PermissionValues:  model.NewPointer(model.PermissionLevelAdmin),
+					PermissionOptions: model.NewPointer(model.PermissionLevelAdmin),
+				})
+
+				// Precondition: the participant really does administer this
+				// conversation, so the denials below are the TargetType dispatch and
+				// not a missing membership.
+				require.True(t, th.App.hasChannelPropertyAdmin(th.Context, plainMember.Id, tc.channel.Id))
+
+				assert.False(t, th.App.SessionHasPermissionToEditPropertyField(th.Context, session(plainMember), systemField))
+				assert.False(t, th.App.SessionHasPermissionToManagePropertyFieldOptions(th.Context, session(plainMember), systemField))
+
+				// The scope-admin helper agrees, so a participant cannot pin the
+				// levels on a system-wide field either.
+				assert.False(t, th.App.SessionHasPermissionToAdministerPropertyFieldScope(th.Context, session(plainMember), systemField))
+
+				// A system admin still administers it, which is what makes the
+				// denials above the permission level rather than an unreachable field.
+				adminSession := model.Session{UserId: th.SystemAdminUser.Id, Roles: model.SystemAdminRoleId}
+				assert.True(t, th.App.SessionHasPermissionToEditPropertyField(th.Context, adminSession, systemField))
+				assert.True(t, th.App.SessionHasPermissionToManagePropertyFieldOptions(th.Context, adminSession, systemField))
+
+				// The value level is the one place participation does apply: the
+				// participant may still set a value on a post in their own
+				// conversation, which is the behaviour the admin tier is for.
+				assert.True(t, th.App.SessionHasPermissionToSetPropertyFieldValues(th.Context, session(plainMember), systemField, post.Id))
+			})
+		})
+	}
+
+	// A guest participates but does not administer. The member level is
+	// unaffected, mirroring channel bookmarks: guests cannot create, update,
+	// reorder or delete them on a DM/GM, but they can still list them.
+	t.Run("guests participate but do not administer", func(t *testing.T) {
+		guest := th.CreateGuest(t)
+		guestDM, appErr := th.App.GetOrCreateDirectChannel(th.Context, guest.Id, plainMember.Id)
+		require.Nil(t, appErr)
+		guestSession := session(guest)
+
+		adminField := converted(&model.PropertyField{
+			GroupID:           groupID,
+			Name:              "guest dm admin " + model.NewId(),
+			Type:              model.PropertyFieldTypeText,
+			ObjectType:        model.PropertyFieldObjectTypePost,
+			TargetType:        string(model.PropertyFieldTargetLevelChannel),
+			TargetID:          guestDM.Id,
+			PermissionField:   model.NewPointer(model.PermissionLevelAdmin),
+			PermissionValues:  model.NewPointer(model.PermissionLevelAdmin),
+			PermissionOptions: model.NewPointer(model.PermissionLevelAdmin),
+		})
+
+		// Precondition: the guest really is in the channel, so the denials
+		// below are the guest check and not a missing membership.
+		_, isMember := th.App.HasPermissionToChannel(th.Context, guest.Id, guestDM.Id, model.PermissionReadChannel)
+		require.True(t, isMember, "precondition: guest is a member of the DM")
+
+		assert.False(t, th.App.hasChannelPropertyAdmin(th.Context, guest.Id, guestDM.Id))
+		assert.False(t, th.App.SessionHasPermissionToEditPropertyField(th.Context, guestSession, adminField))
+		assert.False(t, th.App.SessionHasPermissionToManagePropertyFieldOptions(th.Context, guestSession, adminField))
+		assert.False(t, th.App.SessionHasPermissionToAdministerPropertyFieldScope(th.Context, guestSession, adminField))
+
+		// The member level is untouched: a guest still reaches a field scoped
+		// to a DM they belong to.
+		memberField := converted(&model.PropertyField{
+			GroupID:           groupID,
+			Name:              "guest dm member " + model.NewId(),
+			Type:              model.PropertyFieldTypeText,
+			ObjectType:        model.PropertyFieldObjectTypeChannel,
+			TargetType:        string(model.PropertyFieldTargetLevelChannel),
+			TargetID:          guestDM.Id,
+			PermissionField:   model.NewPointer(model.PermissionLevelMember),
+			PermissionValues:  model.NewPointer(model.PermissionLevelMember),
+			PermissionOptions: model.NewPointer(model.PermissionLevelMember),
+		})
+		assert.True(t, th.App.SessionHasPermissionToEditPropertyField(th.Context, guestSession, memberField))
+		assert.True(t, th.App.SessionHasPermissionToSetPropertyFieldValues(th.Context, guestSession, memberField, guestDM.Id))
+	})
+
+	// Regression guard: normal channels must NOT collapse to membership. Each
+	// caller below can read the channel; only the channel admin holds
+	// manage_channel_roles on it, so any other caller resolving true would mean
+	// the DM/GM rule had leaked into normal channels.
+	t.Run("normal channels still require manage_channel_roles", func(t *testing.T) {
+		readOnlyAdmin := th.CreateUser(t)
+		_, appErr := th.App.UpdateUserRoles(th.Context, readOnlyAdmin.Id,
+			model.SystemUserRoleId+" "+model.SystemReadOnlyAdminRoleId, false)
+		require.Nil(t, appErr)
+
+		field := converted(&model.PropertyField{
+			GroupID:           groupID,
+			Name:              "normal scoped " + model.NewId(),
+			Type:              model.PropertyFieldTypeText,
+			ObjectType:        model.PropertyFieldObjectTypePost,
+			TargetType:        string(model.PropertyFieldTargetLevelChannel),
+			TargetID:          th.BasicChannel.Id,
+			PermissionField:   model.NewPointer(model.PermissionLevelAdmin),
+			PermissionValues:  model.NewPointer(model.PermissionLevelAdmin),
+			PermissionOptions: model.NewPointer(model.PermissionLevelAdmin),
+		})
+
+		// A system-scoped post-object field: the value arm resolves against the
+		// post's channel rather than the field's target, so it needs its own
+		// assertion even though the channel is the same.
+		postField := converted(&model.PropertyField{
+			GroupID:          groupID,
+			Name:             "normal post values " + model.NewId(),
+			Type:             model.PropertyFieldTypeText,
+			ObjectType:       model.PropertyFieldObjectTypePost,
+			TargetType:       string(model.PropertyFieldTargetLevelSystem),
+			PermissionValues: model.NewPointer(model.PermissionLevelAdmin),
+		})
+		basicPost := th.CreatePost(t, th.BasicChannel)
+
+		for _, tc := range []struct {
+			name   string
+			userID string
+			want   bool
+		}{
+			{"plain channel member", plainMember.Id, false},
+			{"read-only admin, not a member", readOnlyAdmin.Id, false},
+			{"channel admin", th.BasicUser.Id, true},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				// Preconditions: every caller can read the channel, so a false
+				// result below is the permission check doing its job rather
+				// than the caller having no access at all.
+				canRead, _ := th.App.HasPermissionToChannel(th.Context, tc.userID, th.BasicChannel.Id, model.PermissionReadChannel)
+				require.True(t, canRead, "precondition: caller can read the channel")
+				canAdmin, _ := th.App.HasPermissionToChannel(th.Context, tc.userID, th.BasicChannel.Id, model.PermissionManageChannelRoles)
+				require.Equal(t, tc.want, canAdmin, "precondition: caller's manage_channel_roles")
+
+				sess := model.Session{UserId: tc.userID, Roles: model.SystemUserRoleId}
+				assert.Equal(t, tc.want, th.App.hasChannelPropertyAdmin(th.Context, tc.userID, th.BasicChannel.Id))
+				assert.Equal(t, tc.want, th.App.SessionHasPermissionToEditPropertyField(th.Context, sess, field))
+				assert.Equal(t, tc.want, th.App.SessionHasPermissionToAdministerPropertyFieldScope(th.Context, sess, field))
+				assert.Equal(t, tc.want, th.App.SessionHasPermissionToSetPropertyFieldValues(th.Context, sess, postField, basicPost.Id))
+			})
+		}
+	})
+}
+
+func TestSessionHasPermissionToSetPropertyFieldValues_PostCreator(t *testing.T) {
+	mainHelper.Parallel(t)
+	th := Setup(t).InitBasic(t)
+
+	groupID := registerTestPropertyGroup(t, th)
+
+	// System-target field so the dispatch is driven purely by ObjectType plus
+	// the value's target — one field definition, one value per object.
+	field := &model.PropertyField{
+		ID:                model.NewId(),
+		GroupID:           groupID,
+		Name:              "post values creator",
+		Type:              model.PropertyFieldTypeText,
+		ObjectType:        model.PropertyFieldObjectTypePost,
+		TargetType:        string(model.PropertyFieldTargetLevelSystem),
+		PermissionField:   model.NewPointer(model.PermissionLevelSysadmin),
+		PermissionValues:  model.NewPointer(model.PermissionLevelCreator),
+		PermissionOptions: model.NewPointer(model.PermissionLevelSysadmin),
+	}
+	field.Permissions = model.PermissionsFromLegacy(field, model.LegacyConversionOpts{ConvertAttrs: false})
+
+	// The author must hold no admin role in the post's channel, or this test
+	// would pass through the admin arm and prove nothing about the creator arm.
+	// th.BasicUser is unsuitable: CreateChannel grants SchemeAdmin to whoever
+	// creates a channel, so BasicUser is a channel admin of BasicChannel.
+	author := th.CreateUser(t)
+	th.LinkUserToTeam(t, author, th.BasicTeam)
+	th.AddUserToChannel(t, author, th.BasicChannel)
+
+	post := th.CreatePost(t, th.BasicChannel, func(p *model.Post) { p.UserId = author.Id })
+
+	// BasicUser2 is a team member but not a channel member out of InitBasic, so
+	// add them: denials should land on "in the channel but not the author"
+	// rather than "not a member at all".
+	th.AddUserToChannel(t, th.BasicUser2, th.BasicChannel)
+
+	channelAdmin := th.CreateUser(t)
+	th.LinkUserToTeam(t, channelAdmin, th.BasicTeam)
+	th.AddUserToChannel(t, channelAdmin, th.BasicChannel)
+	_, appErr := th.App.UpdateChannelMemberRoles(th.Context, th.BasicChannel.Id, channelAdmin.Id,
+		model.ChannelUserRoleId+" "+model.ChannelAdminRoleId)
+	require.Nil(t, appErr)
+
+	// Deliberately NOT added to the channel: a team admin reaches
+	// manage_channel_roles through the team fallback in HasPermissionToChannel,
+	// which is what lets the creator level grant team admins without checking
+	// manage_team separately.
+	teamAdmin := th.CreateUser(t)
+	th.LinkUserToTeam(t, teamAdmin, th.BasicTeam)
+	_, appErr = th.App.UpdateTeamMemberRoles(th.Context, th.BasicTeam.Id, teamAdmin.Id,
+		model.TeamUserRoleId+" "+model.TeamAdminRoleId)
+	require.Nil(t, appErr)
+
+	// Team member, no elevated role, not in the channel.
+	outsider := th.CreateUser(t)
+	th.LinkUserToTeam(t, outsider, th.BasicTeam)
+
+	guest := th.CreateGuest(t)
+	th.LinkUserToTeam(t, guest, th.BasicTeam)
+	th.AddUserToChannel(t, guest, th.BasicChannel)
+	guestPost := th.CreatePost(t, th.BasicChannel, func(p *model.Post) { p.UserId = guest.Id })
+
+	// A DM has no channel-admin tier and cannot acquire one, so
+	// hasChannelPropertyAdmin treats its non-guest participants as its
+	// administrators. Both participants therefore pass the admin arm, which
+	// means creator is no narrower than member inside a DM.
+	dmChannel := th.CreateDmChannel(t, th.BasicUser2)
+	dmPost := th.CreatePost(t, dmChannel) // authored by BasicUser
+
+	session := func(u *model.User) model.Session {
+		return model.Session{UserId: u.Id, Roles: model.SystemUserRoleId}
+	}
+	guestSession := func(u *model.User) model.Session {
+		return model.Session{UserId: u.Id, Roles: model.SystemGuestRoleId}
+	}
+
+	testCases := []struct {
+		name    string
+		session model.Session
+		postID  string
+		allowed bool
+	}{
+		{
+			name:    "author can set values on their own post",
+			session: session(author),
+			postID:  post.Id,
+			allowed: true,
+		},
+		{
+			// The case the member level gets wrong, and the whole reason the
+			// creator level exists.
+			name:    "channel member who did not author the post cannot",
+			session: session(th.BasicUser2),
+			postID:  post.Id,
+			allowed: false,
+		},
+		{
+			name:    "channel admin can set values on someone else's post",
+			session: session(channelAdmin),
+			postID:  post.Id,
+			allowed: true,
+		},
+		{
+			name:    "team admin passes the values check without channel membership",
+			session: session(teamAdmin),
+			postID:  post.Id,
+			allowed: true,
+		},
+		{
+			name:    "system admin can set values",
+			session: session(th.SystemAdminUser),
+			postID:  post.Id,
+			allowed: true,
+		},
+		{
+			name:    "team member outside the channel cannot",
+			session: session(outsider),
+			postID:  post.Id,
+			allowed: false,
+		},
+		{
+			name:    "unknown post denies",
+			session: session(author),
+			postID:  model.NewId(),
+			allowed: false,
+		},
+		{
+			// A post always has a real UserId (Post.IsValid requires one), so
+			// the empty-creator guard in hasPropertyFieldValueCreator is
+			// unreachable on this branch and stays as defense in depth; the
+			// channel branch is where an empty creator genuinely occurs. What
+			// is reachable is an empty caller, which must never match.
+			name:    "empty caller denies",
+			session: model.Session{},
+			postID:  post.Id,
+			allowed: false,
+		},
+		{
+			// authorship is what the creator level grants, so a guest classifies
+			// their own post.
+			name:    "guest author can set values on their own post",
+			session: guestSession(guest),
+			postID:  guestPost.Id,
+			allowed: true,
+		},
+		{
+			// The counterpart: the grant is authorship, not guest-ness. Same
+			// role as the row above, same channel, different post.
+			name:    "guest who did not author the post cannot",
+			session: guestSession(guest),
+			postID:  post.Id,
+			allowed: false,
+		},
+		{
+			// And the reverse direction: a non-guest channel member is still
+			// denied on the guest's post, so the guest grant did not widen the
+			// field for everyone else.
+			name:    "channel member cannot set values on the guest's post",
+			session: session(th.BasicUser2),
+			postID:  guestPost.Id,
+			allowed: false,
+		},
+		{
+			name:    "author can set values on their own direct message post",
+			session: session(th.BasicUser),
+			postID:  dmPost.Id,
+			allowed: true,
+		},
+		{
+			// Passes the admin arm, not the creator arm: DM participants
+			// administer their own DM, so creator is no narrower than member
+			// there.
+			name:    "other direct message participant passes via the admin arm",
+			session: session(th.BasicUser2),
+			postID:  dmPost.Id,
+			allowed: true,
+		},
+		{
+			name:    "system admin can set values on a direct message post",
+			session: session(th.SystemAdminUser),
+			postID:  dmPost.Id,
+			allowed: true,
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			assert.Equal(t, tc.allowed, th.App.SessionHasPermissionToSetPropertyFieldValues(th.Context, tc.session, field, tc.postID))
+		})
+	}
+}
+
+func TestSessionHasPermissionToSetPropertyFieldValues_ChannelCreator(t *testing.T) {
+	mainHelper.Parallel(t)
+	th := Setup(t).InitBasic(t)
+
+	groupID := registerTestPropertyGroup(t, th)
+
+	// System-target field so the dispatch is driven purely by ObjectType plus
+	// the value's target: one field, per-channel values.
+	field := &model.PropertyField{
+		ID:                model.NewId(),
+		GroupID:           groupID,
+		Name:              "channel values creator",
+		Type:              model.PropertyFieldTypeText,
+		ObjectType:        model.PropertyFieldObjectTypeChannel,
+		TargetType:        string(model.PropertyFieldTargetLevelSystem),
+		PermissionField:   model.NewPointer(model.PermissionLevelSysadmin),
+		PermissionValues:  model.NewPointer(model.PermissionLevelCreator),
+		PermissionOptions: model.NewPointer(model.PermissionLevelSysadmin),
+	}
+	field.Permissions = model.PermissionsFromLegacy(field, model.LegacyConversionOpts{ConvertAttrs: false})
+
+	require.Equal(t, th.BasicUser.Id, th.BasicChannel.CreatorId, "BasicChannel is expected to be created by BasicUser")
+
+	// CreateChannel grants SchemeAdmin to whoever creates a channel, so
+	// BasicUser starts out a channel admin of BasicChannel — which would let
+	// the creator rows below pass through the admin arm and prove nothing.
+	// Demote to a plain member so CreatorId is the only thing that can grant.
+	_, appErr := th.App.UpdateChannelMemberRoles(th.Context, th.BasicChannel.Id, th.BasicUser.Id, model.ChannelUserRoleId)
+	require.Nil(t, appErr)
+
+	th.AddUserToChannel(t, th.BasicUser2, th.BasicChannel)
+
+	channelAdmin := th.CreateUser(t)
+	th.LinkUserToTeam(t, channelAdmin, th.BasicTeam)
+	th.AddUserToChannel(t, channelAdmin, th.BasicChannel)
+	_, appErr = th.App.UpdateChannelMemberRoles(th.Context, th.BasicChannel.Id, channelAdmin.Id,
+		model.ChannelUserRoleId+" "+model.ChannelAdminRoleId)
+	require.Nil(t, appErr)
+
+	// Not a channel member: this helper is the inner check only, so the team
+	// fallback in HasPermissionToChannel is enough. The HTTP layer additionally
+	// requires channel membership — see TestPatchPropertyValuesPostCreator.
+	teamAdmin := th.CreateUser(t)
+	th.LinkUserToTeam(t, teamAdmin, th.BasicTeam)
+	_, appErr = th.App.UpdateTeamMemberRoles(th.Context, th.BasicTeam.Id, teamAdmin.Id,
+		model.TeamUserRoleId+" "+model.TeamAdminRoleId)
+	require.Nil(t, appErr)
+
+	outsider := th.CreateUser(t)
+	th.LinkUserToTeam(t, outsider, th.BasicTeam)
+
+	// A channel BasicUser created and has since left. CreatorId survives the
+	// departure, so the inner check still passes; membership is the outer
+	// gate's concern.
+	leftChannel := th.CreateChannel(t, th.BasicTeam)
+	require.Equal(t, th.BasicUser.Id, leftChannel.CreatorId)
+	appErr = th.App.RemoveUserFromChannel(th.Context, th.BasicUser.Id, "", leftChannel)
+	require.Nil(t, appErr)
+
+	// A DM does carry a CreatorId: the store stamps the initiating user
+	// (channel_store.go, createDirectChannel). So the initiator is the DM's
+	// creator and the other participant is not.
+	dmChannel := th.CreateDmChannel(t, th.BasicUser2)
+	require.Equal(t, th.BasicUser.Id, dmChannel.CreatorId, "a direct channel is expected to be created by the initiating user")
+
+	// A group channel does NOT: createGroupChannel builds the model.Channel
+	// without a CreatorId and nothing fills it in. This is the one place an
+	// empty creator occurs in practice, and what the empty guard in
+	// hasPropertyFieldValueCreator exists for.
+	gmChannel := th.CreateGroupChannel(t, th.BasicUser2, outsider)
+	require.Empty(t, gmChannel.CreatorId, "a group channel is expected to have no creator")
+
+	session := func(u *model.User) model.Session {
+		return model.Session{UserId: u.Id, Roles: model.SystemUserRoleId}
+	}
+
+	testCases := []struct {
+		name      string
+		session   model.Session
+		channelID string
+		allowed   bool
+	}{
+		{
+			name:      "channel creator can set values on their own channel",
+			session:   session(th.BasicUser),
+			channelID: th.BasicChannel.Id,
+			allowed:   true,
+		},
+		{
+			name:      "channel member who did not create the channel cannot",
+			session:   session(th.BasicUser2),
+			channelID: th.BasicChannel.Id,
+			allowed:   false,
+		},
+		{
+			name:      "channel admin can set values on someone else's channel",
+			session:   session(channelAdmin),
+			channelID: th.BasicChannel.Id,
+			allowed:   true,
+		},
+		{
+			name:      "team admin passes the values check without channel membership",
+			session:   session(teamAdmin),
+			channelID: th.BasicChannel.Id,
+			allowed:   true,
+		},
+		{
+			name:      "system admin can set values",
+			session:   session(th.SystemAdminUser),
+			channelID: th.BasicChannel.Id,
+			allowed:   true,
+		},
+		{
+			name:      "team member outside the channel cannot",
+			session:   session(outsider),
+			channelID: th.BasicChannel.Id,
+			allowed:   false,
+		},
+		{
+			name:      "unknown channel denies",
+			session:   session(th.BasicUser),
+			channelID: model.NewId(),
+			allowed:   false,
+		},
+		{
+			name:      "creator who left the channel still passes the values check",
+			session:   session(th.BasicUser),
+			channelID: leftChannel.Id,
+			allowed:   true,
+		},
+		{
+			name:      "initiator of a direct channel is its creator",
+			session:   session(th.BasicUser),
+			channelID: dmChannel.Id,
+			allowed:   true,
+		},
+		{
+			// Not the DM's creator, but DM participants administer their own
+			// DM (hasChannelPropertyAdmin), so this passes the admin arm.
+			name:      "the other participant in a direct channel passes via the admin arm",
+			session:   session(th.BasicUser2),
+			channelID: dmChannel.Id,
+			allowed:   true,
+		},
+		{
+			name:      "system admin can set values on a direct channel",
+			session:   session(th.SystemAdminUser),
+			channelID: dmChannel.Id,
+			allowed:   true,
+		},
+		{
+			// A group channel genuinely has no CreatorId, so nobody can pass
+			// the creator arm here — but its participants administer it, so a
+			// member still passes the admin arm. The creator arm is isolated
+			// by the empty-caller row below, which is not a member.
+			name:      "a group channel has no creator, so a participant passes only via the admin arm",
+			session:   session(th.BasicUser),
+			channelID: gmChannel.Id,
+			allowed:   true,
+		},
+		{
+			name:      "empty caller denies",
+			session:   model.Session{},
+			channelID: th.BasicChannel.Id,
+			allowed:   false,
+		},
+		{
+			// The empty-creator guard: a group channel has CreatorId "" and this
+			// caller has UserId "". Comparing the two with bare equality would
+			// match and grant access, so the guard must reject an empty creator
+			// before comparing.
+			name:      "empty caller does not match a channel with no creator",
+			session:   model.Session{},
+			channelID: gmChannel.Id,
+			allowed:   false,
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			assert.Equal(t, tc.allowed, th.App.SessionHasPermissionToSetPropertyFieldValues(th.Context, tc.session, field, tc.channelID))
+		})
+	}
+}
+
+func TestPropertyFieldCreatorLevel_FieldAndOptions(t *testing.T) {
+	mainHelper.Parallel(t)
+	th := Setup(t).InitBasic(t)
+
+	groupID := registerTestPropertyGroup(t, th)
+
+	// For the field and options slots the entity is the field itself, so the
+	// creator is its CreatedBy — not the creator of whatever the field is
+	// scoped to. ObjectType stays post because validation only permits the
+	// creator level on post- and channel-object fields.
+	fieldFor := func(target model.PropertyFieldTargetLevel, targetID, createdBy string) *model.PropertyField {
+		field := &model.PropertyField{
+			ID:                model.NewId(),
+			GroupID:           groupID,
+			Name:              "creator field " + string(target),
+			Type:              model.PropertyFieldTypeText,
+			ObjectType:        model.PropertyFieldObjectTypePost,
+			TargetType:        string(target),
+			TargetID:          targetID,
+			CreatedBy:         createdBy,
+			PermissionField:   model.NewPointer(model.PermissionLevelCreator),
+			PermissionValues:  model.NewPointer(model.PermissionLevelSysadmin),
+			PermissionOptions: model.NewPointer(model.PermissionLevelCreator),
+		}
+		field.Permissions = model.PermissionsFromLegacy(field, model.LegacyConversionOpts{ConvertAttrs: false})
+		return field
+	}
+
+	// The creator must hold no admin role in any of the three scopes, or the
+	// creator rows below would also pass through the admin arm and prove
+	// nothing. th.BasicUser is unsuitable: CreateChannel grants SchemeAdmin to
+	// whoever creates a channel, so BasicUser is a channel admin of
+	// BasicChannel.
+	fieldCreator := th.CreateUser(t)
+	th.LinkUserToTeam(t, fieldCreator, th.BasicTeam)
+	th.AddUserToChannel(t, fieldCreator, th.BasicChannel)
+
+	channelField := fieldFor(model.PropertyFieldTargetLevelChannel, th.BasicChannel.Id, fieldCreator.Id)
+	teamField := fieldFor(model.PropertyFieldTargetLevelTeam, th.BasicTeam.Id, fieldCreator.Id)
+	systemField := fieldFor(model.PropertyFieldTargetLevelSystem, "", fieldCreator.Id)
+
+	// Plugin-created, migration-created and mmctl --local fields all carry an
+	// empty CreatedBy, so such a field must fall back to admin-only rather
+	// than matching anybody.
+	orphanField := fieldFor(model.PropertyFieldTargetLevelChannel, th.BasicChannel.Id, "")
+
+	th.AddUserToChannel(t, th.BasicUser2, th.BasicChannel)
+
+	channelAdmin := th.CreateUser(t)
+	th.LinkUserToTeam(t, channelAdmin, th.BasicTeam)
+	th.AddUserToChannel(t, channelAdmin, th.BasicChannel)
+	_, appErr := th.App.UpdateChannelMemberRoles(th.Context, th.BasicChannel.Id, channelAdmin.Id,
+		model.ChannelUserRoleId+" "+model.ChannelAdminRoleId)
+	require.Nil(t, appErr)
+
+	teamAdmin := th.CreateUser(t)
+	th.LinkUserToTeam(t, teamAdmin, th.BasicTeam)
+	_, appErr = th.App.UpdateTeamMemberRoles(th.Context, th.BasicTeam.Id, teamAdmin.Id,
+		model.TeamUserRoleId+" "+model.TeamAdminRoleId)
+	require.Nil(t, appErr)
+
+	// Creating a field earns no standing to keep editing it after losing access
+	// to the scope it lives in. These two created their fields while in scope
+	// and were then removed, which is the state the creator arm has to reject.
+	// They stay in their own fields so the in-scope rows above keep proving
+	// what they were written to prove.
+	removedFromChannel := th.CreateUser(t)
+	th.LinkUserToTeam(t, removedFromChannel, th.BasicTeam)
+	th.AddUserToChannel(t, removedFromChannel, th.BasicChannel)
+	require.Nil(t, th.RemoveUserFromChannel(t, removedFromChannel, th.BasicChannel))
+
+	removedFromTeam := th.CreateUser(t)
+	th.LinkUserToTeam(t, removedFromTeam, th.BasicTeam)
+	th.RemoveUserFromTeam(t, removedFromTeam, th.BasicTeam)
+
+	// Same creator as removedChannelField, but scoped to the team they are
+	// still a member of: the check follows the field's own scope, so losing the
+	// channel does not cost them a team-scoped field.
+	removedChannelField := fieldFor(model.PropertyFieldTargetLevelChannel, th.BasicChannel.Id, removedFromChannel.Id)
+	removedChannelCreatorTeamField := fieldFor(model.PropertyFieldTargetLevelTeam, th.BasicTeam.Id, removedFromChannel.Id)
+	removedTeamField := fieldFor(model.PropertyFieldTargetLevelTeam, th.BasicTeam.Id, removedFromTeam.Id)
+	removedTeamCreatorSystemField := fieldFor(model.PropertyFieldTargetLevelSystem, "", removedFromTeam.Id)
+
+	session := func(u *model.User) model.Session {
+		return model.Session{UserId: u.Id, Roles: model.SystemUserRoleId}
+	}
+
+	testCases := []struct {
+		name    string
+		session model.Session
+		field   *model.PropertyField
+		allowed bool
+	}{
+		{
+			name:    "field creator can edit their own channel-scoped field",
+			session: session(fieldCreator),
+			field:   channelField,
+			allowed: true,
+		},
+		{
+			name:    "another channel member cannot",
+			session: session(th.BasicUser2),
+			field:   channelField,
+			allowed: false,
+		},
+		{
+			name:    "channel admin can edit a field they did not create",
+			session: session(channelAdmin),
+			field:   channelField,
+			allowed: true,
+		},
+		{
+			name:    "team admin can edit a channel-scoped field",
+			session: session(teamAdmin),
+			field:   channelField,
+			allowed: true,
+		},
+		{
+			name:    "system admin can edit a channel-scoped field",
+			session: session(th.SystemAdminUser),
+			field:   channelField,
+			allowed: true,
+		},
+		{
+			name:    "field creator can edit their own team-scoped field",
+			session: session(fieldCreator),
+			field:   teamField,
+			allowed: true,
+		},
+		{
+			name:    "plain team member cannot edit a team-scoped field",
+			session: session(th.BasicUser2),
+			field:   teamField,
+			allowed: false,
+		},
+		{
+			name:    "team admin can edit a team-scoped field they did not create",
+			session: session(teamAdmin),
+			field:   teamField,
+			allowed: true,
+		},
+		{
+			// HasPermissionToTeam falls back to the system check, so a sysadmin
+			// passes without being a team member at all.
+			name:    "system admin can edit a team-scoped field",
+			session: session(th.SystemAdminUser),
+			field:   teamField,
+			allowed: true,
+		},
+		{
+			name:    "field creator can edit their own system-scoped field without being an admin",
+			session: session(fieldCreator),
+			field:   systemField,
+			allowed: true,
+		},
+		{
+			name:    "non-admin cannot edit a system-scoped field they did not create",
+			session: session(th.BasicUser2),
+			field:   systemField,
+			allowed: false,
+		},
+		{
+			name:    "system admin can edit a system-scoped field they did not create",
+			session: session(th.SystemAdminUser),
+			field:   systemField,
+			allowed: true,
+		},
+		{
+			name:    "a field with no recorded creator falls back to admin only",
+			session: session(fieldCreator),
+			field:   orphanField,
+			allowed: false,
+		},
+		{
+			name:    "channel admin can still edit a field with no recorded creator",
+			session: session(channelAdmin),
+			field:   orphanField,
+			allowed: true,
+		},
+		{
+			// The empty-creator guard: the field has CreatedBy "" and this
+			// caller has UserId "". Comparing them with bare equality would
+			// match and grant access, so the guard must reject an empty creator
+			// before comparing.
+			name:    "empty caller does not match a field with no recorded creator",
+			session: model.Session{},
+			field:   orphanField,
+			allowed: false,
+		},
+		{
+			name:    "field creator removed from the channel can no longer edit their own channel-scoped field",
+			session: session(removedFromChannel),
+			field:   removedChannelField,
+			allowed: false,
+		},
+		{
+			name:    "field creator removed from the team can no longer edit their own team-scoped field",
+			session: session(removedFromTeam),
+			field:   removedTeamField,
+			allowed: false,
+		},
+		{
+			name:    "channel admin can still edit a field whose creator was removed from the channel",
+			session: session(channelAdmin),
+			field:   removedChannelField,
+			allowed: true,
+		},
+		{
+			name:    "field creator removed from the channel keeps their own team-scoped field",
+			session: session(removedFromChannel),
+			field:   removedChannelCreatorTeamField,
+			allowed: true,
+		},
+		{
+			// Pairs with the system row above: system scope is open to any
+			// authenticated user, so even a creator removed from the team keeps
+			// a system-scoped field.
+			name:    "field creator removed from the team keeps their own system-scoped field",
+			session: session(removedFromTeam),
+			field:   removedTeamCreatorSystemField,
+			allowed: true,
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			// Both slots are pinned to creator, so edit and manage-options must
+			// resolve identically; they share the same dispatcher.
+			assert.Equal(t, tc.allowed, th.App.SessionHasPermissionToEditPropertyField(th.Context, tc.session, tc.field), "edit")
+			assert.Equal(t, tc.allowed, th.App.SessionHasPermissionToManagePropertyFieldOptions(th.Context, tc.session, tc.field), "manage options")
+		})
+	}
+}
+
+// TestPropertyFieldPermissionEntryPointsUseDecision covers the migrated
+// (Permissions-populated) path through the six entry points, one case per
+// action rather than one per function — the legacy path is already covered
+// by every other case in this file, none of which sets Permissions.
+func TestPropertyFieldPermissionEntryPointsUseDecision(t *testing.T) {
+	mainHelper.Parallel(t)
+	th := Setup(t).InitBasic(t)
+
+	groupID := registerTestPropertyGroup(t, th)
+
+	t.Run("field.write admin tier allows a channel admin and denies a plain member, with PermissionField left nil", func(t *testing.T) {
+		field := &model.PropertyField{
+			GroupID:    groupID,
+			Name:       "migrated field write admin",
+			Type:       model.PropertyFieldTypeText,
+			ObjectType: model.PropertyFieldObjectTypeUser,
+			TargetType: string(model.PropertyFieldTargetLevelChannel),
+			TargetID:   th.BasicChannel.Id,
+			Permissions: &model.Permissions{
+				Restrictions: &model.Restrictions{
+					Field: model.WriteOnly{Write: model.PermissionLevelAdmin},
+				},
+			},
+		}
+
+		_, appErr := th.App.UpdateChannelMemberRoles(th.Context, th.BasicChannel.Id, th.BasicUser.Id,
+			model.ChannelUserRoleId+" "+model.ChannelAdminRoleId)
+		require.Nil(t, appErr)
+		t.Cleanup(func() {
+			_, _ = th.App.UpdateChannelMemberRoles(th.Context, th.BasicChannel.Id, th.BasicUser.Id, model.ChannelUserRoleId)
+		})
+
+		channelAdmin := model.Session{UserId: th.BasicUser.Id, Roles: model.SystemUserRoleId}
+		channelMember := model.Session{UserId: th.BasicUser2.Id, Roles: model.SystemUserRoleId}
+
+		assert.True(t, th.App.SessionHasPermissionToEditPropertyField(th.Context, channelAdmin, field))
+		assert.False(t, th.App.SessionHasPermissionToEditPropertyField(th.Context, channelMember, field))
+	})
+
+	t.Run("Protected no longer denies once Permissions is populated", func(t *testing.T) {
+		field := &model.PropertyField{
+			GroupID:    groupID,
+			Name:       "migrated protected field",
+			Type:       model.PropertyFieldTypeText,
+			ObjectType: model.PropertyFieldObjectTypeUser,
+			TargetType: string(model.PropertyFieldTargetLevelChannel),
+			TargetID:   th.BasicChannel.Id,
+			Protected:  true,
+			Permissions: &model.Permissions{
+				Restrictions: &model.Restrictions{
+					Field: model.WriteOnly{Write: model.PermissionLevelAdmin},
+				},
+			},
+		}
+
+		_, appErr := th.App.UpdateChannelMemberRoles(th.Context, th.BasicChannel.Id, th.BasicUser.Id,
+			model.ChannelUserRoleId+" "+model.ChannelAdminRoleId)
+		require.Nil(t, appErr)
+		t.Cleanup(func() {
+			_, _ = th.App.UpdateChannelMemberRoles(th.Context, th.BasicChannel.Id, th.BasicUser.Id, model.ChannelUserRoleId)
+		})
+
+		channelAdmin := model.Session{UserId: th.BasicUser.Id, Roles: model.SystemUserRoleId}
+		assert.True(t, th.App.SessionHasPermissionToEditPropertyField(th.Context, channelAdmin, field))
+	})
+
+	t.Run("value.write denied by restrictions but allowed by a matching user grant, for that user only", func(t *testing.T) {
+		field := &model.PropertyField{
+			GroupID:    groupID,
+			Name:       "migrated field value grant",
+			Type:       model.PropertyFieldTypeText,
+			ObjectType: model.PropertyFieldObjectTypeUser,
+			TargetType: string(model.PropertyFieldTargetLevelSystem),
+			Permissions: &model.Permissions{
+				Restrictions: &model.Restrictions{
+					Value: model.ReadWrite{Write: model.PermissionLevelNone},
+				},
+				Grants: []model.Grant{
+					{
+						Identity: model.Identity{Type: model.PropertyOwnerTypeUser, ID: th.BasicUser.Id},
+						Allow:    []string{model.PropertyActionValueWrite},
+					},
+				},
+			},
+		}
+
+		grantedUser := model.Session{UserId: th.BasicUser.Id, Roles: model.SystemUserRoleId}
+		otherUser := model.Session{UserId: th.BasicUser2.Id, Roles: model.SystemUserRoleId}
+
+		assert.True(t, th.App.SessionHasPermissionToSetPropertyFieldValues(th.Context, grantedUser, field, th.BasicUser.Id))
+		assert.False(t, th.App.SessionHasPermissionToSetPropertyFieldValues(th.Context, otherUser, field, th.BasicUser2.Id))
+	})
+
+	t.Run("unrestricted session is allowed even when restrictions deny everything and grants are empty", func(t *testing.T) {
+		field := &model.PropertyField{
+			GroupID:    groupID,
+			Name:       "migrated field deny all",
+			Type:       model.PropertyFieldTypeText,
+			ObjectType: model.PropertyFieldObjectTypeUser,
+			TargetType: string(model.PropertyFieldTargetLevelSystem),
+			Permissions: &model.Permissions{
+				Restrictions: &model.Restrictions{
+					Field:  model.WriteOnly{Write: model.PermissionLevelNone},
+					Value:  model.ReadWrite{Write: model.PermissionLevelNone},
+					Option: model.ReadWrite{Write: model.PermissionLevelNone},
+				},
+			},
+		}
+
+		local := model.Session{UserId: th.BasicUser.Id, Local: true}
+		assert.True(t, th.App.SessionHasPermissionToEditPropertyField(th.Context, local, field))
+	})
+}

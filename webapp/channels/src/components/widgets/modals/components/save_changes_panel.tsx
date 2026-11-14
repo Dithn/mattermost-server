@@ -1,0 +1,170 @@
+// Copyright (c) 2015-present Mattermost, Inc. All Rights Reserved.
+// See LICENSE.txt for license information.
+
+import classNames from 'classnames';
+import React, {useEffect} from 'react';
+import {FormattedMessage, useIntl} from 'react-intl';
+
+import {
+    AlertCircleOutlineIcon,
+    CloseIcon,
+} from '@mattermost/compass-icons/components';
+import {Button} from '@mattermost/compass-ui/components/button';
+import {Icon} from '@mattermost/compass-ui/components/icon';
+import {IconButton} from '@mattermost/compass-ui/components/icon-button';
+import {WithTooltip} from '@mattermost/shared/components/tooltip';
+
+import './save_changes_panel.scss';
+
+export type SaveChangesPanelState = 'editing' | 'saved' | 'error' | undefined;
+
+const CLOSE_TIMEOUT = 1200;
+
+type Props = {
+    handleSubmit: () => void;
+    handleCancel: () => void;
+    handleClose: () => void;
+    tabChangeError?: boolean;
+    state: SaveChangesPanelState;
+    customErrorMessage?: string;
+    customSavedMessage?: string;
+    saveButtonText?: React.ReactNode;
+    cancelButtonText?: React.ReactNode;
+    saving?: boolean;
+};
+function SaveChangesPanel({
+    handleSubmit,
+    handleCancel,
+    handleClose,
+    tabChangeError = false,
+    state = 'editing',
+    customErrorMessage,
+    customSavedMessage,
+    saveButtonText,
+    cancelButtonText,
+    saving = false,
+}: Props) {
+    const intl = useIntl();
+    const panelClassName = classNames('SaveChangesPanel', {error: tabChangeError || state === 'error'}, {saved: state === 'saved'});
+    const messageClassName = classNames('SaveChangesPanel__message', {error: tabChangeError || state === 'error'}, {saved: state === 'saved'});
+
+    useEffect(() => {
+        let timeoutId: NodeJS.Timeout;
+        if (state === 'saved') {
+            timeoutId = setTimeout(() => {
+                handleClose();
+            }, CLOSE_TIMEOUT);
+        }
+
+        return () => clearTimeout(timeoutId);
+    }, [handleClose, state]);
+
+    const generateMessage = () => {
+        if (customErrorMessage && (tabChangeError || state === 'error')) {
+            return customErrorMessage;
+        }
+
+        if (tabChangeError || state === 'editing') {
+            return (
+                <FormattedMessage
+                    id='saveChangesPanel.message'
+                    defaultMessage='You have unsaved changes'
+                />
+            );
+        }
+
+        if (state === 'error') {
+            return (
+                <FormattedMessage
+                    id='saveChangesPanel.error'
+                    defaultMessage='There was an error saving your settings'
+                />
+            );
+        }
+
+        if (customSavedMessage) {
+            return <span>{customSavedMessage}</span>;
+        }
+        return (
+            <FormattedMessage
+                id='saveChangesPanel.saved'
+                defaultMessage='Settings saved'
+            />
+        );
+    };
+
+    const generateControlButtons = () => {
+        if (state === 'saved') {
+            return (
+                <div className='SaveChangesPanel__btn-ctr'>
+                    <WithTooltip title={intl.formatMessage({id: 'saveChangesPanel.dismiss', defaultMessage: 'Dismiss'})}>
+                        <IconButton
+                            id='panelCloseButton'
+                            size='small'
+                            icon={<Icon glyph={<CloseIcon/>}/>}
+                            onClick={handleClose}
+                            aria-label={intl.formatMessage({id: 'saveChangesPanel.dismiss', defaultMessage: 'Dismiss'})}
+                        />
+                    </WithTooltip>
+                </div>
+            );
+        }
+
+        const saveButtonDisabled = saving || tabChangeError || state === 'error';
+
+        return (
+            <div className='SaveChangesPanel__btn-ctr'>
+                <Button
+                    data-testid='SaveChangesPanel__cancel-btn'
+                    emphasis='tertiary'
+                    size='small'
+                    className={classNames('SaveChangesPanel__cancel-btn', {error: tabChangeError || state === 'error'})}
+                    onClick={handleCancel}
+                    disabled={saving}
+                >
+                    {cancelButtonText || (
+                        <FormattedMessage
+                            id='saveChangesPanel.cancel'
+                            defaultMessage='Undo'
+                        />
+                    )}
+                </Button>
+                <Button
+                    data-testid='SaveChangesPanel__save-btn'
+                    emphasis='primary'
+                    size='small'
+                    className={classNames('SaveChangesPanel__save-btn', {error: tabChangeError || state === 'error'})}
+                    onClick={handleSubmit}
+                    disabled={saveButtonDisabled}
+                    loading={saving}
+                >
+                    {saving ? (
+                        <FormattedMessage
+                            id='saveChangesPanel.saving'
+                            defaultMessage='Saving...'
+                        />
+                    ) : (saveButtonText || (
+                        <FormattedMessage
+                            id='saveChangesPanel.save'
+                            defaultMessage='Save'
+                        />
+                    ))}
+                </Button>
+            </div>
+        );
+    };
+
+    return (
+        <div className={panelClassName}>
+            <p className={messageClassName}>
+                <AlertCircleOutlineIcon
+                    size={18}
+                    color={'currentcolor'}
+                />
+                {generateMessage()}
+            </p>
+            {generateControlButtons()}
+        </div>
+    );
+}
+export default SaveChangesPanel;

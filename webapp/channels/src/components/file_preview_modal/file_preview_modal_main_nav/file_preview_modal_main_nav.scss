@@ -1,0 +1,20 @@
+.file_preview_modal_main_nav {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 1.6rem;
+    font-weight: 600;
+
+    &__next {
+        margin-left: 12px;
+    }
+
+    &__prev {
+        margin-right: 12px;
+    }
+
+    @media screen and (max-width: 768px) {
+        width: 100%;
+        margin-left: -24px;
+    }
+}

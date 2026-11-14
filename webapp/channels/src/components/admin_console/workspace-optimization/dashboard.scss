@@ -1,0 +1,262 @@
+.error {
+    color: var(--sys-error-text);
+}
+
+.info {
+    color: var(--sys-sidebar-text-active-border);
+}
+
+.warning {
+    color: var(--sys-away-indicator-dark);
+}
+
+.ok {
+    color: var(--sys-online-indicator);
+}
+
+.scoreGraph {
+    display: flex;
+    width: 112px;
+    height: 112px;
+    align-items: center;
+    justify-content: center;
+    border-radius: 50%;
+}
+
+.WorkspaceOptimizationDashboard {
+
+    button[class*=' StyledChip'],
+    button[class^='StyledChip'] {
+        width: 120px;
+        height: 24px;
+        justify-content: space-around;
+        border: none;
+        margin-right: 8px;
+        margin-bottom: 0;
+        box-shadow: none;
+        font-size: 12px;
+        font-style: normal;
+        font-weight: bold;
+        line-height: 16px;
+        text-align: center;
+
+        &.error {
+            @extend .error;
+
+            background-color: rgba(var(--sys-error-text-color-rgb), 0.16);
+        }
+
+        &.info {
+            @extend .info;
+
+            background-color: rgba(var(--sys-sidebar-text-active-border-rgb), 0.16);
+        }
+
+        &.warning {
+            @extend .warning;
+
+            background-color: rgba(var(--sys-away-indicator-rgb), 0.16);
+        }
+
+        &.ok {
+            @extend .ok;
+
+            background-color: rgba(var(--sys-online-indicator-rgb), 0.16);
+        }
+    }
+
+    // AdminPanel now supplies surface/border/radius/elevation/padding/sizing
+    // itself (it's a <section>, not a <div>, now). Its real children sit
+    // inside its own internal body wrapper, not directly under the root
+    // section, so the icon-beside-content flex layout has to target that
+    // wrapper (same fix server_logs.scss needed) — flex on .OverallScore
+    // itself never reaches scoreEllipseSvg/content, which just block-stack.
+    .OverallScore {
+        [class*='admin-panel__body'] {
+            display: flex;
+            align-items: center;
+            gap: var(--spacing-xxl);
+        }
+
+        &__scoreEllipseSvg {
+            display: flex;
+            width: 140px;
+            height: 140px;
+            flex-shrink: 0;
+            align-items: center;
+
+            .alertImageScore {
+                @extend .scoreGraph;
+
+                background-color: rgba(var(--sys-error-text-color-rgb), 0.3);
+            }
+
+            .successImageScore {
+                @extend .scoreGraph;
+
+                background-color: rgba(var(--sys-online-indicator-rgb), 0.3);
+            }
+
+            .CircularChart {
+                .circular-chart {
+                    display: block;
+                    margin: 5px auto;
+
+                    &.warning .circle {
+                        stroke: var(--sys-away-indicator);
+                    }
+
+                    &.success .circle {
+                        stroke: var(--sys-online-indicator);
+                    }
+
+                    &.info .circle {
+                        stroke: var(--sys-sidebar-text-active-border);
+                    }
+
+                    &.error .circle {
+                        stroke: var(--sys-error-text);
+                    }
+
+                    .circle {
+                        animation: progress 1s ease-out forwards;
+                        fill: none;
+                        stroke-width: 3.55;
+                    }
+
+                    .percentageOrNumber {
+                        font-family: var(--font-family-heading);
+                        font-size: 0.65em;
+                        font-weight: var(--font-weight-semibold);
+                    }
+                }
+
+                @keyframes progress {
+                    0% {
+                        stroke-dasharray: 0 100;
+                    }
+                }
+            }
+        }
+
+        &__content {
+            display: flex;
+            min-width: 0;
+            flex: 1 1 auto;
+            flex-direction: column;
+
+            &__title {
+                margin: 0 0 var(--spacing-xs);
+                color: var(--center-channel-color);
+                font-family: var(--font-family-heading);
+                font-size: var(--font-size-200);
+                font-weight: var(--font-weight-semibold);
+                line-height: var(--line-height-200);
+            }
+
+            &__description {
+                margin: 0 0 var(--spacing-xxl);
+                color: rgba(var(--center-channel-color-rgb), 0.75);
+                font-family: var(--font-family-body);
+                font-size: var(--font-size-100);
+                font-weight: var(--font-weight-regular);
+                line-height: var(--line-height-100);
+            }
+
+            &__chips {
+                display: flex;
+                flex-direction: row;
+                flex-wrap: wrap;
+                gap: var(--spacing-m);
+
+                button[class*=' StyledChip'],
+                button[class^='StyledChip'] {
+                    width: 180px;
+                    height: 32px;
+                    margin-right: 0;
+                }
+            }
+        }
+    }
+
+    .WorkspaceOptimizationDashboard__sections {
+        display: flex;
+        width: 100%;
+        max-width: 920px;
+        flex-direction: column;
+        margin-top: var(--spacing-xl);
+        gap: var(--spacing-l);
+    }
+
+    .WorkspaceOptimizationDashboard__section {
+        // Success / up-to-date sections: green leading pill like the former accordion.
+        &--success {
+            [class*='admin-panel-header__leading'] {
+                background-color: rgba(var(--sys-online-indicator-rgb), 0.16);
+                color: var(--sys-online-indicator);
+            }
+        }
+
+        // Header-only (no recommendations): hide empty Compass body + divider.
+        &--header-only {
+            [class*='admin-panel-header--divided'] {
+                border-bottom-color: transparent;
+            }
+
+            [class*='admin-panel__body'] {
+                display: none;
+                padding: 0;
+            }
+        }
+
+        [class*='admin-panel-header__actions'] {
+            button[class*=' StyledChip'],
+            button[class^='StyledChip'] {
+                width: auto;
+                min-width: 120px;
+                height: 24px;
+                margin-right: 0;
+            }
+        }
+
+        [class*='admin-panel__body'] {
+            .WorkspaceOptimizationDashboard__item {
+                padding: var(--spacing-l) 0;
+
+                &:first-child {
+                    padding-top: 0;
+                }
+
+                &:last-child {
+                    padding-bottom: 0;
+                    border-bottom: none;
+                }
+
+                h5 {
+                    display: inline-flex;
+                    align-items: center;
+                    margin-top: 0;
+                    margin-bottom: var(--spacing-xxs);
+                    font-weight: bold;
+                }
+
+                i {
+                    margin-left: calc(var(--spacing-xxs) * -1);
+                    font-size: 20px;
+
+                    &.warning {
+                        color: var(--sys-away-indicator);
+                    }
+                }
+            }
+
+            .ctaButtons {
+                display: flex;
+                flex-wrap: wrap;
+                justify-content: flex-start;
+                margin: var(--spacing-l) 0 0 0;
+                gap: var(--spacing-xs);
+            }
+        }
+    }
+}

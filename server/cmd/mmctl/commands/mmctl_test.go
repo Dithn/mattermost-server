@@ -1,0 +1,278 @@
+// Copyright (c) 2015-present Mattermost, Inc. All Rights Reserved.
+// See LICENSE.txt for license information.
+
+package commands
+
+import (
+	"context"
+	"fmt"
+	"slices"
+	"testing"
+	"time"
+
+	"github.com/mattermost/mattermost/server/public/model"
+	"github.com/mattermost/mattermost/server/v8/channels/api4"
+	"github.com/mattermost/mattermost/server/v8/channels/jobs"
+	"github.com/mattermost/mattermost/server/v8/cmd/mmctl/client"
+	"github.com/mattermost/mattermost/server/v8/cmd/mmctl/mocks"
+	"github.com/mattermost/mattermost/server/v8/cmd/mmctl/printer"
+	"github.com/spf13/cobra"
+	"github.com/spf13/pflag"
+	"github.com/spf13/viper"
+	"github.com/stretchr/testify/require"
+	"github.com/stretchr/testify/suite"
+	"go.uber.org/mock/gomock"
+)
+
+var EnableEnterpriseTests string
+
+// newTestCmd returns a cobra.Command whose context is bound to the test's
+// lifetime, mirroring the context cobra assigns to a command during real
+// execution (see Command.ExecuteContext). base is one of the package's real
+// command vars (e.g. SystemSupportPacketCmd, SystemGetBusyCmd), reusing its
+// already-registered flags instead of re-declaring them on a bare command.
+//
+// base's context and flag values are restored once the test completes, so
+// mutating the shared command in one test (e.g. via cmd.Flags().Set(...))
+// can't leak into a later test or into a real dispatch through cobra's
+// Execute/ExecuteContext, which only assigns a fresh context when one isn't
+// already set.
+func newTestCmd(t *testing.T, base *cobra.Command) *cobra.Command {
+	// A slice flag's first Set replaces its default and later ones append, and pflag can't
+	// reset that. So the test gets fresh slice values, and base gets its own back afterwards.
+	originals := make(map[*pflag.Flag]pflag.Value)
+	base.Flags().VisitAll(func(f *pflag.Flag) {
+		if fresh := newSliceValue(t, f); fresh != nil {
+			originals[f] = f.Value
+			f.Value = fresh
+		}
+	})
+
+	t.Cleanup(func() {
+		// A nil context is intentional here: it restores cobra's own "no
+		// context assigned yet" sentinel (see Command.ExecuteC), so the next
+		// real dispatch gets a fresh context instead of this test's.
+		base.SetContext(nil) //nolint:staticcheck
+		base.Flags().VisitAll(func(f *pflag.Flag) {
+			if original, ok := originals[f]; ok {
+				f.Value = original
+			} else {
+				_ = f.Value.Set(f.DefValue)
+			}
+			f.Changed = false
+		})
+	})
+	base.SetContext(t.Context())
+	return base
+}
+
+// newSliceValue returns a new value holding the default of a slice flag, or nil for any other flag.
+func newSliceValue(t *testing.T, f *pflag.Flag) pflag.Value {
+	slice, ok := f.Value.(pflag.SliceValue)
+	if !ok {
+		return nil
+	}
+
+	defaults := slices.Clone(slice.GetSlice())
+	fs := pflag.NewFlagSet(f.Name, pflag.ContinueOnError)
+	switch f.Value.Type() {
+	case "stringSlice":
+		fs.StringSlice(f.Name, defaults, f.Usage)
+	case "stringArray":
+		fs.StringArray(f.Name, defaults, f.Usage)
+	default:
+		t.Fatalf("newTestCmd doesn't support %s flags yet, such as --%s", f.Value.Type(), f.Name)
+	}
+	return fs.Lookup(f.Name).Value
+}
+
+func (s *MmctlUnitTestSuite) TestNewTestCmd() {
+	base := &cobra.Command{}
+	base.Flags().StringSlice("slice", []string{"a"}, "")
+	base.Flags().StringArray("array", []string{"a"}, "")
+
+	for _, name := range []string{"slice", "array"} {
+		get := func(cmd *cobra.Command) []string {
+			if name == "slice" {
+				values, err := cmd.Flags().GetStringSlice(name)
+				s.Require().NoError(err)
+				return values
+			}
+			values, err := cmd.Flags().GetStringArray(name)
+			s.Require().NoError(err)
+			return values
+		}
+
+		// Each test's first Set replaces the default, as on the command line
+		for range 2 {
+			s.Run(name+" set", func() {
+				cmd := newTestCmd(s.T(), base)
+				s.Require().NoError(cmd.Flags().Set(name, "b"))
+				s.Require().NoError(cmd.Flags().Set(name, "c"))
+				s.Equal([]string{"b", "c"}, get(cmd))
+			})
+		}
+
+		s.Run(name+" default", func() {
+			s.Equal([]string{"a"}, get(newTestCmd(s.T(), base)))
+		})
+	}
+}
+
+type MmctlUnitTestSuite struct {
+	suite.Suite
+	mockCtrl *gomock.Controller
+	client   *mocks.MockClient
+}
+
+func (s *MmctlUnitTestSuite) SetupTest() {
+	viper.Reset()
+	printer.Clean()
+	printer.SetFormat(printer.FormatJSON)
+
+	s.mockCtrl = gomock.NewController(s.T())
+	s.client = mocks.NewMockClient(s.mockCtrl)
+}
+
+func (s *MmctlUnitTestSuite) TearDownTest() {
+	s.mockCtrl.Finish()
+	viper.Reset()
+}
+
+type MmctlE2ETestSuite struct {
+	suite.Suite
+	th *api4.TestHelper
+}
+
+func (s *MmctlE2ETestSuite) SetupTest() {
+	printer.Clean()
+	printer.SetFormat(printer.FormatJSON)
+}
+
+func (s *MmctlE2ETestSuite) SetupSubTest() {
+	printer.Clean()
+}
+
+func (s *MmctlE2ETestSuite) TearDownTest() {
+	// Remove the test helper from the structure to avoid reusing the same helper between tests
+	s.th = nil
+}
+
+func (s *MmctlE2ETestSuite) SetupTestHelper() *api4.TestHelper {
+	s.th = api4.Setup(s.T())
+	return s.th
+}
+
+func (s *MmctlE2ETestSuite) SetupTestHelperWithConfig(updateConfig func(cfg *model.Config)) *api4.TestHelper {
+	s.th = api4.SetupConfig(s.T(), updateConfig)
+	return s.th
+}
+
+func (s *MmctlE2ETestSuite) SetupEnterpriseTestHelper() *api4.TestHelper {
+	if EnableEnterpriseTests != "true" {
+		s.T().SkipNow()
+	}
+	s.th = api4.SetupEnterprise(s.T())
+	return s.th
+}
+
+func (s *MmctlE2ETestSuite) SetupMessageExportTestHelper() *api4.TestHelper {
+	if EnableEnterpriseTests != "true" {
+		s.T().SkipNow()
+	}
+
+	jobs.DefaultWatcherPollingInterval = 100
+	s.th = api4.SetupEnterprise(s.T()).InitBasic(s.T())
+	s.th.App.Srv().SetLicense(model.NewTestLicense("message_export"))
+	s.th.App.UpdateConfig(func(cfg *model.Config) {
+		*cfg.MessageExportSettings.DownloadExportResults = true
+		*cfg.MessageExportSettings.EnableExport = true
+		*cfg.MessageExportSettings.ExportFormat = model.ComplianceExportTypeActiance
+	})
+
+	err := s.th.App.Srv().Jobs.StartWorkers()
+	require.NoError(s.T(), err)
+
+	err = s.th.App.Srv().Jobs.StartSchedulers()
+	require.NoError(s.T(), err)
+
+	return s.th
+}
+
+// RunForSystemAdminAndLocal runs a test function for both SystemAdmin
+// and Local clients. Several commands work in the same way when used
+// by a fully privileged user and through the local mode, so this
+// helper facilitates checking both
+func (s *MmctlE2ETestSuite) RunForSystemAdminAndLocal(testName string, fn func(client.Client)) {
+	s.Run(testName+"/SystemAdminClient", func() {
+		fn(s.th.SystemAdminClient)
+	})
+
+	s.Run(testName+"/LocalClient", func() {
+		fn(s.th.LocalClient)
+	})
+}
+
+// RunForAllClients runs a test function for all the clients
+// registered in the TestHelper
+func (s *MmctlE2ETestSuite) RunForAllClients(testName string, fn func(client.Client)) {
+	s.Run(testName+"/Client", func() {
+		fn(s.th.Client)
+	})
+
+	s.Run(testName+"/SystemAdminClient", func() {
+		fn(s.th.SystemAdminClient)
+	})
+
+	s.Run(testName+"/LocalClient", func() {
+		fn(s.th.LocalClient)
+	})
+}
+
+func (s *MmctlE2ETestSuite) CheckErrorID(err error, errorId string) {
+	api4.CheckErrorID(s.T(), err, errorId)
+}
+
+// Helper functions for compliance export job testing
+
+// getMostRecentJobWithId gets the most recent job with the specified ID
+func (s *MmctlE2ETestSuite) getMostRecentJobWithId(id string) *model.Job {
+	list, _, err := s.th.SystemAdminClient.GetJobsByType(context.Background(), model.JobTypeMessageExport, 0, 1)
+	s.Require().NoError(err)
+	s.Require().Len(list, 1)
+	s.Require().Equal(id, list[0].Id)
+	return list[0]
+}
+
+// checkJobForStatus polls until the job with the specified ID reaches the expected status
+func (s *MmctlE2ETestSuite) checkJobForStatus(id string, status string) {
+	doneChan := make(chan bool)
+	var job *model.Job
+	go func() {
+		defer close(doneChan)
+		for {
+			job = s.getMostRecentJobWithId(id)
+			if job.Status == status {
+				break
+			}
+			time.Sleep(100 * time.Millisecond)
+		}
+		s.Require().Equal(status, job.Status)
+	}()
+	select {
+	case <-doneChan:
+	case <-time.After(15 * time.Second):
+		s.Require().Fail(fmt.Sprintf("expected job's status to be %s, got %s", status, job.Status))
+	}
+}
+
+// runJobForTest creates a job and waits for it to complete
+func (s *MmctlE2ETestSuite) runJobForTest(jobData map[string]string) *model.Job {
+	job, _, err := s.th.SystemAdminClient.CreateJob(context.Background(),
+		&model.Job{Type: model.JobTypeMessageExport, Data: jobData})
+	s.Require().NoError(err)
+	// poll until completion
+	s.checkJobForStatus(job.Id, model.JobStatusSuccess)
+	job = s.getMostRecentJobWithId(job.Id)
+	return job
+}

@@ -1,0 +1,46 @@
+// Copyright (c) 2015-present Mattermost, Inc. All Rights Reserved.
+// See LICENSE.txt for license information.
+
+.ContentFlaggingSettings {
+    // Single enable BooleanSetting under form-horizontal: keep label/radio
+    // padding alignment, but drop the default 25px form-group margin — sibling
+    // spacing comes from admin-console__content gap.
+    .admin-console__setting-group > .form-group {
+        margin-bottom: 0;
+    }
+
+    .content-flagging-section-setting {
+        display: flex;
+    }
+
+    .setting-title {
+        min-width: 290px;
+        font-size: 14px;
+        font-weight: 600;
+    }
+
+    .content-flagging-section-setting-wrapper {
+        display: flex;
+        flex-direction: column;
+        gap: var(--spacing-xl);
+    }
+
+    .setting-content {
+        display: flex;
+        flex: 1;
+        font-size: 14px;
+        gap: var(--spacing-xl);
+    }
+
+    .setting-content-wrapper {
+        display: flex;
+        flex-direction: column;
+        gap: var(--spacing-xs);
+    }
+
+    .admin-console-save {
+        .error-message {
+            color: var(--dnd-indicator);
+        }
+    }
+}

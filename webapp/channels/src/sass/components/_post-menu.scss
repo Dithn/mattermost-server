@@ -1,0 +1,74 @@
+@use "utils/functions";
+@use "utils/variables";
+
+.post-menu {
+    position: absolute;
+    z-index: 6;
+    top: -12px;
+    right: 0;
+    display: flex;
+    justify-content: flex-end;
+    padding: 4px;
+    border: 1px solid transparent;
+    border-radius: 4px;
+
+    // Counteract the margins added to ul in _typography.scss
+    margin-top: 0;
+    margin-bottom: 0;
+
+    list-style: none;
+    white-space: normal;
+}
+
+// Layout / hover-reveal only. Sizing and colors come from Compass IconButton.
+// `button.` raises specificity so IconButton's display:inline-flex does not win the hide rule.
+.post-menu__item {
+    border: none;
+    background: transparent;
+}
+
+.post-menu__item--show {
+    display: inline-flex;
+}
+
+.post-menu__item--wide {
+    width: auto;
+}
+
+.post-menu__emoticon {
+    cursor: pointer;
+}
+
+@media (min-width: 768px) {
+    button.post-menu__item {
+        display: none;
+    }
+
+    button.post-menu__item--show {
+        display: inline-flex;
+    }
+
+    .post {
+        &:hover,
+        &.post--hovered,
+        &.a11y--active {
+            .post-menu {
+                border-color: rgba(var(--center-channel-color-rgb), 0.2);
+                background-color: functions.v(center-channel-bg);
+                box-shadow: variables.$elevation-1;
+            }
+
+            .search-item__jump {
+                color: rgba(functions.v(center-channel-color-rgb), 0.75);
+
+                &:hover {
+                    color: functions.v(link-color);
+                }
+            }
+
+            button.post-menu__item {
+                display: inline-flex;
+            }
+        }
+    }
+}

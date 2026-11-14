@@ -1,0 +1,44 @@
+{
+  "compilerOptions": {
+    "target": "esnext",
+    "lib": [
+      "dom",
+      "dom.iterable",
+      "esnext"
+    ],
+    "allowJs": true,
+    "skipLibCheck": true,
+    "esModuleInterop": true,
+    "isolatedModules": true,
+    "allowSyntheticDefaultImports": true,
+    "strict": true,
+    "strictNullChecks": true,
+    "forceConsistentCasingInFileNames": true,
+    "module": "es2020",
+    "moduleResolution": "bundler",
+    "resolveJsonModule": true,
+    "noEmit": true,
+    "experimentalDecorators": true,
+    "jsx": "react",
+    "useUnknownInCatchVariables": false,
+    "noUncheckedSideEffectImports": false,
+    "composite": true,
+    "types": ["@testing-library/jest-dom"],
+    "paths": {
+        "*": ["./src/*"],
+        "mattermost-redux/*": ["./src/packages/mattermost-redux/src/*"],
+    },
+    "plugins": [{
+        "name": "typescript-eslint-language-service"
+    }]
+  },
+  "include": [
+    "./src/**/*",
+    "./src/**/*.json"
+  ],
+  "references": [
+    {"path": "../platform/client"},
+    {"path": "../platform/components"},
+    {"path": "../platform/types"}
+  ]
+}

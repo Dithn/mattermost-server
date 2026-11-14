@@ -1,0 +1,260 @@
+# @mattermost/playwright-lib
+
+A comprehensive end-to-end testing library for Mattermost web, desktop and plugin applications using Playwright.
+
+## Overview
+
+This library provides:
+
+- Pre-built page objects and components for common Mattermost UI elements
+- Server configuration and initialization utilities
+- Test fixtures and helpers
+- Visual testing support with Percy integration
+- Accessibility testing support with [axe-core](https://github.com/dequelabs/axe-core)
+- Browser notification mocking
+- File handling utilities
+- Common test actions and assertions
+
+## Installation
+
+```bash
+npm install @mattermost/playwright-lib
+```
+
+### Peer Dependencies
+
+This library requires `@playwright/test` version 1.55.0 or higher:
+
+```bash
+npm install @playwright/test@^1.55.0
+```
+
+## Usage
+
+Basic example of logging in and posting a message:
+
+```typescript
+import {test, expect} from '@mattermost/playwright-lib';
+
+test('user can post message', async ({pw}) => {
+    // # Create and login a new user
+    const {user} = await pw.initSetup();
+    const {channelsPage} = await pw.testBrowser.login(user);
+
+    // # Navigate and post a message
+    await channelsPage.goto();
+    const message = 'Hello World!';
+    await channelsPage.postMessage(message);
+
+    // * Verify message appears
+    const lastPost = await channelsPage.getLastPost();
+    await expect(lastPost).toHaveText(message);
+});
+```
+
+## Key Components
+
+### Page Objects
+
+Ready-to-use page objects for common Mattermost pages:
+
+- Login
+- Signup
+- Channels
+- System Console
+- And more...
+
+### UI Components
+
+Reusable component objects for UI elements:
+
+- Headers
+- Posts
+- Menus
+- Modals
+- And more...
+
+### Test Utilities
+
+Helper functions for common testing needs:
+
+- Server setup and configuration
+- User/team creation
+- File handling
+- Visual testing
+- And more...
+
+Global setup leaves only the plugins a fresh install has active (Calls, Playbooks, Agents, NPS) and
+deactivates the rest, so a plugin one spec enabled cannot alter the webapp for the next one — the
+demo plugin, for instance, replaces the attachment button with its own upload menu. A spec needing
+another plugin enables it itself with `pw.installAndEnablePlugin()` or `pw.ensurePluginsLoaded()`.
+`PW_ENSURE_PLUGINS_INSTALLED` is honoured and left active.
+
+## Configuration
+
+The library can be configured via optional environment variables:
+
+### Environment Variables
+
+All environment variables are optional with sensible defaults.
+
+#### Server Configuration
+
+| Variable                      | Description                                | Default                          |
+| ----------------------------- | ------------------------------------------ | -------------------------------- |
+| `PW_BASE_URL`                 | Server URL                                 | `http://localhost:8065`          |
+| `PW_ADMIN_USERNAME`           | Admin username                             | `sysadmin`                       |
+| `PW_ADMIN_PASSWORD`           | Admin password                             | `Sys@dmin-sample1`               |
+| `PW_ADMIN_EMAIL`              | Admin email                                | `sysadmin@sample.mattermost.com` |
+| `PW_ENSURE_PLUGINS_INSTALLED` | Comma-separated list of plugins to install | `[]`                             |
+| `PW_RESET_BEFORE_TEST`        | Reset server before test                   | `false`                          |
+| `PW_SMTP_URL`                 | Inbucket HTTP API URL                      | `http://localhost:9001`          |
+
+#### High Availability Cluster Settings
+
+| Variable                   | Description             | Default          |
+| -------------------------- | ----------------------- | ---------------- |
+| `PW_HA_CLUSTER_ENABLED`    | Enable HA cluster       | `false`          |
+| `PW_HA_CLUSTER_NODE_COUNT` | Number of cluster nodes | `2`              |
+| `PW_HA_CLUSTER_NAME`       | Cluster name            | `mm_dev_cluster` |
+
+#### Push Notifications
+
+| Variable                      | Description                  | Default                            |
+| ----------------------------- | ---------------------------- | ---------------------------------- |
+| `PW_PUSH_NOTIFICATION_SERVER` | Push notification server URL | `https://push-test.mattermost.com` |
+
+#### Playwright Settings
+
+| Variable      | Description                     | Default |
+| ------------- | ------------------------------- | ------- |
+| `PW_HEADLESS` | Run tests headless              | `true`  |
+| `PW_SLOWMO`   | Add delay between actions in ms | `0`     |
+| `PW_WORKERS`  | Number of parallel workers      | `1`     |
+
+#### Visual Testing
+
+| Variable             | Description                 | Default |
+| -------------------- | --------------------------- | ------- |
+| `PW_SNAPSHOT_ENABLE` | Enable snapshot testing     | `false` |
+| `PW_PERCY_ENABLE`    | Enable Percy visual testing | `false` |
+
+#### CI Settings
+
+| Variable | Description                          | Default |
+| -------- | ------------------------------------ | ------- |
+| `CI`     | Set automatically in CI environments | N/A     |
+
+#### Testcontainers
+
+Selects `testcontainers` mode — Playwright brings up the server + dependencies itself via [Testcontainers](https://node.testcontainers.org/) — instead of the `external` mode default, which expects a server already running at `PW_BASE_URL`.
+
+| Variable                             | Description                                                                                                                                                                                                                                                                                                                                                                        | Default                                                      |
+| ------------------------------------ | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------ |
+| `PW_USE_TESTCONTAINERS`              | Selects `testcontainers` mode                                                                                                                                                                                                                                                                                                                                                      | `false`                                                      |
+| `PW_TESTCONTAINERS_SERVICES`         | Comma-separated additional services to start (`openldap`, `keycloak`, `elasticsearch`, `opensearch`, `minio`, `azurite`, `nginx`); set to an empty string to start none                                                                                                                                                                                                            | `minio,openldap,keycloak,elasticsearch,nginx`                |
+| `PW_TESTCONTAINERS_REUSE`            | Reuse containers across repeated local runs instead of recreating them; tear down with `npm run testcontainers:down` (requires `testcontainers.reuse.enable=true` in `~/.testcontainers.properties`)                                                                                                                                                                               | `true`                                                       |
+| `PW_TESTCONTAINERS_CONTAINER_RUNNER` | Set when the Playwright process itself runs inside a Docker container (e.g. CI), to join it to the Testcontainers network                                                                                                                                                                                                                                                          | `false`                                                      |
+| `SERVER_IMAGE`                       | Prebuilt Mattermost server image `testcontainers` mode starts — also the upgrade tests' to-image                                                                                                                                                                                                                                                                                   | `mattermostdevelopment/mattermost-enterprise-edition:master` |
+| `PW_UPGRADE_FROM_SERVER_IMAGE`       | Older server image `test:upgrade:from` boots fresh on — use a `release-X.Y` tag (see `script/resolve_upgrade_matrix.mjs`). Required; if `.env.testcontainers` already exists, run `npm run testcontainers:down` first                                                                                                                                                              | none — required for `--project=upgrade-from`                 |
+| `MM_ENV`                             | Comma-separated `KEY=VALUE` server config overrides, merged over the test baseline                                                                                                                                                                                                                                                                                                 | none                                                         |
+| `PW_LDAP_HOST` / `PW_LDAP_PORT`      | OpenLDAP host/port (only used when `openldap` is started)                                                                                                                                                                                                                                                                                                                          | `localhost` / `389`                                          |
+| `PW_KEYCLOAK_URL`                    | Keycloak URL (only used when `keycloak` is started)                                                                                                                                                                                                                                                                                                                                | `http://localhost:8484`                                      |
+| `PW_ELASTICSEARCH_URL`               | Elasticsearch URL (only used when `elasticsearch` is started)                                                                                                                                                                                                                                                                                                                      | `http://localhost:9200`                                      |
+| `PW_OPENSEARCH_URL`                  | OpenSearch URL (only used when `opensearch` is started)                                                                                                                                                                                                                                                                                                                            | `http://localhost:9201`                                      |
+| `PW_MINIO_URL`                       | Minio URL (only used when `minio` is started)                                                                                                                                                                                                                                                                                                                                      | `http://localhost:9000`                                      |
+| `PW_AZURITE_URL`                     | Azurite URL (only used when `azurite` is started)                                                                                                                                                                                                                                                                                                                                  | `http://localhost:10000`                                     |
+| `PW_NGINX_URL`                       | Nginx reverse-proxy URL fronting the server (only used when `nginx` is started)                                                                                                                                                                                                                                                                                                    | `http://localhost:8057`                                      |
+| `PW_SERVER_SSL`                      | Serve the nginx proxy over HTTPS (devcert-issued locally-trusted cert, falling back to self-signed) instead of plain HTTP                                                                                                                                                                                                                                                          | `false`                                                      |
+| `PW_SERVER_DEPLOY`                   | Deployment topology to boot the server as: unset (a typical single-node server), `subpath` (boots directly with SiteURL under the nginx proxy's subpath — every other test sharing this server would also see the prefix, so use it only for a run dedicated entirely to subpath specs, e.g. standalone `--project subpath`), or `ha` (defaults `PW_HA_CLUSTER_ENABLED` to `true`) | (empty)                                                      |
+
+In `testcontainers` mode, these host/port defaults above are never actually used — Testcontainers assigns its own dynamic port or network alias per run for every one of these services, so a `testcontainers`-mode run can never collide with a same-machine `external`-mode session using the fixed defaults above.
+
+The one exception is the **Mattermost server container itself**, which publishes to a **fixed host port, `8055`** (`MATTERMOST_FIXED_HOST_PORT` in `lib/src/containers/constants.ts`) rather than a dynamic one. This is deliberately not `8065` (the `external`-mode/`PW_BASE_URL` default above), so a `testcontainers`-mode run still doesn't collide with a locally-run dev server on the same machine. The fixed port exists so `testConfig.baseURL` stays stable across a `restartMattermostContainer()` call — some settings (e.g. `ServiceSettings.SiteURL`, via `pw.ensureSiteUrl()`) depend on that stability to converge at all; a dynamic port would go stale the instant a restart replaced the container. This assumes one Mattermost `testcontainers` stack per host at a time (already true of `PW_TESTCONTAINERS_REUSE`'s single-stack model); CI runs each matrix job on its own isolated runner, so it doesn't collide there either.
+
+Starting the stack, restarting the server and the global setup run under a lock (`.testcontainers.lock`, ignored by git). A second invocation started while the first is still booting waits, then reuses the stack and admin the first one set up, instead of fighting for port `8055` or wiping the server's data directory. It waits at most 2 minutes, and takes over a lock whose owner has exited or stopped refreshing it. Before each server start, leftover containers from a failed attempt are removed and the host port is awaited until it is free. A server of this stack that is still running but no longer recorded in `.env.testcontainers`, which an interrupted run can leave behind (the worker is killed without cleanup), is removed at the next start and at teardown. If something else holds the port, the run fails right away and names the holder.
+
+Tear a reused stack down explicitly with `npm run testcontainers:down` (from the `playwright/` package).
+
+## Accessibility Testing
+
+The library includes built-in accessibility testing using [axe-core](https://github.com/dequelabs/axe-core):
+
+```typescript
+import {test, expect} from '@mattermost/playwright-lib';
+
+test('verify login page accessibility', async ({page, axe}) => {
+    // # Navigate to login page
+    await page.goto('/login');
+
+    // # Run accessibility scan
+    const results = await axe.builder(page).analyze();
+
+    // * Verify no accessibility violations
+    expect(results.violations).toHaveLength(0);
+});
+```
+
+The axe-core integration:
+
+- Runs WCAG 2.0 Level A & AA rules by default
+- Provides detailed violation reports
+- Supports rule customization
+- Can be configured per-test or globally
+
+## Visual Testing
+
+The library supports visual testing through [Playwright's built-in visual comparisons](https://playwright.dev/docs/test-snapshots) and [Percy](https://www.browserstack.com/percy) integration:
+
+```typescript
+import {test, expect} from '@mattermost/playwright-lib';
+
+test('verify channel header appearance', async ({pw, browserName, viewport}, testInfo) => {
+    // # Setup and login
+    const {user} = await pw.initSetup();
+    const {page, channelsPage} = await pw.testBrowser.login(user);
+
+    // # Navigate and prepare page
+    await channelsPage.goto();
+    await expect(channelsPage.appBar.playbooksIcon).toBeVisible();
+    await pw.hideDynamicChannelsContent(page);
+
+    // * Take and verify snapshot
+    await pw.matchSnapshot(testInfo, {page, browserName, viewport});
+});
+```
+
+## Browser Notifications
+
+Mock and verify browser notifications:
+
+```typescript
+import {test, expect} from '@mattermost/playwright-lib';
+
+test('verify notification on mention', async ({pw}) => {
+    // # Setup users and team
+    const {team, adminUser, user} = await pw.initSetup();
+
+    // # Setup admin browser with notifications
+    const {page: adminPage, channelsPage: adminChannelsPage} = await pw.testBrowser.login(adminUser);
+    await adminChannelsPage.goto(team.name, 'town-square');
+    await pw.stubNotification(adminPage, 'granted');
+
+    // # Setup user browser and post mention
+    const {channelsPage: userChannelsPage} = await pw.testBrowser.login(user);
+    await userChannelsPage.goto(team.name, 'off-topic');
+    await userChannelsPage.postMessage(`@ALL good morning, ${team.name}!`);
+
+    // * Verify notification received
+    const notifications = await pw.waitForNotification(adminPage);
+    expect(notifications.length).toBe(1);
+});
+```
+
+## Contributing
+
+See [CONTRIBUTING.md](https://github.com/mattermost/mattermost/blob/master/CONTRIBUTING.md) for development setup and guidelines.
+
+## License
+
+See [LICENSE.txt](https://github.com/mattermost/mattermost/blob/master/LICENSE.txt) for license information.

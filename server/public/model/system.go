@@ -1,0 +1,198 @@
+// Copyright (c) 2015-present Mattermost, Inc. All Rights Reserved.
+// See LICENSE.txt for license information.
+
+package model
+
+import (
+	"math/big"
+	"net/http"
+	"time"
+	"unicode/utf8"
+)
+
+const (
+	SystemServerId                         = "DiagnosticId"
+	SystemRanUnitTests                     = "RanUnitTests"
+	SystemLastSecurityTime                 = "LastSecurityTime"
+	SystemActiveLicenseId                  = "ActiveLicenseId"
+	SystemLastComplianceTime               = "LastComplianceTime"
+	SystemAsymmetricSigningKeyKey          = "AsymmetricSigningKey"
+	SystemPostActionCookieSecretKey        = "PostActionCookieSecret"
+	SystemSamlRelayStateSigningKeyKey      = "SamlRelayStateSigningKey"
+	SystemInstallationDateKey              = "InstallationDate"
+	SystemOrganizationName                 = "OrganizationName"
+	SystemFirstAdminRole                   = "FirstAdminRole"
+	SystemFirstServerRunTimestampKey       = "FirstServerRunTimestamp"
+	SystemClusterEncryptionKey             = "ClusterEncryptionKey"
+	SystemPushProxyAuthToken               = "PushProxyAuthToken"
+	SystemUpgradedFromTeId                 = "UpgradedFromTE"
+	SystemWarnMetricNumberOfTeams5         = "warn_metric_number_of_teams_5"
+	SystemWarnMetricNumberOfChannels50     = "warn_metric_number_of_channels_50"
+	SystemWarnMetricMfa                    = "warn_metric_mfa"
+	SystemWarnMetricEmailDomain            = "warn_metric_email_domain"
+	SystemWarnMetricNumberOfActiveUsers100 = "warn_metric_number_of_active_users_100"
+	SystemWarnMetricNumberOfActiveUsers200 = "warn_metric_number_of_active_users_200"
+	SystemWarnMetricNumberOfActiveUsers300 = "warn_metric_number_of_active_users_300"
+	SystemWarnMetricNumberOfActiveUsers500 = "warn_metric_number_of_active_users_500"
+	SystemWarnMetricNumberOfPosts2m        = "warn_metric_number_of_posts_2M"
+	SystemWarnMetricLastRunTimestampKey    = "LastWarnMetricRunTimestamp"
+	SystemFirstAdminVisitMarketplace       = "FirstAdminVisitMarketplace"
+	SystemFirstAdminSetupComplete          = "FirstAdminSetupComplete"
+	SystemLastAccessiblePostTime           = "LastAccessiblePostTime"
+	SystemLastAccessibleFileTime           = "LastAccessibleFileTime"
+	SystemPostChannelTypeBackfillComplete  = "PostChannelTypeBackfillComplete"
+	AwsMeteringReportInterval              = 1
+	AwsMeteringDimensionUsageHrs           = "UsageHrs"
+	CloudRenewalEmail                      = "CloudRenewalEmail"
+)
+
+// Deprecated: The hosted purchase screening job has been removed.
+const SystemHostedPurchaseNeedsScreening = "HostedPurchaseNeedsScreening"
+
+const (
+	WarnMetricStatusLimitReached    = "true"
+	WarnMetricStatusRunonce         = "runonce"
+	WarnMetricStatusAck             = "ack"
+	WarnMetricStatusStorePrefix     = "warn_metric_"
+	WarnMetricJobInterval           = 24 * 7
+	WarnMetricNumberOfActiveUsers25 = 25
+	WarnMetricJobWaitTime           = 1000 * 3600 * 24 * 7 // 7 days
+)
+
+type System struct {
+	Name  string `json:"name"`
+	Value string `json:"value"`
+}
+
+type SystemPostActionCookieSecret struct {
+	Secret []byte `json:"key,omitempty"`
+}
+
+type SystemSamlRelayStateSigningKey struct {
+	Secret []byte `json:"key,omitempty"`
+}
+
+type SystemAsymmetricSigningKey struct {
+	ECDSAKey *SystemECDSAKey `json:"ecdsa_key,omitempty"`
+}
+
+type SystemECDSAKey struct {
+	Curve string   `json:"curve"`
+	X     *big.Int `json:"x"`
+	Y     *big.Int `json:"y"`
+	D     *big.Int `json:"d,omitempty"`
+}
+
+// ServerBusyState provides serialization for app.Busy.
+type ServerBusyState struct {
+	Busy      bool   `json:"busy"`
+	Expires   int64  `json:"expires"`
+	ExpiresTS string `json:"expires_ts,omitempty"`
+}
+
+type AppliedMigration struct {
+	Version int    `json:"version"`
+	Name    string `json:"name"`
+}
+
+// LogFilterDateLayout is the timestamp layout expected for the DateFrom and
+// DateTo bounds of a LogFilter.
+const LogFilterDateLayout = "2006-01-02 15:04:05.999 -07:00"
+
+// LogFilterSearchMaxLength is the maximum length, in characters, of a LogFilter's Search term.
+const LogFilterSearchMaxLength = 256
+
+// LogFilterFieldsMaxKeys is the maximum number of fields a LogFilter's Fields can filter on.
+const LogFilterFieldsMaxKeys = 10
+
+// LogFilterFieldMaxValues is the maximum number of values a LogFilter's Fields can accept for one field.
+const LogFilterFieldMaxValues = 20
+
+// LogFilterFieldMaxLength is the maximum length, in characters, of a field name or value in a
+// LogFilter's Fields.
+const LogFilterFieldMaxLength = 256
+
+type LogFilter struct {
+	ServerNames []string `json:"server_names"`
+	LogLevels   []string `json:"log_levels"`
+	DateFrom    string   `json:"date_from"`
+	DateTo      string   `json:"date_to"`
+	// Search keeps entries with a value other than level and timestamp that contains it,
+	// ignoring case.
+	Search string `json:"search"`
+	// Fields keeps entries whose top-level field, named by the key, equals one of its values.
+	// Every key must match, and values that aren't strings are compared as their JSON.
+	Fields map[string][]string `json:"fields,omitempty"`
+}
+
+// logFilterFieldDetail names a rejected field in an error's details, cut to LogFilterFieldMaxLength
+// characters so an oversized key doesn't end up in full in the server log.
+func logFilterFieldDetail(key string) string {
+	if utf8.RuneCountInString(key) > LogFilterFieldMaxLength {
+		key = string([]rune(key)[:LogFilterFieldMaxLength]) + "…"
+	}
+	return "field=" + key
+}
+
+// IsValid validates the log filter. Empty date bounds mean "unbounded", so only
+// a non-empty value that cannot be parsed with LogFilterDateLayout is rejected.
+func (f *LogFilter) IsValid() *AppError {
+	if f == nil {
+		return nil
+	}
+
+	if f.DateFrom != "" {
+		if _, err := time.Parse(LogFilterDateLayout, f.DateFrom); err != nil {
+			return NewAppError("LogFilter.IsValid", "model.log_filter.is_valid.date_from.app_error", map[string]any{"Layout": LogFilterDateLayout}, "", http.StatusBadRequest).Wrap(err)
+		}
+	}
+
+	if f.DateTo != "" {
+		if _, err := time.Parse(LogFilterDateLayout, f.DateTo); err != nil {
+			return NewAppError("LogFilter.IsValid", "model.log_filter.is_valid.date_to.app_error", map[string]any{"Layout": LogFilterDateLayout}, "", http.StatusBadRequest).Wrap(err)
+		}
+	}
+
+	if utf8.RuneCountInString(f.Search) > LogFilterSearchMaxLength {
+		return NewAppError("LogFilter.IsValid", "model.log_filter.is_valid.search.app_error", map[string]any{"MaxLength": LogFilterSearchMaxLength}, "", http.StatusBadRequest)
+	}
+
+	if len(f.Fields) > LogFilterFieldsMaxKeys {
+		return NewAppError("LogFilter.IsValid", "model.log_filter.is_valid.fields.app_error", map[string]any{"MaxKeys": LogFilterFieldsMaxKeys}, "", http.StatusBadRequest)
+	}
+
+	for key, values := range f.Fields {
+		// Level and timestamp have filters of their own
+		if key == "" || key == "level" || key == "timestamp" || utf8.RuneCountInString(key) > LogFilterFieldMaxLength {
+			return NewAppError("LogFilter.IsValid", "model.log_filter.is_valid.field_name.app_error", map[string]any{"MaxLength": LogFilterFieldMaxLength}, logFilterFieldDetail(key), http.StatusBadRequest)
+		}
+
+		if len(values) == 0 || len(values) > LogFilterFieldMaxValues {
+			return NewAppError("LogFilter.IsValid", "model.log_filter.is_valid.field_values.app_error", map[string]any{"MaxValues": LogFilterFieldMaxValues}, logFilterFieldDetail(key), http.StatusBadRequest)
+		}
+
+		for _, value := range values {
+			if utf8.RuneCountInString(value) > LogFilterFieldMaxLength {
+				return NewAppError("LogFilter.IsValid", "model.log_filter.is_valid.field_value.app_error", map[string]any{"MaxLength": LogFilterFieldMaxLength}, logFilterFieldDetail(key), http.StatusBadRequest)
+			}
+		}
+	}
+
+	return nil
+}
+
+type LogEntry struct {
+	Timestamp string
+	Level     string
+}
+
+// SystemPingOptions is the options for setting contents of the system ping
+// response.
+type SystemPingOptions struct {
+	// FullStatus allows server to set the detailed information about
+	// the system status.
+	FullStatus bool
+	// RestSemantics allows server to return 200 code even if the server
+	// status is unhealthy.
+	RESTSemantics bool
+}

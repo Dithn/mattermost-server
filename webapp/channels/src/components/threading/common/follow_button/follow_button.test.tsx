@@ -1,0 +1,77 @@
+// Copyright (c) 2015-present Mattermost, Inc. All Rights Reserved.
+// See LICENSE.txt for license information.
+
+import React from 'react';
+
+import {renderWithContext, screen, userEvent} from 'tests/react_testing_utils';
+
+import FollowButton from './follow_button';
+
+describe('components/threading/common/follow_button', () => {
+    test('should say follow', async () => {
+        const clickHandler = jest.fn();
+
+        renderWithContext(
+            <FollowButton
+                isFollowing={false}
+                onClick={clickHandler}
+            />,
+        );
+
+        expect(screen.getByText('Follow')).toBeInTheDocument();
+
+        await userEvent.click(screen.getByRole('button'));
+        expect(clickHandler).toHaveBeenCalled();
+    });
+
+    test('should say following', () => {
+        renderWithContext(
+            <FollowButton
+                isFollowing={true}
+            />,
+        );
+
+        expect(screen.getByText('Following')).toBeInTheDocument();
+    });
+
+    test('as an icon button, uses the Compass bell off/on glyphs', async () => {
+        const {rerender} = renderWithContext(
+            <FollowButton
+                isFollowing={false}
+                iconOnly={true}
+            />,
+        );
+
+        const offButton = screen.getByRole('button', {name: 'Follow'});
+        expect(offButton).toHaveAttribute('aria-pressed', 'false');
+        expect(offButton).not.toHaveAttribute('data-active');
+        expect(offButton.querySelector('svg')).toBeInTheDocument();
+        expect(screen.queryByText('Follow')).not.toBeInTheDocument();
+
+        rerender(
+            <FollowButton
+                isFollowing={true}
+                iconOnly={true}
+            />,
+        );
+
+        const onButton = screen.getByRole('button', {name: 'Following'});
+        expect(onButton).toHaveAttribute('aria-pressed', 'true');
+        expect(onButton).toHaveAttribute('data-active', 'true');
+        expect(onButton.querySelector('svg')).toBeInTheDocument();
+    });
+
+    test('should fire click handler', async () => {
+        const clickHandler = jest.fn();
+
+        renderWithContext(
+            <FollowButton
+                isFollowing={false}
+                onClick={clickHandler}
+            />,
+        );
+
+        await userEvent.click(screen.getByRole('button'));
+        expect(clickHandler).toHaveBeenCalled();
+    });
+});

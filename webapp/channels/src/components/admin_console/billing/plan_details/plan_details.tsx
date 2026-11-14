@@ -1,0 +1,162 @@
+// Copyright (c) 2015-present Mattermost, Inc. All Rights Reserved.
+// See LICENSE.txt for license information.
+
+import React from 'react';
+import {FormattedMessage, useIntl} from 'react-intl';
+
+import {Button} from '@mattermost/compass-ui/components/button';
+
+import useOpenPricingModal from 'components/common/hooks/useOpenPricingModal';
+import Tag from 'components/widgets/tag/tag';
+
+import {CloudProducts} from 'utils/constants';
+
+import './plan_details.scss';
+
+type Props = {
+    userCount: number;
+    isFreeTrial: boolean;
+    subscriptionPlan: string | undefined;
+    daysLeftOnTrial: number;
+    isYearly: boolean;
+};
+
+export const PlanDetailsTopElements = ({
+    userCount,
+    isFreeTrial,
+    subscriptionPlan,
+    daysLeftOnTrial,
+    isYearly,
+}: Props) => {
+    let productName;
+    const {openPricingModal, isAirGapped} = useOpenPricingModal();
+    const {formatMessage} = useIntl();
+
+    const userCountDisplay = (
+        <div className='PlanDetails__userCount'>
+            <FormattedMessage
+                id='admin.billing.subscription.planDetails.userCount'
+                defaultMessage='{userCount} users'
+                values={{userCount}}
+            />
+        </div>
+    );
+    switch (subscriptionPlan) {
+    case CloudProducts.PROFESSIONAL:
+        productName = (
+            <FormattedMessage
+                id='admin.billing.subscription.planDetails.productName.cloudProfessional'
+                defaultMessage='Cloud Professional'
+            />
+        );
+        break;
+    case CloudProducts.ENTERPRISE:
+        productName = (
+            <FormattedMessage
+                id='admin.billing.subscription.planDetails.productName.cloudEnterprise'
+                defaultMessage='Cloud Enterprise'
+            />
+        );
+        break;
+    case CloudProducts.ADVANCED:
+        productName = (
+            <FormattedMessage
+                id='admin.billing.subscription.planDetails.productName.cloudAdvanced'
+                defaultMessage='Cloud Enterprise Advanced'
+            />
+        );
+        break;
+    default:
+        productName = (
+            <FormattedMessage
+                id='admin.billing.subscription.planDetails.productName.unknown'
+                defaultMessage='Unknown product'
+            />
+        );
+        break;
+    }
+
+    const trialBadge = isFreeTrial ? (
+        <Tag
+            className='TrialBadge'
+            text={formatMessage({
+                id: 'admin.billing.subscription.cloudTrialBadge.daysLeftOnTrial',
+                defaultMessage: '{daysLeftOnTrial} trial days left',
+            },
+            {daysLeftOnTrial},
+            )}
+        />
+    ) : null;
+
+    const monthlyBadge = (
+        <Tag
+            className='RecurringIntervalBadge'
+            text={formatMessage({
+                id: 'admin.billing.subscription.cloudMonthlyBadge',
+                defaultMessage: 'Monthly',
+            })}
+        />
+    );
+
+    const yearlyBadge = (
+        <Tag
+            className='RecurringIntervalBadge'
+            text={formatMessage({
+                id: 'admin.billing.subscription.cloudYearlyBadge',
+                defaultMessage: 'Annual',
+            })}
+        />
+    );
+
+    const getBadge = () => {
+        if (isFreeTrial) {
+            return trialBadge;
+        }
+
+        if (isYearly) {
+            return yearlyBadge;
+        }
+
+        return monthlyBadge;
+    };
+
+    const viewPlansButton = isAirGapped ? null : (
+        <Button
+            onClick={openPricingModal}
+            emphasis='secondary'
+            className='PlanDetails__viewPlansButton'
+        >
+            {formatMessage({
+                id: 'workspace_limits.menu_limit.view_plans',
+                defaultMessage: 'View plans',
+            })}
+        </Button>
+    );
+
+    return (
+        <>
+            <div className='PlanDetails__top'>
+                <div className='PlanDetails__productName'>
+                    {productName}{getBadge()}
+                </div>
+                {viewPlansButton}
+            </div>
+            {userCountDisplay}
+        </>
+    );
+};
+
+export const currentPlanText = (isFreeTrial: boolean) => {
+    if (isFreeTrial) {
+        return null;
+    }
+    return (
+        <div className='PlanDetails__currentPlan'>
+            <i className='icon-check-circle'/>
+            <FormattedMessage
+                id='admin.billing.subscription.planDetails.currentPlan'
+                defaultMessage='Current Plan'
+            />
+        </div>
+    );
+};

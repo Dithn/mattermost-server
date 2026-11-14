@@ -1,0 +1,75 @@
+// Copyright (c) 2015-present Mattermost, Inc. All Rights Reserved.
+// See LICENSE.txt for license information.
+
+import {screen} from '@testing-library/react';
+import React from 'react';
+
+import {renderWithContext, userEvent} from 'tests/react_testing_utils';
+import {TestHelper} from 'utils/test_helper';
+
+import FileAttachment from './file_attachment';
+
+jest.mock('utils/utils', () => {
+    const original = jest.requireActual('utils/utils');
+    return {
+        ...original,
+        loadImage: jest.fn((id: string, callback: () => void) => {
+            if (id !== 'noLoad') {
+                callback();
+            }
+        }),
+    };
+});
+
+jest.mock('mattermost-redux/utils/file_utils', () => {
+    const original = jest.requireActual('mattermost-redux/utils/file_utils');
+    return {
+        ...original,
+        getFileThumbnailUrl: (fileId: string) => fileId,
+    };
+});
+
+describe('FileAttachment', () => {
+    const baseFileInfo = {
+        id: 'thumbnail_id',
+        extension: 'pdf',
+        name: 'test.pdf',
+        size: 100,
+        width: 100,
+        height: 80,
+        has_preview_image: true,
+        user_id: '',
+        channel_id: 'channel_id',
+        create_at: 0,
+        update_at: 0,
+        delete_at: 0,
+        mime_type: '',
+        clientId: '',
+    };
+
+    const baseProps = {
+        fileInfo: baseFileInfo,
+        handleImageClick: jest.fn(),
+        index: 3,
+        canDownloadFiles: true,
+        enableSVGs: false,
+        enablePublicLink: false,
+        pluginMenuItems: [],
+        currentChannel: TestHelper.getChannelMock(),
+        isFileRejected: false,
+        handleFileDropdownOpened: jest.fn(() => null),
+        actions: {
+            openModal: jest.fn(),
+        },
+    };
+
+    test('should blur file attachment link after click', async () => {
+        const props = {...baseProps, compactDisplay: true};
+        renderWithContext(<FileAttachment {...props}/>);
+
+        const link = screen.getByText(baseProps.fileInfo.name);
+        const blur = jest.spyOn(link, 'blur');
+        await userEvent.click(link);
+        expect(blur).toHaveBeenCalled();
+    });
+});

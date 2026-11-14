@@ -1,0 +1,270 @@
+// Copyright (c) 2015-present Mattermost, Inc. All Rights Reserved.
+// See LICENSE.txt for license information.
+
+import React from 'react';
+import {injectIntl} from 'react-intl';
+import type {IntlShape} from 'react-intl';
+
+import type {AppContext, AppField, AppForm, AppFormValues, FormResponseData, AppLookupResponse} from '@mattermost/types/apps';
+
+import {AppCallResponseTypes} from 'mattermost-redux/constants/apps';
+
+import {createCallRequest, makeCallErrorResponse} from 'utils/apps';
+
+import type {DoAppSubmit, DoAppFetchForm, DoAppLookup, DoAppCallResult, PostEphemeralCallResponseForContext} from 'types/apps';
+
+import AppsForm from './apps_form_component';
+
+type Props = {
+    intl: IntlShape;
+    form?: AppForm;
+    appContext?: AppContext;
+    timezone?: string;
+    refreshNonce?: number;
+    hidden?: boolean;
+
+    // Called with each form that replaces the current one (from a submit or refresh).
+    // A refresh response superseded by a newer form is never applied or reported.
+    onFormChange?: (form: AppForm) => void;
+    onExited: () => void;
+    onHide?: () => void;
+    actions: {
+        doAppSubmit: DoAppSubmit<any>;
+        doAppFetchForm: DoAppFetchForm<any>;
+        doAppLookup: DoAppLookup<any>;
+        postEphemeralCallResponseForContext: PostEphemeralCallResponseForContext;
+    };
+};
+
+type State = {
+    form?: AppForm;
+};
+
+class AppsFormContainer extends React.PureComponent<Props, State> {
+    private refreshSeq = 0;
+    private unmounted = false;
+
+    constructor(props: Props) {
+        super(props);
+        this.state = {form: props.form};
+    }
+
+    componentWillUnmount() {
+        this.unmounted = true;
+    }
+
+    applyForm = (form?: AppForm) => {
+        this.setState({form});
+        if (form) {
+            this.props.onFormChange?.(form);
+        }
+    };
+
+    submitForm = async (submission: {values: AppFormValues}): Promise<DoAppCallResult<FormResponseData>> => {
+        const makeErrorMsg = (msg: string) => {
+            return this.props.intl.formatMessage(
+                {
+                    id: 'apps.error.form.submit.pretext',
+                    defaultMessage: 'There has been an error submitting the modal. Contact the app developer. Details: {details}',
+                },
+                {details: msg},
+            );
+        };
+        const {form} = this.state;
+        if (!form) {
+            const errMsg = this.props.intl.formatMessage({id: 'apps.error.form.no_form', defaultMessage: '`form` is not defined.'});
+            return {error: makeCallErrorResponse(makeErrorMsg(errMsg))};
+        }
+        if (!form.submit) {
+            const errMsg = this.props.intl.formatMessage({id: 'apps.error.form.no_submit', defaultMessage: '`submit` is not defined.'});
+            return {error: makeCallErrorResponse(makeErrorMsg(errMsg))};
+        }
+        if (!this.props.appContext) {
+            return {error: makeCallErrorResponse('unreachable: empty context')};
+        }
+
+        const creq = createCallRequest(form.submit, this.props.appContext, {}, submission.values);
+        const res = await this.props.actions.doAppSubmit(creq, this.props.intl) as DoAppCallResult<FormResponseData>;
+        if (res.error) {
+            return res;
+        }
+
+        const callResp = res.data!;
+        switch (callResp.type) {
+        case AppCallResponseTypes.OK:
+            if (callResp.text) {
+                this.props.actions.postEphemeralCallResponseForContext(
+                    callResp,
+                    callResp.text,
+                    creq.context,
+                );
+            }
+            break;
+        case AppCallResponseTypes.FORM:
+            // A newer form replaces the current one; drop any refresh still in flight.
+            this.refreshSeq++;
+            this.applyForm(callResp.form);
+            break;
+        case AppCallResponseTypes.NAVIGATE:
+            break;
+        default:
+            return {error: makeCallErrorResponse(makeErrorMsg(this.props.intl.formatMessage(
+                {
+                    id: 'apps.error.responses.unknown_type',
+                    defaultMessage: 'App response type not supported. Response type: {type}.',
+                }, {
+                    type: callResp.type,
+                },
+            )))};
+        }
+        return res;
+    };
+
+    refreshOnSelect = async (field: AppField, values: AppFormValues): Promise<DoAppCallResult<FormResponseData>> => {
+        const makeErrMsg = (message: string) => this.props.intl.formatMessage(
+            {
+                id: 'apps.error.form.update',
+                defaultMessage: 'There has been an error updating the modal. Contact the app developer. Details: {details}',
+            },
+            {details: message},
+        );
+
+        const {form} = this.state;
+        if (!form) {
+            return {error: makeCallErrorResponse(makeErrMsg(this.props.intl.formatMessage({
+                id: 'apps.error.form.no_form',
+                defaultMessage: '`form` is not defined.',
+            })))};
+        }
+        if (!form.source) {
+            return {error: makeCallErrorResponse(makeErrMsg(this.props.intl.formatMessage({
+                id: 'apps.error.form.no_source',
+                defaultMessage: '`source` is not defined.',
+            })))};
+        }
+        if (!field.refresh) {
+            // Should never happen
+            return {error: makeCallErrorResponse(makeErrMsg(this.props.intl.formatMessage({
+                id: 'apps.error.form.refresh_no_refresh',
+                defaultMessage: 'Called refresh on no refresh field.',
+            })))};
+        }
+        if (!this.props.appContext) {
+            return {error: makeCallErrorResponse('unreachable: empty context')};
+        }
+
+        const creq = createCallRequest(form.source, this.props.appContext, {}, values);
+        creq.selected_field = field.name;
+
+        const res = await this.props.actions.doAppFetchForm(creq, this.props.intl);
+        if (res.error) {
+            return res;
+        }
+
+        const callResp = res.data!;
+        switch (callResp.type) {
+        case AppCallResponseTypes.FORM:
+            // A newer form replaces the current one; drop any refresh still in flight.
+            this.refreshSeq++;
+            this.applyForm(callResp.form);
+            break;
+        case AppCallResponseTypes.OK:
+        case AppCallResponseTypes.NAVIGATE:
+            return {error: makeCallErrorResponse(makeErrMsg(this.props.intl.formatMessage({
+                id: 'apps.error.responses.unexpected_type',
+                defaultMessage: 'App response type was not expected. Response type: {type}',
+            }, {
+                type: callResp.type,
+            },
+            )))};
+        default:
+            return {error: makeCallErrorResponse(makeErrMsg(this.props.intl.formatMessage({
+                id: 'apps.error.responses.unknown_type',
+                defaultMessage: 'App response type not supported. Response type: {type}.',
+            }, {
+                type: callResp.type,
+            },
+            )))};
+        }
+        return res;
+    };
+
+    // Re-fetches the whole form from its source without a selected field, e.g. when a
+    // child dialog stacked on top of this one closes.
+    refreshForm = async (values: AppFormValues): Promise<DoAppCallResult<FormResponseData>> => {
+        const {form} = this.state;
+        if (!form?.source || !this.props.appContext) {
+            return {data: {type: AppCallResponseTypes.OK}};
+        }
+
+        const seq = ++this.refreshSeq;
+        const creq = createCallRequest(form.source, this.props.appContext, {}, values);
+        const res = await this.props.actions.doAppFetchForm(creq, this.props.intl);
+
+        // Ignore a response superseded by a newer refresh, or that arrives after unmount.
+        if (this.unmounted || seq !== this.refreshSeq) {
+            return {data: {type: AppCallResponseTypes.OK}};
+        }
+        if (!res.error && res.data?.type === AppCallResponseTypes.FORM && res.data.form) {
+            this.applyForm(res.data.form);
+        }
+        return res;
+    };
+
+    performLookupCall = async (field: AppField, values: AppFormValues, userInput: string): Promise<DoAppCallResult<AppLookupResponse>> => {
+        const intl = this.props.intl;
+        const makeErrorMsg = (message: string) => intl.formatMessage(
+            {
+                id: 'apps.error.form.refresh',
+                defaultMessage: 'There has been an error updating the modal. Contact the app developer. Details: {details}',
+            },
+            {details: message},
+        );
+        if (!field.lookup) {
+            return {error: makeCallErrorResponse(makeErrorMsg(intl.formatMessage({
+                id: 'apps.error.form.no_lookup',
+                defaultMessage: '`lookup` is not defined.',
+            })))};
+        }
+        if (!this.props.appContext) {
+            return {error: makeCallErrorResponse('unreachable: empty context')};
+        }
+
+        const creq = createCallRequest(field.lookup, this.props.appContext, {}, values);
+        creq.selected_field = field.name;
+        creq.query = userInput;
+
+        return this.props.actions.doAppLookup(creq, intl);
+    };
+
+    render() {
+        const {form} = this.state;
+
+        if (!form?.submit || !this.props.appContext) {
+            return null;
+        }
+
+        return (
+            <AppsForm
+                form={form}
+                channelId={this.props.appContext.channel_id}
+                timezone={this.props.timezone}
+                refreshNonce={this.props.refreshNonce}
+                hidden={this.props.hidden}
+                onExited={this.props.onExited}
+                onHide={this.props.onHide}
+                actions={{
+                    submit: this.submitForm,
+                    performLookupCall: this.performLookupCall,
+                    refreshOnSelect: this.refreshOnSelect,
+                    refreshForm: this.refreshForm,
+                }}
+            />
+        );
+    }
+}
+
+// Exported for tests
+export {AppsFormContainer as RawAppsFormContainer};
+
+export default injectIntl(AppsFormContainer);

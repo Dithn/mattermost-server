@@ -1,0 +1,215 @@
+// Copyright (c) 2015-present Mattermost, Inc. All Rights Reserved.
+// See LICENSE.txt for license information.
+
+import React from 'react';
+import {FormattedMessage, defineMessage} from 'react-intl';
+
+import ExternalLink from 'components/external_link';
+import AdminPanel from 'components/widgets/admin_console/admin_panel';
+
+import AdminSettingsSwitch from '../../admin_settings_switch';
+
+type Props = {
+    syncChecked: boolean;
+    allAllowedChecked: boolean;
+    allowedDomainsChecked: boolean;
+    allowedDomains: string;
+    onToggle: (syncChecked: boolean, allAllowedChecked: boolean, allowedDomainsChecked: boolean, allowedDomains: string) => void;
+    isDisabled?: boolean;
+};
+
+const SyncGroupsToggle = ({syncChecked, allAllowedChecked, allowedDomainsChecked, allowedDomains, onToggle, isDisabled, last}: Props & {last?: boolean}) => (
+    <AdminSettingsSwitch
+        id='syncGroupSwitch'
+        disabled={isDisabled}
+        checked={syncChecked}
+        last={last}
+        onChange={() => onToggle(!syncChecked, allAllowedChecked, allowedDomainsChecked, allowedDomains)}
+        secondaryLabel={(
+            <FormattedMessage
+                id='admin.team_settings.team_details.syncGroupMembersDescr'
+                defaultMessage='When enabled, adding and removing users from groups will add or remove them from this team. The only way of inviting members to this team is by adding the groups they belong to. <link>Learn More</link>'
+                values={{
+                    link: (msg) => (
+                        <ExternalLink
+                            href='https://mattermost.com/pl/default-ldap-group-constrained-team-channel.html'
+                            location='team_modes'
+                        >
+                            {msg}
+                        </ExternalLink>
+                    ),
+                }}
+            />
+        )}
+    >
+        <FormattedMessage
+            id='admin.team_settings.team_details.syncGroupMembers'
+            defaultMessage='Sync Group Members'
+        />
+    </AdminSettingsSwitch>
+);
+
+const AllowAllToggle = ({syncChecked, allAllowedChecked, allowedDomainsChecked, allowedDomains, onToggle, isDisabled}: Props) =>
+    (syncChecked ? null : (
+        <AdminSettingsSwitch
+            id='allowAllToggleSwitch'
+            disabled={isDisabled}
+            checked={allAllowedChecked}
+            onChange={() => onToggle(syncChecked, !allAllowedChecked, allowedDomainsChecked, allowedDomains)}
+            secondaryLabel={(
+                <FormattedMessage
+                    id='admin.team_settings.team_details.anyoneCanJoinDescr'
+                    defaultMessage='This team can be discovered allowing anyone with an account to join this team.'
+                />
+            )}
+        >
+            <FormattedMessage
+                id='admin.team_settings.team_details.anyoneCanJoin'
+                defaultMessage='Anyone can join this team'
+            />
+        </AdminSettingsSwitch>
+    ));
+
+const AllowedDomainsToggle = ({syncChecked, allAllowedChecked, allowedDomainsChecked, allowedDomains, onToggle, isDisabled, last = true}: Props & {last?: boolean}) =>
+    (syncChecked ? null : (
+        <AdminSettingsSwitch
+            id='allowedDomainsToggleSwitch'
+            disabled={isDisabled}
+            checked={allowedDomainsChecked}
+            last={last}
+            onChange={() => onToggle(syncChecked, allAllowedChecked, !allowedDomainsChecked, allowedDomains)}
+            secondaryLabel={(
+                <FormattedMessage
+                    id='admin.team_settings.team_details.specificDomainsDescr'
+                    defaultMessage='Users can only join the team if their email matches one of the specified domains'
+                />
+            )}
+            footer={(
+                <>
+                    <div className='help-text csvDomains'>
+                        <FormattedMessage
+                            id='admin.team_settings.team_details.csvDomains'
+                            defaultMessage='Comma Separated Email Domain List'
+                        />
+                    </div>
+                    <input
+                        type='text'
+                        value={allowedDomains}
+                        placeholder='mattermost.com'
+                        className='form-control'
+                        onChange={(e) => onToggle(syncChecked, allAllowedChecked, allowedDomainsChecked, e.currentTarget.value)}
+                        disabled={isDisabled}
+                    />
+                </>
+            )}
+        >
+            <FormattedMessage
+                id='admin.team_settings.team_details.specificDomains'
+                defaultMessage='Only specific email domains can join this team'
+            />
+        </AdminSettingsSwitch>
+    ));
+
+type PolicyEnforceToggleProps = {
+    syncChecked: boolean;
+    policyEnforced: boolean;
+
+    // Locked once a policy is linked; removal happens from the policy list.
+    policyEnforcedToggleAvailable: boolean;
+    onToggle?: (policyEnforced: boolean) => void;
+    isDisabled?: boolean;
+};
+
+const PolicyEnforceToggle = ({syncChecked, policyEnforced, policyEnforcedToggleAvailable, onToggle, isDisabled}: PolicyEnforceToggleProps) => (
+    <AdminSettingsSwitch
+        id='policy-enforce-toggle'
+        disabled={isDisabled || syncChecked || !policyEnforcedToggleAvailable}
+        checked={policyEnforced}
+
+        // Email-domains (and anyone-can-join) hide when synced; this row stays
+        // visible (disabled) and is then the last row.
+        last={syncChecked}
+        onChange={() => {
+            if (syncChecked || !policyEnforcedToggleAvailable) {
+                return;
+            }
+            onToggle?.(!policyEnforced);
+        }}
+        secondaryLabel={syncChecked ? (
+            <FormattedMessage
+                id='admin.team_settings.team_details.policy_enforced_group_synced'
+                defaultMessage='Group synced teams cannot use a membership policy. Disable group sync to manage access by attributes.'
+            />
+        ) : (
+            <FormattedMessage
+                id='admin.team_settings.team_details.policy_enforced_description'
+                defaultMessage='Restrict which users can be added to this team based on their user attributes and values. Only people who match the specified conditions will be allowed to be selected and added to this team.'
+            />
+        )}
+    >
+        <FormattedMessage
+            id='admin.team_settings.team_details.policy_enforced_title'
+            defaultMessage='Manage membership with attribute based membership policies'
+        />
+    </AdminSettingsSwitch>
+);
+
+type TeamModesProps = Props & {
+    isLicensedForLDAPGroups?: boolean;
+    abacSupported?: boolean;
+    policyEnforced?: boolean;
+    policyEnforcedToggleAvailable?: boolean;
+    onPolicyEnforcedToggle?: (policyEnforced: boolean) => void;
+};
+
+export const TeamModes = ({allAllowedChecked, syncChecked, allowedDomains, allowedDomainsChecked, onToggle, isDisabled, isLicensedForLDAPGroups, abacSupported, policyEnforced, policyEnforcedToggleAvailable, onPolicyEnforcedToggle}: TeamModesProps) => {
+    // Omit the Sync row separator only when nothing else in this panel is
+    // visible. ABAC still renders (disabled) while synced, so sync-on alone
+    // must not set last.
+    const syncIsLastVisible = Boolean(syncChecked && !abacSupported);
+
+    return (
+        <AdminPanel
+            id='team_manage'
+            title={defineMessage({id: 'admin.team_settings.team_detail.manageTitle', defaultMessage: 'Team Management'})}
+            subtitle={defineMessage({id: 'admin.team_settings.team_detail.manageDescription', defaultMessage: 'Choose between inviting members manually or syncing members automatically from groups.'})}
+        >
+            {isLicensedForLDAPGroups && !policyEnforced &&
+                <SyncGroupsToggle
+                    allAllowedChecked={allAllowedChecked}
+                    allowedDomainsChecked={allowedDomainsChecked}
+                    allowedDomains={allowedDomains}
+                    syncChecked={syncChecked}
+                    onToggle={onToggle}
+                    isDisabled={isDisabled}
+                    last={syncIsLastVisible}
+                />
+            }
+            <AllowAllToggle
+                allAllowedChecked={allAllowedChecked}
+                allowedDomainsChecked={allowedDomainsChecked}
+                allowedDomains={allowedDomains}
+                syncChecked={syncChecked}
+                onToggle={onToggle}
+                isDisabled={isDisabled}
+            />
+            {abacSupported &&
+                <PolicyEnforceToggle
+                    syncChecked={syncChecked}
+                    policyEnforced={Boolean(policyEnforced)}
+                    policyEnforcedToggleAvailable={Boolean(policyEnforcedToggleAvailable)}
+                    onToggle={onPolicyEnforcedToggle}
+                    isDisabled={isDisabled}
+                />
+            }
+            <AllowedDomainsToggle
+                allAllowedChecked={allAllowedChecked}
+                allowedDomainsChecked={allowedDomainsChecked}
+                allowedDomains={allowedDomains}
+                syncChecked={syncChecked}
+                onToggle={onToggle}
+                isDisabled={isDisabled}
+            />
+        </AdminPanel>
+    );
+};

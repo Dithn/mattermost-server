@@ -1,0 +1,51 @@
+// Copyright (c) 2015-present Mattermost, Inc. All Rights Reserved.
+// See LICENSE.txt for license information.
+
+.content-flagging-section-setting-wrapper {
+    display: flex;
+    flex-direction: column;
+    gap: var(--spacing-xl);
+}
+
+.content-flagging-section-setting {
+    display: flex;
+    width: 100%;
+    align-items: center;
+
+    .setting-title {
+        min-width: 290px;
+        max-width: 290px;
+        color: var(--center-channel-color);
+        font-size: var(--font-size-100);
+        font-style: normal;
+        font-weight: var(--font-weight-semibold);
+    }
+
+    .setting-content {
+        display: flex;
+        flex: 1;
+        align-items: center;
+        gap: var(--spacing-xxxl);
+
+        // Compass Radio defaults to width: 100%; keep True/False side-by-side.
+        > label {
+            width: auto;
+        }
+    }
+
+    // Compass Checkbox keeps Bootstrap's `.checkbox-inline` class, whose 20px
+    // left padding made room for a native input that Compass doesn't use. Drop
+    // it so the box lines up with the inputs above and below it.
+    .checkbox-inline {
+        padding-left: 0;
+    }
+}
+
+.helpText {
+    margin-top: var(--spacing-xs);
+    color: rgba(var(--center-channel-color-rgb), 0.72);
+    font-family: var(--font-family-body);
+    font-size: var(--font-size-100);
+    font-weight: var(--font-weight-regular);
+    line-height: var(--line-height-100);
+}

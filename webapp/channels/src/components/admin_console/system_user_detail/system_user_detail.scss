@@ -1,0 +1,233 @@
+.SystemUserDetail {
+    .SystemUserDetail__pictureError {
+        margin-top: 12px;
+
+        .has-error .control-label {
+            margin: 0;
+        }
+    }
+
+    .AdminUserCard__body {
+        .two-column-layout {
+            .field-row {
+                display: flex;
+                margin-bottom: var(--spacing-l);
+                gap: var(--spacing-m);
+
+                &:last-child {
+                    margin-bottom: 0;
+                }
+
+                .field-column {
+                    min-width: 0; // Allow content to shrink
+                    flex: 1;
+                }
+            }
+        }
+
+        label {
+            display: block;
+            font-weight: unset;
+
+            .field-label {
+                display: block;
+                margin: 0 0 var(--spacing-xs);
+                font-size: 12px;
+                font-weight: bold;
+            }
+
+            input,
+            select {
+                display: inline-block;
+                width: 100%;
+                max-width: 320px;
+
+                &.error {
+                    border-color: var(--error-text);
+                    box-shadow: 0 0 0 1px var(--error-text);
+                }
+            }
+
+            .field-error {
+                display: block;
+                margin-top: var(--spacing-xxs);
+                color: var(--error-text);
+                font-size: 12px;
+            }
+
+            select[multiple] {
+                min-height: 80px;
+            }
+        }
+
+        // Icons sit inside the control so every field shares one left edge.
+        // AtIcon/EmailIcon/etc. wrap <svg width="100%" height="100%"> in a span —
+        // size the span or the svg blows up to the column width.
+        .field-control {
+            position: relative;
+            display: block;
+            max-width: 320px;
+
+            > span:has(> svg),
+            > svg {
+                position: absolute;
+                z-index: 1;
+                top: 50%;
+                left: 12px;
+                display: block;
+                width: 16px;
+                height: 16px;
+                margin: 0;
+                color: rgba(var(--sys-color-sidebar-text-rgb), 0.6);
+                fill: rgba(var(--sys-color-sidebar-text-rgb), 0.6);
+                pointer-events: none;
+                transform: translateY(-50%);
+
+                svg {
+                    display: block;
+                    width: 100%;
+                    height: 100%;
+                    fill: currentColor;
+                }
+            }
+
+            input.form-control {
+                width: 100%;
+                max-width: 100%;
+                padding-left: 36px;
+            }
+
+            &--text {
+                display: flex;
+                min-height: 36px;
+                align-items: center;
+                gap: var(--spacing-s);
+
+                > span:has(> svg),
+                > svg {
+                    position: static;
+                    flex: 0 0 auto;
+                    transform: none;
+                }
+            }
+        }
+
+        .cpa-field {
+            position: relative;
+        }
+
+        .hierarchical-value-menu {
+            max-width: 320px;
+        }
+
+        .cpa-section-divider {
+            display: flex;
+            align-items: center;
+            padding-top: var(--spacing-l);
+            border-top: 1px solid rgba(var(--center-channel-color-rgb), 0.12);
+            margin-top: var(--spacing-l);
+            margin-bottom: var(--spacing-l);
+
+            .cpa-section-header {
+                color: rgba(var(--center-channel-color-rgb), 0.72);
+                font-size: 12px;
+                font-weight: 600;
+                letter-spacing: 0.5px;
+                text-transform: uppercase;
+            }
+        }
+
+        .user-property-field-values__sync-indicator {
+            display: flex;
+            flex-wrap: wrap;
+            align-items: center;
+            margin-top: 4px;
+            color: rgba(var(--center-channel-color-rgb), 0.7);
+            font-size: 11px;
+            gap: 4px;
+            
+            svg {
+                width: 14px;
+                height: 14px;
+                margin-right: 2px;
+                fill: rgba(var(--center-channel-color-rgb), 0.5);
+            }
+        }
+
+        .user-detail-cpa-field__chip {
+            display: inline-block;
+            padding: 2px 8px;
+            border-radius: 12px;
+            background: rgba(var(--center-channel-color-rgb), 0.08);
+            color: var(--center-channel-color);
+            font-size: 11px;
+            font-weight: 600;
+        }
+    }
+
+    .teamlistLoading {
+        display: flex;
+        min-height: 20vh;
+        align-items: center;
+        justify-content: center;
+    }
+
+    .AdminUserCard__footer {
+        .manageUserSettingsBtn {
+            margin-left: auto;
+            cursor: pointer;
+        }
+    }
+
+    // Mobile responsiveness for two-column layout
+    @media (max-width: 768px) {
+        .AdminUserCard__body {
+            .two-column-layout {
+                .field-row {
+                    flex-direction: column;
+                    gap: var(--spacing-l);
+
+                    .field-column.right {
+                        margin-top: 0;
+                    }
+                }
+            }
+        }
+    }
+}
+
+#admin-userDetail-saveChangesModal {
+    .changes-list {
+        margin-top: 10px;
+        margin-bottom: 10px;
+    }
+
+    .password-confirmation-section {
+        padding: 12px;
+        border-radius: 4px;
+        margin-top: 16px;
+        margin-bottom: 16px;
+        background-color: rgba(var(--center-channel-color-rgb), 0.04);
+
+        .password-input-wrapper {
+            margin-top: 12px;
+
+            input[type="password"] {
+                width: 100%;
+                max-width: 320px;
+
+                &.error {
+                    border-color: var(--error-text);
+                    box-shadow: 0 0 0 1px var(--error-text);
+                }
+            }
+
+            .field-error {
+                display: block;
+                margin-top: 8px;
+                color: var(--error-text);
+                font-size: 12px;
+            }
+        }
+    }
+}
